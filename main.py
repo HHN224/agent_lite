@@ -4,6 +4,7 @@ import subprocess
 from openai import OpenAI
 
 from agent_core import AgentLoop
+from ai import tools
 
 
 WORKSPACE = Path(__file__).resolve().parent
@@ -19,82 +20,19 @@ def safe_path(path: str) -> Path:
     return file
 
 
-tools = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read",
-            "description": "Read a text file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                    }
-                },
-                "required": ["path"],
+def to_schema() -> list[dict]:
+    """把 ai 层工具定义转换成 OpenAI function calling 的 schema。"""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write",
-            "description": "Write content to a text file",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                    },
-                    "content": {
-                        "type": "string",
-                    }
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command and return its stdout/stderr",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit",
-            "description": "Replace an exact substring in a text file with new content",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                    },
-                    "old_string": {
-                        "type": "string",
-                    },
-                    "new_string": {
-                        "type": "string",
-                    }
-                },
-                "required": ["path", "old_string", "new_string"],
-            },
-        },
-    }
-]
+        }
+        for t in tools
+    ]
 
 
 client = OpenAI(
@@ -191,7 +129,7 @@ def main():
         client=client,
         model="deepseek-v4-flash",
         system_prompt=SYSTEM_PROMPT,
-        tools=tools,
+        tools=to_schema(),
         tool_map=tool_map,
     )
 
