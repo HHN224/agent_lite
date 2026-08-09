@@ -1,8 +1,9 @@
 from pathlib import Path
-import json
 import os
 import subprocess
 from openai import OpenAI
+
+from agent_core import AgentLoop
 
 
 WORKSPACE = Path(__file__).resolve().parent
@@ -182,51 +183,21 @@ tool_map = {
     "edit": edit,
 }
 
-
-def agent(prompt: str):
-    messages = [
-        {"role": "system", "content": "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."},
-        {"role": "user", "content": prompt},
-    ]
-
-    while True:
-        print(f"\n>>> 调用 API ...")
-        response = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=messages,
-            tools=tools,
-        )
-
-        message = response.choices[0].message
-        messages.append(message)
-
-        # 没有工具调用，说明模型已经回答完了
-        if not message.tool_calls:
-            print(f">>> 最终回复: {message.content}")
-            return message.content
-
-        # 执行工具
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
-
-            print(f">>> 正在使用工具: {name} | 参数: {args}")
-            result = tool_map[name](**args)
-            print(f">>> 工具返回: {str(result)[:200]}")
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result,
-            })
-
-
+SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."
 
 
 def main():
+    loop = AgentLoop(
+        client=client,
+        model="deepseek-v4-flash",
+        system_prompt=SYSTEM_PROMPT,
+        tools=tools,
+        tool_map=tool_map,
+    )
+
     while True:
         user_input = input("> ")
-        print(agent(user_input))
+        print(loop.run(user_input))
 
 if __name__ == "__main__":
     main()
