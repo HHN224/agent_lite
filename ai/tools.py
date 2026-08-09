@@ -9,3 +9,14 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
+
+    def to_schema(self) -> dict:
+        """转成 OpenAI function calling 的 schema。"""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }

@@ -4,12 +4,12 @@ import json
 class AgentLoop:
     """仿 pi-agent 的核心循环：调模型 → 若有 tool_calls 则执行 → 循环直到模型直接回复。"""
 
-    def __init__(self, client, model, system_prompt, tools, tool_map):
+    def __init__(self, client, model, system_prompt, tools):
         self.client = client
         self.model = model
         self.system_prompt = system_prompt
         self.tools = tools
-        self.tool_map = tool_map
+        self.tool_map = {t.name: t for t in tools}
 
     def run(self, prompt: str) -> str:
         messages = [
@@ -22,7 +22,7 @@ class AgentLoop:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=self.tools,
+                tools=[t.to_schema() for t in self.tools],
             )
 
             message = response.choices[0].message
@@ -39,7 +39,7 @@ class AgentLoop:
                 args = json.loads(tool_call.function.arguments)
 
                 print(f">>> 正在使用工具: {name} | 参数: {args}")
-                result = self.tool_map[name](**args)
+                result = self.tool_map[name].execute(**args)
                 print(f">>> 工具返回: {str(result)[:200]}")
 
                 messages.append({
@@ -47,3 +47,4 @@ class AgentLoop:
                     "tool_call_id": tool_call.id,
                     "content": result,
                 })
+

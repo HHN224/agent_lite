@@ -147,5 +147,3 @@ class EditTool(AgentTool):
 
 
 tools = [ReadTool(), WriteTool(), BashTool(), EditTool()]
-
-tool_map = {t.name: t.execute for t in tools}
