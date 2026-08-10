@@ -41,8 +41,15 @@
 
 ```
 agent lite/
-├── main.py          # 主程序：工具定义、工具实现、Agent 循环、CLI 入口
-└── README.md        # 项目说明文档
+├── ai/               # 最底层：Tool 数据类（name / description / parameters → schema）
+│   └── tools.py
+├── agent_core/       # 核心层：AgentLoop（对话循环）与 AgentTool 抽象接口
+│   ├── loop.py
+│   └── agent_tools.py
+├── coding_agent/     # 应用层：四个具体工具 + CLI 入口
+│   ├── tools.py      # read / write / bash / edit
+│   └── __main__.py   # 入口：python -m coding_agent
+└── README.md         # 项目说明文档
 ```
 
 ---
@@ -60,9 +67,9 @@ agent lite/
 pip install openai
 ```
 
-### 3. 配置 API Key（推荐）
+### 3. 配置 API Key（必需）
 
-**强烈建议**将 API Key 通过环境变量传入，避免硬编码在代码中泄露：
+代码通过环境变量 `DEEPSEEK_API_KEY` 读取密钥，未设置时程序会直接退出并提示：
 
 ```bash
 # Windows (PowerShell)
@@ -72,26 +79,16 @@ $env:DEEPSEEK_API_KEY = "sk-xxxx"
 export DEEPSEEK_API_KEY="sk-xxxx"
 ```
 
-然后在 `main.py` 中修改：
-
-```python
-import os
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com",
-)
-```
-
 ### 4. 运行
 
 ```bash
-python main.py
+python -m coding_agent
 ```
 
 在 `>` 提示符后输入任务即可，例如：
 
 ```text
-> 读取当前目录下的 main.py，并把函数说明翻译成英文写进 notes.md
+> 读取当前目录下的 README.md，并把项目说明翻译成英文写进 notes.md
 ```
 
 ---
@@ -99,7 +96,7 @@ python main.py
 ## ⚠️ 安全须知
 
 - `bash` 工具会以**当前用户权限**执行任意命令，请勿在不受信任的环境中运行，也不要让 AI 接触敏感系统
-- 请勿将 API Key 硬编码进代码并提交到 Git 仓库（`main.py` 中目前留有示例 Key，建议立即移除并改用环境变量）
+- 请勿将 API Key 硬编码进代码并提交到 Git 仓库（当前代码已从环境变量 `DEEPSEEK_API_KEY` 读取密钥）
 - 本项目的工具没有沙箱、权限校验和路径限制，仅适合本地学习与实验
 
 ---
