@@ -64,12 +64,18 @@ agent lite/
 ### 2. 安装依赖
 
 ```bash
-pip install openai
+pip install openai python-dotenv
 ```
 
 ### 3. 配置 API Key（必需）
 
-代码通过环境变量 `DEEPSEEK_API_KEY` 读取密钥，未设置时程序会直接退出并提示：
+**方式一：`.env` 文件（推荐）** —— 复制 `.env.example` 为 `.env`，填入真实 Key 即可，程序启动时自动加载（`.env` 已被 `.gitignore` 忽略，不会泄露到仓库）：
+
+```bash
+DEEPSEEK_API_KEY=sk-xxxx
+```
+
+**方式二：环境变量** —— 代码最终仍从环境变量 `DEEPSEEK_API_KEY` 读取，直接设置也同样有效：
 
 ```bash
 # Windows (PowerShell)
