@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from agent_core import AgentLoop
+from agent_core import Agent, AgentLoop
 from coding_agent.tools import tools
 
 
@@ -38,13 +38,17 @@ def main():
     loop = AgentLoop(
         client=client,
         model="deepseek-v4-flash",
-        system_prompt=SYSTEM_PROMPT,
         tools=tools,
+    )
+
+    agent = Agent(
+        loop=loop,
+        system_prompt=SYSTEM_PROMPT,
     )
 
     while True:
         user_input = input("> ")
-        print(loop.run(user_input))
+        print(agent.prompt(user_input))
 
 
 if __name__ == "__main__":

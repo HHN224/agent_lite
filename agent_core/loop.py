@@ -2,21 +2,19 @@ import json
 
 
 class AgentLoop:
-    """仿 pi-agent 的核心循环：调模型 → 若有 tool_calls 则执行 → 循环直到模型直接回复。"""
+    """仿 pi-agent 的核心循环：调模型 → 若有 tool_calls 则执行 → 循环直到模型直接回复。
 
-    def __init__(self, client, model, system_prompt, tools):
+    本类只管"接收 messages → 驱动模型 → 追加结果"，不关心上下文怎么构建与压缩；
+    上下文管理（system prompt、历史累积、消息改写）由 Agent 负责。
+    """
+
+    def __init__(self, client, model, tools):
         self.client = client
         self.model = model
-        self.system_prompt = system_prompt
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
 
-    def run(self, prompt: str) -> str:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-
+    def run(self, messages: list) -> str:
         while True:
             print("\n>>> 调用 API ...")
             response = self.client.chat.completions.create(
@@ -47,4 +45,3 @@ class AgentLoop:
                     "tool_call_id": tool_call.id,
                     "content": result,
                 })
-

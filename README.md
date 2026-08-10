@@ -37,16 +37,46 @@
 
 ---
 
+## 🏗️ 分层架构（来自 pi-agent）
+
+本项目严格遵循 **自底向上分层，底层不能调用上层**，上层只能依赖紧邻的下层：
+
+```
+┌─────────────────────────────────────────────┐
+│  coding_agent  应用层（最上层）                │
+│  · 具体工具：read / write / bash / edit      │
+│  · CLI 入口：main 里组装 AgentLoop + Agent   │
+├─────────────────────────────────────────────┤
+│  agent_core    核心层                        │
+│  · Agent      管理对话状态（messages / system│
+│               prompt），对外只暴露 prompt()   │
+│  · AgentLoop  只管"接收 messages → 调模型 →  │
+│               执行工具 → 回填结果"的机械循环   │
+│  · AgentTool  具体工具必须实现的 execute 契约  │
+├─────────────────────────────────────────────┤
+│  ai           最底层                          │
+│  · Tool       工具数据类（name/description/  │
+│               parameters → OpenAI schema）   │
+└─────────────────────────────────────────────┘
+```
+
+- **最上层是 coding_agent，往下一层是 agent_core，最下面一层是 ai**
+- 上下层只通过 `from agent_core import ...` / `from ai import ...` 这类导入建立依赖，方向始终向下
+- 将来做消息压缩、改写、持久化记忆时，都放在 **agent_core 的 Agent 里**，不要让 AgentLoop 关心上下文管理
+
+---
+
 ## 📁 项目结构
 
 ```
 agent lite/
 ├── ai/               # 最底层：Tool 数据类（name / description / parameters → schema）
 │   └── tools.py
-├── agent_core/       # 核心层：AgentLoop（对话循环）与 AgentTool 抽象接口
+├── agent_core/       # 核心层：Agent（对话状态）与 AgentLoop（模型循环）、AgentTool 抽象接口
+│   ├── agent.py
 │   ├── loop.py
 │   └── agent_tools.py
-├── coding_agent/     # 应用层：四个具体工具 + CLI 入口
+├── coding_agent/     # 应用层（最上层）：四个具体工具 + CLI 入口
 │   ├── tools.py      # read / write / bash / edit
 │   └── __main__.py   # 入口：python -m coding_agent
 └── README.md         # 项目说明文档
