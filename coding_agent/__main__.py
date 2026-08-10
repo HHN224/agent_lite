@@ -2,6 +2,10 @@ import os
 import sys
 from pathlib import Path
 
+# 支持直接运行本文件（如 VS Code 运行按钮）：把项目根目录加入 sys.path，
+# 否则找不到 agent_core、coding_agent 等同级包。推荐入口仍是 python -m coding_agent。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from dotenv import load_dotenv
 from openai import OpenAI
 
