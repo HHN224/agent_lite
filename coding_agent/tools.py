@@ -74,10 +74,18 @@ class WriteTool(AgentTool):
 
 
 class BashTool(AgentTool):
-    def __init__(self):
+    """在一次性 Docker 容器中执行命令：无网络、只读根文件系统、资源限额，
+    仅通过 bind mount 把工作目录暴露给容器。"""
+
+    IMAGE = "python:3.12-slim"
+    TIMEOUT = 30
+
+    def __init__(self, workspace: Path):
+        self.workspace = workspace.resolve()
+
         super().__init__(
             name="bash",
-            description="Run a shell command and return its stdout/stderr",
+            description="Run a shell command in a Docker sandbox (no network); the project is mounted at /workspace",
             parameters={
                 "type": "object",
                 "properties": {
@@ -93,13 +101,32 @@ class BashTool(AgentTool):
     def execute(self, command: str) -> str:
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                [
+                    "docker", "run",
+                    "--rm",
+
+                    "--network", "none",
+                    "--read-only",
+                    "--tmpfs", "/tmp",
+                    "--pids-limit", "100",
+                    "--memory", "512m",
+
+                    "--mount",
+                    f"type=bind,source={self.workspace},target=/workspace",
+
+                    "--workdir", "/workspace",
+
+                    self.IMAGE,
+                    "sh", "-lc", command,
+                ],
                 capture_output=True,
                 text=True,
+                timeout=self.TIMEOUT,
             )
             output = result.stdout + result.stderr
             return output.strip() or f"(exit code {result.returncode}, no output)"
+        except subprocess.TimeoutExpired:
+            return f"Error: command timed out after {self.TIMEOUT}s"
         except Exception as e:
             return f"Error: {e}"
 
@@ -146,4 +173,4 @@ class EditTool(AgentTool):
             return f"Error: {e}"
 
 
-tools = [ReadTool(), WriteTool(), BashTool(), EditTool()]
+tools = [ReadTool(), WriteTool(), BashTool(WORKSPACE), EditTool()]

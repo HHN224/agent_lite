@@ -10,7 +10,7 @@
 
 - 🤖 **真正的 Agent 循环**：模型可自主决定是否调用工具，并在工具返回结果后继续推理，直到给出最终回答
 - 📂 **文件工具**：`read` 读取文件、`write` 写入文件、`edit` 精确替换文件内容
-- 🖥️ **Shell 工具**：`bash` 执行任意系统命令并返回 stdout / stderr
+- 🖥️ **Shell 工具**：`bash` 在一次性 Docker 沙箱容器中执行命令（无网络、只读根文件系统、512MB 内存 / 100 进程限额），工作目录通过 bind mount 挂载到容器 `/workspace`
 - 💬 **交互式 REPL**：终端中输入提示词即可与 Agent 持续对话
 - 🔧 **接口兼容 OpenAI**：使用 `openai` SDK 接入 DeepSeek API，替换 `base_url` 即可迁移到其他兼容服务
 
@@ -59,6 +59,7 @@ agent lite/
 ### 1. 环境要求
 
 - Python 3.10+
+- Docker Desktop（`bash` 工具的沙箱运行环境，需启动守护进程并拉取 `python:3.12-slim` 镜像）
 - 一个 [DeepSeek 开放平台](https://platform.deepseek.com/) 的 API Key
 
 ### 2. 安装依赖
@@ -101,9 +102,9 @@ python -m coding_agent
 
 ## ⚠️ 安全须知
 
-- `bash` 工具会以**当前用户权限**执行任意命令，请勿在不受信任的环境中运行，也不要让 AI 接触敏感系统
+- `bash` 工具在 Docker 沙箱中运行（断网 + 资源限额），但工作目录以可写方式挂载进容器，AI 仍可通过命令修改项目内文件
 - 请勿将 API Key 硬编码进代码并提交到 Git 仓库（当前代码已从环境变量 `DEEPSEEK_API_KEY` 读取密钥）
-- 本项目的工具没有沙箱、权限校验和路径限制，仅适合本地学习与实验
+- 文件工具通过 `safe_path` 限制在工作目录内，但本项目的工具仍没有完整的权限校验，仅适合本地学习与实验
 
 ---
 
