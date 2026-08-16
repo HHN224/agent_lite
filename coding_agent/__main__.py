@@ -1,4 +1,6 @@
+import argparse
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -10,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 
 from ai import OpenAIProvider
-from agent_core import Agent, AgentLoop
+from agent_core import Agent, AgentLoop, SessionStore
 from coding_agent.tools import tools
 
 
@@ -19,8 +21,36 @@ SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them 
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
+# 会话存档目录：sessions/<会话名>.json
+SESSIONS_DIR = Path(__file__).resolve().parent.parent / "sessions"
+
+# 会话名白名单，防止 --session ../../xxx 之类的路径越界
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Agent Lite 交互式 REPL")
+    parser.add_argument(
+        "--session",
+        default="default",
+        help="会话名，对应 sessions/<name>.json（默认 default）",
+    )
+    parser.add_argument(
+        "--new",
+        action="store_true",
+        help="不恢复历史，从新会话开始（仍会存档到同一文件）",
+    )
+    args = parser.parse_args(argv)
+
+    if not SESSION_NAME_RE.match(args.session):
+        parser.error("会话名只能包含字母、数字、下划线和连字符，长度 1-64")
+
+    return args
+
 
 def main():
+    args = parse_args()
+
     load_dotenv(ENV_FILE)
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -31,7 +61,7 @@ def main():
             '或设置环境变量：$env:DEEPSEEK_API_KEY = "sk-xxxx"'
         )
 
-    # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态
+    # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态 + 会话存档
     provider = OpenAIProvider(
         api_key=api_key,
         base_url="https://api.deepseek.com",
@@ -43,14 +73,24 @@ def main():
         tools=tools,
     )
 
+    store = SessionStore(SESSIONS_DIR / f"{args.session}.json")
+
+    print(f">>> 会话: {args.session}（存档: {store.path}）")
+
     agent = Agent(
         loop=loop,
         system_prompt=SYSTEM_PROMPT,
+        store=store,
+        resume=not args.new,
     )
 
     while True:
         try:
             user_input = input("> ")
+            if user_input.strip() == "/clear":
+                agent.clear_history()
+                print(">>> 已清空对话历史")
+                continue
             agent.prompt(user_input)  # 回复已在循环内流式打印，这里只负责结束行
             print()
         except (KeyboardInterrupt, EOFError):

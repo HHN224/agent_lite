@@ -11,6 +11,7 @@
 - 🤖 **真正的 Agent 循环**：模型可自主决定是否调用工具，并在工具返回结果后继续推理，直到给出最终回答
 - ⚡ **流式输出**：回复按 token 实时打印，工具调用过程同步可见
 - 🛡️ **循环健壮性**：工具调用轮数上限、工具错误回填模型、API 故障不崩溃（统一 `ProviderError`）、Ctrl+C 优雅退出
+- 💾 **会话持久化**：每轮对话自动存档为 JSON，重启自动恢复历史，支持多会话与 `/clear` 清空
 - 📂 **文件工具**：`read` 读取文件、`write` 写入文件、`edit` 精确替换文件内容
 - 🖥️ **Shell 工具**：`bash` 在一次性 Docker 沙箱容器中执行命令（无网络、只读根文件系统、512MB 内存 / 100 进程限额），工作目录通过 bind mount 挂载到容器 `/workspace`
 - 💬 **交互式 REPL**：终端中输入提示词即可与 Agent 持续对话
@@ -51,7 +52,8 @@
 ├─────────────────────────────────────────────┤
 │  agent_core    核心层                        │
 │  · Agent      管理对话状态（messages / system│
-│               prompt），对外只暴露 prompt()   │
+│               prompt）与会话持久化，对外只   │
+│               暴露 prompt()                   │
 │  · AgentLoop  只管"接收 messages → 经 Provider │
 │               流式调模型 → 执行工具 → 回填结果"  │
 │               的机械循环，不接触具体 API SDK     │
@@ -78,13 +80,15 @@ agent lite/
 ├── ai/               # 最底层：Tool 数据类与 Provider 流式调用契约
 │   ├── tools.py      # Tool（name / description / parameters → schema）
 │   └── providers.py  # LLMProvider 抽象 + OpenAI 兼容流式实现
-├── agent_core/       # 核心层：Agent（对话状态）与 AgentLoop（模型循环）、AgentTool 抽象接口
+├── agent_core/       # 核心层：Agent（对话状态 + 会话持久化）、AgentLoop（模型循环）、AgentTool 抽象接口
 │   ├── agent.py
 │   ├── loop.py
+│   ├── session.py    # SessionStore：会话状态 ↔ JSON 存档
 │   └── agent_tools.py
 ├── coding_agent/     # 应用层（最上层）：四个具体工具 + CLI 入口
 │   ├── tools.py      # read / write / bash / edit
 │   └── __main__.py   # 入口：python -m coding_agent
+├── sessions/         # 会话存档（每轮自动保存，已 gitignore）
 └── README.md         # 项目说明文档
 ```
 
@@ -134,6 +138,12 @@ python -m coding_agent
 > 读取当前目录下的 README.md，并把项目说明翻译成英文写进 notes.md
 ```
 
+每轮对话自动存档到 `sessions/default.json`，重启后自动恢复历史。可选参数：
+
+- `--session NAME`：使用不同会话（存档为 `sessions/NAME.json`）
+- `--new`：忽略已有历史，从新会话开始
+- 对话中输入 `/clear` 清空当前会话历史
+
 ---
 
 ## ⚠️ 安全须知
@@ -148,7 +158,7 @@ python -m coding_agent
 
 - 增加更多工具：网络请求（`requests`）、数据库查询、图片处理等
 - 为工具加入路径白名单 / 命令黑名单等安全校验
-- 持久化对话历史，支持多轮记忆
+- 增加上下文压缩（超长对话自动总结），见 pi 的 compaction 设计
 
 ---
 
