@@ -1,6 +1,6 @@
 import json
 
-from ai import TextDelta, ToolCall
+from ai import ProviderError, TextDelta, ToolCall
 
 
 class AgentLoop:
@@ -24,12 +24,17 @@ class AgentLoop:
             tool_calls: list[ToolCall] = []
 
             print("\n>>> 调用 API ...")
-            for event in self.provider.stream(messages, self.tools, self.model):
-                if isinstance(event, TextDelta):
-                    print(event.content, end="", flush=True)
-                    text_parts.append(event.content)
-                elif isinstance(event, ToolCall):
-                    tool_calls.append(event)
+            try:
+                for event in self.provider.stream(messages, self.tools, self.model):
+                    if isinstance(event, TextDelta):
+                        print(event.content, end="", flush=True)
+                        text_parts.append(event.content)
+                    elif isinstance(event, ToolCall):
+                        tool_calls.append(event)
+            except ProviderError as e:
+                # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
+                print(f"\n>>> 模型服务出错: {e}")
+                return f"(模型服务出错：{e})"
 
             if text_parts:
                 print()  # 结束流式输出所在的行
@@ -76,6 +81,8 @@ class AgentLoop:
             return f"Error: unknown tool '{call.name}'"
 
         try:
-            return tool.execute(**call.arguments)
+            result = tool.execute(**call.arguments)
+            # 契约要求 execute 返回 str；工具违反契约时兜底序列化，避免消息里混入非字符串
+            return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
         except Exception as e:
             return f"Error: {e}"

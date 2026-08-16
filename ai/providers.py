@@ -9,9 +9,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Iterator, Union
 
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 
 from .tools import Tool
+
+
+class ProviderError(Exception):
+    """Provider 层的统一异常：API / 网络 / 协议解析错误都包装成本类型。
+
+    上层循环只需捕获它即可做到「模型服务故障不崩溃」，无需了解具体 SDK 的异常体系。
+    """
 
 
 @dataclass
@@ -37,6 +44,7 @@ class LLMProvider(ABC):
     """流式 Provider 契约：把「messages + 工具定义」变成一串流式事件。
 
     只负责「如何向某个 LLM 提问」，不知道也不关心谁来消费这些事件。
+    任何失败都抛 ProviderError。
     """
 
     @abstractmethod
@@ -52,48 +60,54 @@ class OpenAIProvider(LLMProvider):
 
     内部消化了 OpenAI 流式协议里「工具调用参数分片返回」的细节：
     按 tool_call.index 累积 arguments，流结束后再产出完整的 ToolCall。
+    连接类错误由 SDK 自动重试（max_retries），所有失败统一抛 ProviderError。
     """
 
     def __init__(self, api_key: str, base_url: str | None = None):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
 
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=[t.to_schema() for t in tools],
-            stream=True,
-        )
-
         # 流式协议下 tool_calls 按 index 分片到达，先累积、流结束后再产出完整事件
         pending: dict[int, dict[str, str]] = {}
 
-        for chunk in response:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta is None:
-                continue
+        try:
+            response = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[t.to_schema() for t in tools],
+                stream=True,
+            )
 
-            if delta.content:
-                yield TextDelta(delta.content)
+            for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta is None:
+                    continue
 
-            for tc in delta.tool_calls or []:
-                acc = pending.setdefault(tc.index, {"id": "", "name": "", "args": ""})
-                if tc.id:
-                    acc["id"] = tc.id
-                if tc.function and tc.function.name:
-                    acc["name"] = tc.function.name
-                if tc.function and tc.function.arguments:
-                    acc["args"] += tc.function.arguments
+                if delta.content:
+                    yield TextDelta(delta.content)
+
+                for tc in delta.tool_calls or []:
+                    acc = pending.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                    if tc.id:
+                        acc["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        acc["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        acc["args"] += tc.function.arguments
+        except OpenAIError as e:
+            raise ProviderError(f"模型 API 错误: {e}") from e
 
         for index in sorted(pending):
             acc = pending[index]
             try:
                 arguments = json.loads(acc["args"]) if acc["args"] else {}
-            except json.JSONDecodeError:
-                # 极少见：模型输出非法 JSON，按空参数处理，交由上层循环纠错
-                arguments = {}
+            except json.JSONDecodeError as e:
+                # 不再静默吞掉：明确告知上层「模型输出了非法 JSON 参数」
+                raise ProviderError(
+                    f"工具 {acc['name']!r} 的参数不是合法 JSON: {acc['args'][:200]!r}"
+                ) from e
             yield ToolCall(id=acc["id"], name=acc["name"], arguments=arguments)

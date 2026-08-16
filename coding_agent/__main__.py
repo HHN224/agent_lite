@@ -1,5 +1,6 @@
 import os
 import sys
+import traceback
 from pathlib import Path
 
 # 支持直接运行本文件（如 VS Code 运行按钮）：把项目根目录加入 sys.path，
@@ -48,9 +49,17 @@ def main():
     )
 
     while True:
-        user_input = input("> ")
-        agent.prompt(user_input)  # 回复已在循环内流式打印，这里只负责结束行
-        print()
+        try:
+            user_input = input("> ")
+            agent.prompt(user_input)  # 回复已在循环内流式打印，这里只负责结束行
+            print()
+        except (KeyboardInterrupt, EOFError):
+            print("\n再见！")
+            break
+        except Exception:
+            # 任何未预期错误都只跳过本轮，不退出会话
+            print("\n发生未预期错误，已跳过本轮：")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
