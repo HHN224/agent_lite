@@ -7,8 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
-from openai import OpenAI
 
+from ai import OpenAIProvider
 from agent_core import Agent, AgentLoop
 from coding_agent.tools import tools
 
@@ -30,13 +30,14 @@ def main():
             '或设置环境变量：$env:DEEPSEEK_API_KEY = "sk-xxxx"'
         )
 
-    client = OpenAI(
+    # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态
+    provider = OpenAIProvider(
         api_key=api_key,
         base_url="https://api.deepseek.com",
     )
 
     loop = AgentLoop(
-        client=client,
+        provider=provider,
         model="deepseek-v4-flash",
         tools=tools,
     )
@@ -48,7 +49,8 @@ def main():
 
     while True:
         user_input = input("> ")
-        print(agent.prompt(user_input))
+        agent.prompt(user_input)  # 回复已在循环内流式打印，这里只负责结束行
+        print()
 
 
 if __name__ == "__main__":

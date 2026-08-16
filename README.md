@@ -9,6 +9,7 @@
 ## ✨ 功能特性
 
 - 🤖 **真正的 Agent 循环**：模型可自主决定是否调用工具，并在工具返回结果后继续推理，直到给出最终回答
+- ⚡ **流式输出**：回复按 token 实时打印，工具调用过程同步可见
 - 📂 **文件工具**：`read` 读取文件、`write` 写入文件、`edit` 精确替换文件内容
 - 🖥️ **Shell 工具**：`bash` 在一次性 Docker 沙箱容器中执行命令（无网络、只读根文件系统、512MB 内存 / 100 进程限额），工作目录通过 bind mount 挂载到容器 `/workspace`
 - 💬 **交互式 REPL**：终端中输入提示词即可与 Agent 持续对话
@@ -50,13 +51,16 @@
 │  agent_core    核心层                        │
 │  · Agent      管理对话状态（messages / system│
 │               prompt），对外只暴露 prompt()   │
-│  · AgentLoop  只管"接收 messages → 调模型 →  │
-│               执行工具 → 回填结果"的机械循环   │
+│  · AgentLoop  只管"接收 messages → 经 Provider │
+│               流式调模型 → 执行工具 → 回填结果"  │
+│               的机械循环，不接触具体 API SDK     │
 │  · AgentTool  具体工具必须实现的 execute 契约  │
 ├─────────────────────────────────────────────┤
 │  ai           最底层                          │
 │  · Tool       工具数据类（name/description/  │
 │               parameters → OpenAI schema）   │
+│  · Provider   LLMProvider 流式调用契约 +     │
+│               OpenAI 兼容实现                │
 └─────────────────────────────────────────────┘
 ```
 
@@ -70,8 +74,9 @@
 
 ```
 agent lite/
-├── ai/               # 最底层：Tool 数据类（name / description / parameters → schema）
-│   └── tools.py
+├── ai/               # 最底层：Tool 数据类与 Provider 流式调用契约
+│   ├── tools.py      # Tool（name / description / parameters → schema）
+│   └── providers.py  # LLMProvider 抽象 + OpenAI 兼容流式实现
 ├── agent_core/       # 核心层：Agent（对话状态）与 AgentLoop（模型循环）、AgentTool 抽象接口
 │   ├── agent.py
 │   ├── loop.py
@@ -142,7 +147,6 @@ python -m coding_agent
 
 - 增加更多工具：网络请求（`requests`）、数据库查询、图片处理等
 - 为工具加入路径白名单 / 命令黑名单等安全校验
-- 使用 `stream=True` 实现流式输出，提升交互体验
 - 持久化对话历史，支持多轮记忆
 
 ---
