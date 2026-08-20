@@ -12,11 +12,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 
 from ai import OpenAIProvider
-from agent_core import Agent, AgentLoop, SessionStore
+from agent_core import Agent, AgentEvent, AgentLoop, SessionStore
 from coding_agent.tools import tools
 
 
 SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."
+
+
+def cli_listener(event: AgentEvent):
+    """把 AgentLoop 的事件流渲染成终端输出（复刻原来的 >>> 提示格式）。"""
+    if event.type == "api_start":
+        print("\n>>> 调用 API ...")
+    elif event.type == "text_delta":
+        print(event.data["content"], end="", flush=True)
+    elif event.type == "text_end":
+        print()
+    elif event.type == "tool_start":
+        print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
+    elif event.type == "tool_end":
+        print(f">>> 工具返回: {event.data['content'][:200]}")
+    elif event.type == "error":
+        print(f"\n>>> 模型服务出错: {event.data['message']}")
 
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -72,6 +88,7 @@ def main():
         model="deepseek-v4-flash",
         tools=tools,
     )
+    loop.add_listener(cli_listener)
 
     store = SessionStore(SESSIONS_DIR / f"{args.session}.json")
 

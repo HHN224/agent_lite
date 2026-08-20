@@ -5,6 +5,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from ai import ProviderError, TextDelta, ToolCall
 
 from .agent_tools import ToolResult
+from .events import AgentEvent
 
 
 class AgentLoop:
@@ -13,6 +14,9 @@ class AgentLoop:
     本类只管"接收 messages → 驱动模型 → 追加结果"的机械循环，不关心上下文怎么构建与压缩；
     上下文管理（system prompt、历史累积、消息改写）由 Agent 负责。
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
+
+    运行过程中只 emit AgentEvent，不做任何 print / UI；
+    显示由外部通过 add_listener 注册的监听器负责（CLI、Web、日志等）。
     """
 
     def __init__(self, provider, model, tools, max_iterations: int = 10):
@@ -21,27 +25,37 @@ class AgentLoop:
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
+        self._listeners: list = []
+
+    def add_listener(self, fn):
+        """注册一个事件监听器；emit 事件时会依次调用每个监听器 fn(event)。"""
+        self._listeners.append(fn)
+
+    def emit(self, event: AgentEvent):
+        """把事件分发给所有已注册的监听器。"""
+        for fn in self._listeners:
+            fn(event)
 
     def run(self, messages: list) -> str:
         for _ in range(self.max_iterations):
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
 
-            print("\n>>> 调用 API ...")
+            self.emit(AgentEvent("api_start"))
             try:
                 for event in self.provider.stream(messages, self.tools, self.model):
                     if isinstance(event, TextDelta):
-                        print(event.content, end="", flush=True)
+                        self.emit(AgentEvent("text_delta", {"content": event.content}))
                         text_parts.append(event.content)
                     elif isinstance(event, ToolCall):
                         tool_calls.append(event)
             except ProviderError as e:
                 # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
-                print(f"\n>>> 模型服务出错: {e}")
+                self.emit(AgentEvent("error", {"message": str(e)}))
                 return f"(模型服务出错：{e})"
 
             if text_parts:
-                print()  # 结束流式输出所在的行
+                self.emit(AgentEvent("text_end"))
 
             # 没有工具调用，说明模型已经回答完了
             if not tool_calls:
@@ -66,9 +80,9 @@ class AgentLoop:
 
             # 依次执行工具并回填结果
             for call in tool_calls:
-                print(f">>> 正在使用工具: {call.name} | 参数: {call.arguments}")
+                self.emit(AgentEvent("tool_start", {"name": call.name, "arguments": call.arguments}))
                 result = self._execute(call)
-                print(f">>> 工具返回: {result.content[:200]}")
+                self.emit(AgentEvent("tool_end", {"content": result.content, "is_error": result.is_error}))
 
                 messages.append({
                     "role": "tool",
