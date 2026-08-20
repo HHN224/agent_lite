@@ -82,6 +82,10 @@ class AgentLoop:
         if tool is None:
             return ToolResult(content=f"Error: unknown tool '{call.name}'", is_error=True)
 
+        errors = tool.validate_arguments(call.arguments)
+        if errors:
+            return ToolResult(content="Error: " + "; ".join(errors), is_error=True)
+
         try:
             return tool.execute(**call.arguments)
         except Exception as e:

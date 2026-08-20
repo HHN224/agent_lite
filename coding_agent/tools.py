@@ -18,6 +18,8 @@ def safe_path(path: str) -> Path:
 
 
 class ReadTool(AgentTool):
+    argument_types = {"path": str}
+
     def __init__(self):
         super().__init__(
             name="read",
@@ -42,6 +44,8 @@ class ReadTool(AgentTool):
 
 
 class WriteTool(AgentTool):
+    argument_types = {"path": str, "content": str}
+
     def __init__(self):
         super().__init__(
             name="write",
@@ -65,6 +69,8 @@ class WriteTool(AgentTool):
 class BashTool(AgentTool):
     """在一次性 Docker 容器中执行命令：无网络、只读根文件系统、资源限额，
     仅通过 bind mount 把工作目录暴露给容器。"""
+
+    argument_types = {"command": str}
 
     IMAGE = "python:3.12-slim"
     TIMEOUT = 30
@@ -116,6 +122,8 @@ class BashTool(AgentTool):
 
 
 class EditTool(AgentTool):
+    argument_types = {"path": str, "old_string": str, "new_string": str}
+
     def __init__(self):
         super().__init__(
             name="edit",

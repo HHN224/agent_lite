@@ -26,6 +26,25 @@ class AgentTool(Tool, ABC):
     具体工具由上层继承本类并实现 execute() 来提供。
     """
 
+    argument_types: dict = {}
+
+    def validate_arguments(self, args: dict) -> list[str]:
+        """自检参数：返回错误消息列表，空列表表示通过。
+
+        只做最简单的"必填 + 类型"两项检查，不解析 JSON Schema。
+        子类通过覆盖 argument_types 声明每个参数期望的 Python 类型，例如：
+            argument_types = {"path": str}
+        """
+        if not isinstance(args, dict):
+            return ["arguments should be a JSON object"]
+        errors = []
+        for key, typ in self.argument_types.items():
+            if key not in args:
+                errors.append(f"{key} is required")
+            elif not isinstance(args[key], typ):
+                errors.append(f"{key} should be {typ.__name__}, got {type(args[key]).__name__}")
+        return errors
+
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
         """执行工具，返回 ToolResult（content + is_error）。"""
