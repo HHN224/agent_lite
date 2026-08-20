@@ -8,6 +8,14 @@ from .agent_tools import ToolResult
 from .events import AgentEvent
 
 
+class StepResult:
+    """单步 step() 的返回值：标记这一轮是否结束，并携带最终回复（若已结束）。"""
+
+    def __init__(self, finished: bool, text: str = ""):
+        self.finished = finished
+        self.text = text
+
+
 class AgentLoop:
     """仿 pi-agent 的核心循环：流式调模型 → 若有 tool_calls 则执行 → 循环直到模型直接回复。
 
@@ -15,7 +23,8 @@ class AgentLoop:
     上下文管理（system prompt、历史累积、消息改写）由 Agent 负责。
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
 
-    run() 是一个生成器：逐个 yield AgentEvent，消费者（CLI / Web）用 for 迭代。
+    run() 是生成器薄壳：反复调 step() 直到某轮 finished；单轮逻辑在 step()。
+    两者都逐个 yield AgentEvent，消费者（CLI / Web）用 for 迭代。
     最终回复通过生成器 return 值返回（yield from 可捕获）。
     """
 
@@ -27,70 +36,87 @@ class AgentLoop:
         self.max_iterations = max_iterations
 
     def run(self, messages: list):
-        """生成器：逐个 yield AgentEvent，return 最终回复字符串。"""
+        """生成器：反复 step() 直到某轮 finished，return 最终回复字符串。
+
+        本方法只管"循环 + 判断是否结束"，单轮逻辑在 step() 里；
+        所有事件由 step() 产出，这里用 yield from 透传给消费者。
+        """
         for _ in range(self.max_iterations):
-            yield AgentEvent("turn_start")
-
-            text_parts: list[str] = []
-            tool_calls: list[ToolCall] = []
-            message_started = False
-
-            try:
-                for event in self.provider.stream(messages, self.tools, self.model):
-                    if isinstance(event, TextDelta):
-                        if not message_started:
-                            yield AgentEvent("message_start")
-                            message_started = True
-                        yield AgentEvent("message_update", {"content": event.content})
-                        text_parts.append(event.content)
-                    elif isinstance(event, ToolCall):
-                        tool_calls.append(event)
-            except ProviderError as e:
-                # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
-                yield AgentEvent("error", {"message": str(e)})
-                yield AgentEvent("turn_end")
-                return f"(模型服务出错：{e})"
-
-            if message_started:
-                yield AgentEvent("message_end")
-
-            # 没有工具调用，说明模型已经回答完了
-            if not tool_calls:
-                yield AgentEvent("turn_end")
-                return "".join(text_parts)
-
-            # 把这一轮 assistant 消息以标准 dict 形式记入历史
-            messages.append({
-                "role": "assistant",
-                "content": "".join(text_parts) or None,
-                "tool_calls": [
-                    {
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                        },
-                    }
-                    for call in tool_calls
-                ],
-            })
-
-            # 依次执行工具并回填结果
-            for call in tool_calls:
-                yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
-                result = self._execute(call)
-                yield AgentEvent("tool_execution_end", {"content": result.content, "is_error": result.is_error})
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": result.content,
-                })
-
-            yield AgentEvent("turn_end")
+            result = yield from self.step(messages)
+            if result.finished:
+                return result.text
 
         return "\n(已达到最大工具调用轮数，停止循环)"
+
+    def step(self, messages: list):
+        """单步生成器：跑一轮（调模型 → 可能执行工具），yield AgentEvent，return StepResult。
+
+        三种结束路径：
+          - ProviderError  → StepResult(finished=True, text=错误信息)
+          - 模型直接回复    → StepResult(finished=True, text=最终回复)
+          - 执行了工具      → StepResult(finished=False)（还需下一轮让模型看到结果）
+        """
+        yield AgentEvent("turn_start")
+
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        message_started = False
+
+        try:
+            for event in self.provider.stream(messages, self.tools, self.model):
+                if isinstance(event, TextDelta):
+                    if not message_started:
+                        yield AgentEvent("message_start")
+                        message_started = True
+                    yield AgentEvent("message_update", {"content": event.content})
+                    text_parts.append(event.content)
+                elif isinstance(event, ToolCall):
+                    tool_calls.append(event)
+        except ProviderError as e:
+            # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
+            yield AgentEvent("error", {"message": str(e)})
+            yield AgentEvent("turn_end")
+            return StepResult(finished=True, text=f"(模型服务出错：{e})")
+
+        if message_started:
+            yield AgentEvent("message_end")
+
+        # 没有工具调用，说明模型已经回答完了
+        if not tool_calls:
+            yield AgentEvent("turn_end")
+            return StepResult(finished=True, text="".join(text_parts))
+
+        # 把这一轮 assistant 消息以标准 dict 形式记入历史
+        messages.append({
+            "role": "assistant",
+            "content": "".join(text_parts) or None,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    },
+                }
+                for call in tool_calls
+            ],
+        })
+
+        # 依次执行工具并回填结果
+        for call in tool_calls:
+            yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
+            result = self._execute(call)
+            yield AgentEvent("tool_execution_end", {"content": result.content, "is_error": result.is_error})
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result.content,
+            })
+
+        yield AgentEvent("turn_end")
+        return StepResult(finished=False)
 
     def _execute(self, call: ToolCall) -> ToolResult:
         """执行单个工具调用；任何错误或超时都转成 ToolResult(is_error=True) 回填给模型，而不是让循环崩溃。"""
