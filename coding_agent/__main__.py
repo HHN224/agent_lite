@@ -20,16 +20,16 @@ SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them 
 
 
 def cli_listener(event: AgentEvent):
-    """把 AgentLoop 的事件流渲染成终端输出（复刻原来的 >>> 提示格式）。"""
-    if event.type == "api_start":
+    """把 Agent 的事件流渲染成终端输出（复刻原来的 >>> 提示格式）。"""
+    if event.type == "turn_start":
         print("\n>>> 调用 API ...")
-    elif event.type == "text_delta":
+    elif event.type == "message_update":
         print(event.data["content"], end="", flush=True)
-    elif event.type == "text_end":
+    elif event.type == "message_end":
         print()
-    elif event.type == "tool_start":
+    elif event.type == "tool_execution_start":
         print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
-    elif event.type == "tool_end":
+    elif event.type == "tool_execution_end":
         print(f">>> 工具返回: {event.data['content'][:200]}")
     elif event.type == "error":
         print(f"\n>>> 模型服务出错: {event.data['message']}")
@@ -88,7 +88,6 @@ def main():
         model="deepseek-v4-flash",
         tools=tools,
     )
-    loop.add_listener(cli_listener)
 
     store = SessionStore(SESSIONS_DIR / f"{args.session}.json")
 
@@ -108,8 +107,8 @@ def main():
                 agent.clear_history()
                 print(">>> 已清空对话历史")
                 continue
-            agent.prompt(user_input)  # 回复已在循环内流式打印，这里只负责结束行
-            print()
+            for event in agent.prompt(user_input):
+                cli_listener(event)
         except (KeyboardInterrupt, EOFError):
             print("\n再见！")
             break

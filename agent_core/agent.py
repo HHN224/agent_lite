@@ -1,9 +1,15 @@
+from .events import AgentEvent
+
+
 class Agent:
     """仿 pi-agent 的 Agent：负责管理对话状态（messages 与 system prompt）。
 
     AgentLoop 只负责"接收 messages → 调模型 → 执行工具 → 回填结果"的机械循环，
     而上下文由本类掌控：system prompt 的注入、历史消息的累积、会话的持久化，
     以及将来消息的压缩 / 改写，都发生在这里。
+
+    prompt() 是一个生成器：yield agent_start → 转发 loop 的全部事件 → yield agent_end。
+    消费者（CLI / Web）用 for event in agent.prompt(...) 迭代。
     """
 
     def __init__(self, loop, system_prompt: str = "", store=None, resume: bool = True):
@@ -17,16 +23,19 @@ class Agent:
         if store is not None and resume:
             self._restore()
 
-    def prompt(self, user_input: str) -> str:
-        """追加一条用户消息并驱动循环，返回模型最终回复；每轮结束后自动存档。
+    def prompt(self, user_input: str):
+        """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
 
         对话历史由本类维护并原样传给 AgentLoop；
         AgentLoop 在运行过程中会把模型回复与工具结果追加回 self.messages。
         """
         self.messages.append({"role": "user", "content": user_input})
-        result = self.loop.run(self.messages)
+
+        yield AgentEvent("agent_start")
+        final_text = yield from self.loop.run(self.messages)
+        yield AgentEvent("agent_end", {"text": final_text})
+
         self._save()
-        return result
 
     def clear_history(self):
         """清空对话历史，仅保留 system prompt，并同步存档。"""

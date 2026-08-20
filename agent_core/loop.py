@@ -15,8 +15,8 @@ class AgentLoop:
     上下文管理（system prompt、历史累积、消息改写）由 Agent 负责。
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
 
-    运行过程中只 emit AgentEvent，不做任何 print / UI；
-    显示由外部通过 add_listener 注册的监听器负责（CLI、Web、日志等）。
+    run() 是一个生成器：逐个 yield AgentEvent，消费者（CLI / Web）用 for 迭代。
+    最终回复通过生成器 return 值返回（yield from 可捕获）。
     """
 
     def __init__(self, provider, model, tools, max_iterations: int = 10):
@@ -25,40 +25,38 @@ class AgentLoop:
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
-        self._listeners: list = []
 
-    def add_listener(self, fn):
-        """注册一个事件监听器；emit 事件时会依次调用每个监听器 fn(event)。"""
-        self._listeners.append(fn)
-
-    def emit(self, event: AgentEvent):
-        """把事件分发给所有已注册的监听器。"""
-        for fn in self._listeners:
-            fn(event)
-
-    def run(self, messages: list) -> str:
+    def run(self, messages: list):
+        """生成器：逐个 yield AgentEvent，return 最终回复字符串。"""
         for _ in range(self.max_iterations):
+            yield AgentEvent("turn_start")
+
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
+            message_started = False
 
-            self.emit(AgentEvent("api_start"))
             try:
                 for event in self.provider.stream(messages, self.tools, self.model):
                     if isinstance(event, TextDelta):
-                        self.emit(AgentEvent("text_delta", {"content": event.content}))
+                        if not message_started:
+                            yield AgentEvent("message_start")
+                            message_started = True
+                        yield AgentEvent("message_update", {"content": event.content})
                         text_parts.append(event.content)
                     elif isinstance(event, ToolCall):
                         tool_calls.append(event)
             except ProviderError as e:
                 # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
-                self.emit(AgentEvent("error", {"message": str(e)}))
+                yield AgentEvent("error", {"message": str(e)})
+                yield AgentEvent("turn_end")
                 return f"(模型服务出错：{e})"
 
-            if text_parts:
-                self.emit(AgentEvent("text_end"))
+            if message_started:
+                yield AgentEvent("message_end")
 
             # 没有工具调用，说明模型已经回答完了
             if not tool_calls:
+                yield AgentEvent("turn_end")
                 return "".join(text_parts)
 
             # 把这一轮 assistant 消息以标准 dict 形式记入历史
@@ -80,15 +78,17 @@ class AgentLoop:
 
             # 依次执行工具并回填结果
             for call in tool_calls:
-                self.emit(AgentEvent("tool_start", {"name": call.name, "arguments": call.arguments}))
+                yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
                 result = self._execute(call)
-                self.emit(AgentEvent("tool_end", {"content": result.content, "is_error": result.is_error}))
+                yield AgentEvent("tool_execution_end", {"content": result.content, "is_error": result.is_error})
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": result.content,
                 })
+
+            yield AgentEvent("turn_end")
 
         return "\n(已达到最大工具调用轮数，停止循环)"
 
