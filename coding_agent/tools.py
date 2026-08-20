@@ -30,21 +30,15 @@ class ReadTool(AgentTool):
         )
 
     def execute(self, path: str) -> ToolResult:
-        try:
-            file = safe_path(path)
+        file = safe_path(path)
 
-            if not file.exists():
-                return ToolResult(content=f"Error: file not found: {path}", is_error=True)
+        if not file.exists():
+            return ToolResult(content=f"Error: file not found: {path}", is_error=True)
 
-            if not file.is_file():
-                return ToolResult(content=f"Error: not a file: {path}", is_error=True)
+        if not file.is_file():
+            return ToolResult(content=f"Error: not a file: {path}", is_error=True)
 
-            return ToolResult(content=file.read_text(encoding="utf-8"))
-
-        except PermissionError as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
+        return ToolResult(content=file.read_text(encoding="utf-8"))
 
 
 class WriteTool(AgentTool):
@@ -63,14 +57,9 @@ class WriteTool(AgentTool):
         )
 
     def execute(self, path: str, content: str) -> ToolResult:
-        try:
-            file = safe_path(path)
-            file.write_text(content, encoding="utf-8")
-            return ToolResult(content=f"Successfully wrote to {path}")
-        except PermissionError as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
+        file = safe_path(path)
+        file.write_text(content, encoding="utf-8")
+        return ToolResult(content=f"Successfully wrote to {path}")
 
 
 class BashTool(AgentTool):
@@ -99,36 +88,31 @@ class BashTool(AgentTool):
         )
 
     def execute(self, command: str) -> ToolResult:
-        try:
-            result = subprocess.run(
-                [
-                    "docker", "run",
-                    "--rm",
+        result = subprocess.run(
+            [
+                "docker", "run",
+                "--rm",
 
-                    "--network", "none",
-                    "--read-only",
-                    "--tmpfs", "/tmp",
-                    "--pids-limit", "100",
-                    "--memory", "512m",
+                "--network", "none",
+                "--read-only",
+                "--tmpfs", "/tmp",
+                "--pids-limit", "100",
+                "--memory", "512m",
 
-                    "--mount",
-                    f"type=bind,source={self.workspace},target=/workspace",
+                "--mount",
+                f"type=bind,source={self.workspace},target=/workspace",
 
-                    "--workdir", "/workspace",
+                "--workdir", "/workspace",
 
-                    self.IMAGE,
-                    "sh", "-lc", command,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=self.TIMEOUT,
-            )
-            output = result.stdout + result.stderr
-            return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
-        except subprocess.TimeoutExpired:
-            return ToolResult(content=f"Error: command timed out after {self.TIMEOUT}s", is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
+                self.IMAGE,
+                "sh", "-lc", command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=self.TIMEOUT,
+        )
+        output = result.stdout + result.stderr
+        return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
 
 
 class EditTool(AgentTool):
@@ -148,29 +132,24 @@ class EditTool(AgentTool):
         )
 
     def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
-        try:
-            file = safe_path(path)
+        file = safe_path(path)
 
-            if not file.exists():
-                return ToolResult(content=f"Error: file not found: {path}", is_error=True)
+        if not file.exists():
+            return ToolResult(content=f"Error: file not found: {path}", is_error=True)
 
-            if not file.is_file():
-                return ToolResult(content=f"Error: not a file: {path}", is_error=True)
+        if not file.is_file():
+            return ToolResult(content=f"Error: not a file: {path}", is_error=True)
 
-            content = file.read_text(encoding="utf-8")
+        content = file.read_text(encoding="utf-8")
 
-            if content.count(old_string) == 0:
-                return ToolResult(content=f"Error: old_string not found in {path}", is_error=True)
+        if content.count(old_string) == 0:
+            return ToolResult(content=f"Error: old_string not found in {path}", is_error=True)
 
-            if content.count(old_string) > 1:
-                return ToolResult(content=f"Error: old_string matches {content.count(old_string)} times in {path}; it must be unique", is_error=True)
+        if content.count(old_string) > 1:
+            return ToolResult(content=f"Error: old_string matches {content.count(old_string)} times in {path}; it must be unique", is_error=True)
 
-            file.write_text(content.replace(old_string, new_string), encoding="utf-8")
-            return ToolResult(content=f"Successfully edited {path}")
-        except PermissionError as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
+        file.write_text(content.replace(old_string, new_string), encoding="utf-8")
+        return ToolResult(content=f"Successfully edited {path}")
 
 
 tools = [ReadTool(), WriteTool(), BashTool(WORKSPACE), EditTool()]
