@@ -1,7 +1,7 @@
 from pathlib import Path
 import subprocess
 
-from agent_core import AgentTool
+from agent_core import AgentTool, ToolResult
 
 
 WORKSPACE = Path(__file__).resolve().parent.parent
@@ -29,22 +29,22 @@ class ReadTool(AgentTool):
             },
         )
 
-    def execute(self, path: str) -> str:
+    def execute(self, path: str) -> ToolResult:
         try:
             file = safe_path(path)
 
             if not file.exists():
-                return f"Error: file not found: {path}"
+                return ToolResult(content=f"Error: file not found: {path}", is_error=True)
 
             if not file.is_file():
-                return f"Error: not a file: {path}"
+                return ToolResult(content=f"Error: not a file: {path}", is_error=True)
 
-            return file.read_text(encoding="utf-8")
+            return ToolResult(content=file.read_text(encoding="utf-8"))
 
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
 
 
 class WriteTool(AgentTool):
@@ -62,15 +62,15 @@ class WriteTool(AgentTool):
             },
         )
 
-    def execute(self, path: str, content: str) -> str:
+    def execute(self, path: str, content: str) -> ToolResult:
         try:
             file = safe_path(path)
             file.write_text(content, encoding="utf-8")
-            return f"Successfully wrote to {path}"
+            return ToolResult(content=f"Successfully wrote to {path}")
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
 
 
 class BashTool(AgentTool):
@@ -98,7 +98,7 @@ class BashTool(AgentTool):
             },
         )
 
-    def execute(self, command: str) -> str:
+    def execute(self, command: str) -> ToolResult:
         try:
             result = subprocess.run(
                 [
@@ -124,11 +124,11 @@ class BashTool(AgentTool):
                 timeout=self.TIMEOUT,
             )
             output = result.stdout + result.stderr
-            return output.strip() or f"(exit code {result.returncode}, no output)"
+            return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
         except subprocess.TimeoutExpired:
-            return f"Error: command timed out after {self.TIMEOUT}s"
+            return ToolResult(content=f"Error: command timed out after {self.TIMEOUT}s", is_error=True)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
 
 
 class EditTool(AgentTool):
@@ -147,30 +147,30 @@ class EditTool(AgentTool):
             },
         )
 
-    def execute(self, path: str, old_string: str, new_string: str) -> str:
+    def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
         try:
             file = safe_path(path)
 
             if not file.exists():
-                return f"Error: file not found: {path}"
+                return ToolResult(content=f"Error: file not found: {path}", is_error=True)
 
             if not file.is_file():
-                return f"Error: not a file: {path}"
+                return ToolResult(content=f"Error: not a file: {path}", is_error=True)
 
             content = file.read_text(encoding="utf-8")
 
             if content.count(old_string) == 0:
-                return f"Error: old_string not found in {path}"
+                return ToolResult(content=f"Error: old_string not found in {path}", is_error=True)
 
             if content.count(old_string) > 1:
-                return f"Error: old_string matches {content.count(old_string)} times in {path}; it must be unique"
+                return ToolResult(content=f"Error: old_string matches {content.count(old_string)} times in {path}; it must be unique", is_error=True)
 
             file.write_text(content.replace(old_string, new_string), encoding="utf-8")
-            return f"Successfully edited {path}"
+            return ToolResult(content=f"Successfully edited {path}")
         except PermissionError as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
 
 
 tools = [ReadTool(), WriteTool(), BashTool(WORKSPACE), EditTool()]

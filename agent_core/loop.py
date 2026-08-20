@@ -2,6 +2,8 @@ import json
 
 from ai import ProviderError, TextDelta, ToolCall
 
+from .agent_tools import ToolResult
+
 
 class AgentLoop:
     """仿 pi-agent 的核心循环：流式调模型 → 若有 tool_calls 则执行 → 循环直到模型直接回复。
@@ -64,25 +66,23 @@ class AgentLoop:
             for call in tool_calls:
                 print(f">>> 正在使用工具: {call.name} | 参数: {call.arguments}")
                 result = self._execute(call)
-                print(f">>> 工具返回: {str(result)[:200]}")
+                print(f">>> 工具返回: {result.content[:200]}")
 
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": result,
+                    "content": result.content,
                 })
 
         return "\n(已达到最大工具调用轮数，停止循环)"
 
-    def _execute(self, call: ToolCall) -> str:
-        """执行单个工具调用；任何错误都转成字符串回填给模型，而不是让循环崩溃。"""
+    def _execute(self, call: ToolCall) -> ToolResult:
+        """执行单个工具调用；任何错误都转成 ToolResult(is_error=True) 回填给模型，而不是让循环崩溃。"""
         tool = self.tool_map.get(call.name)
         if tool is None:
-            return f"Error: unknown tool '{call.name}'"
+            return ToolResult(content=f"Error: unknown tool '{call.name}'", is_error=True)
 
         try:
-            result = tool.execute(**call.arguments)
-            # 契约要求 execute 返回 str；工具违反契约时兜底序列化，避免消息里混入非字符串
-            return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+            return tool.execute(**call.arguments)
         except Exception as e:
-            return f"Error: {e}"
+            return ToolResult(content=f"Error: {e}", is_error=True)
