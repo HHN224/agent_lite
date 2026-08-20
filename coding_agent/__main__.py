@@ -103,15 +103,29 @@ def main():
     while True:
         try:
             user_input = input("> ")
-            if user_input.strip() == "/clear":
-                agent.clear_history()
-                print(">>> 已清空对话历史")
-                continue
-            for event in agent.prompt(user_input):
-                cli_listener(event)
         except (KeyboardInterrupt, EOFError):
             print("\n再见！")
             break
+
+        if user_input.strip() == "/clear":
+            agent.clear_history()
+            print(">>> 已清空对话历史")
+            continue
+
+        # 执行阶段：Ctrl+C 触发 abort（中止本轮），而非退出 REPL
+        gen = agent.prompt(user_input)
+        try:
+            for event in gen:
+                cli_listener(event)
+        except KeyboardInterrupt:
+            print("\n>>> 已中止")
+            loop.abort()
+            # 排空生成器剩余事件，让 loop 在下个检查点安全退出
+            try:
+                for event in gen:
+                    cli_listener(event)
+            except KeyboardInterrupt:
+                pass
         except Exception:
             # 任何未预期错误都只跳过本轮，不退出会话
             print("\n发生未预期错误，已跳过本轮：")

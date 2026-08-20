@@ -36,6 +36,11 @@ class AgentLoop:
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
         self.state = AgentState.IDLE
+        self._aborted = False
+
+    def abort(self):
+        """请求中止当前运行；在下个安全检查点（轮间 / 流式 token 间 / 工具间）安全退出。"""
+        self._aborted = True
 
     def run(self, messages: list):
         """生成器：反复 step() 直到某轮 finished，return 最终回复字符串。
@@ -43,7 +48,11 @@ class AgentLoop:
         本方法只管"循环 + 判断是否结束"，单轮逻辑在 step() 里；
         所有事件由 step() 产出，这里用 yield from 透传给消费者。
         """
+        self._aborted = False
         for _ in range(self.max_iterations):
+            if self._aborted:
+                self.state = AgentState.FINISHED
+                return "\n(已中止)"
             result = yield from self.step(messages)
             if result.finished:
                 return result.text
@@ -68,6 +77,8 @@ class AgentLoop:
 
         try:
             for event in self.provider.stream(messages, self.tools, self.model):
+                if self._aborted:
+                    break
                 if isinstance(event, TextDelta):
                     if not message_started:
                         yield AgentEvent("message_start")
@@ -85,6 +96,12 @@ class AgentLoop:
 
         if message_started:
             yield AgentEvent("message_end")
+
+        # 用户中止：在模型回复后安全退出
+        if self._aborted:
+            self.state = AgentState.FINISHED
+            yield AgentEvent("turn_end")
+            return StepResult(finished=True, text="\n(已中止)")
 
         # 没有工具调用，说明模型已经回答完了
         if not tool_calls:
@@ -112,6 +129,8 @@ class AgentLoop:
         # 依次执行工具并回填结果
         self.state = AgentState.CALLING_TOOL
         for call in tool_calls:
+            if self._aborted:
+                break
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
             result = self._execute(call)
             yield AgentEvent("tool_execution_end", {"content": result.content, "is_error": result.is_error})
@@ -121,6 +140,12 @@ class AgentLoop:
                 "tool_call_id": call.id,
                 "content": result.content,
             })
+
+        # 用户中止：在工具执行后安全退出
+        if self._aborted:
+            self.state = AgentState.FINISHED
+            yield AgentEvent("turn_end")
+            return StepResult(finished=True, text="\n(已中止)")
 
         yield AgentEvent("turn_end")
         return StepResult(finished=False)
