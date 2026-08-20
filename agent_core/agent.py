@@ -1,4 +1,5 @@
 from .events import AgentEvent
+from .states import AgentState
 
 
 class Agent:
@@ -22,6 +23,11 @@ class Agent:
 
         if store is not None and resume:
             self._restore()
+
+    @property
+    def state(self) -> AgentState:
+        """当前运行时状态（委托给 loop，单一真相源）。"""
+        return self.loop.state
 
     def prompt(self, user_input: str):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。

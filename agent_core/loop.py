@@ -6,6 +6,7 @@ from ai import ProviderError, TextDelta, ToolCall
 
 from .agent_tools import ToolResult
 from .events import AgentEvent
+from .states import AgentState
 
 
 class StepResult:
@@ -34,6 +35,7 @@ class AgentLoop:
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
+        self.state = AgentState.IDLE
 
     def run(self, messages: list):
         """生成器：反复 step() 直到某轮 finished，return 最终回复字符串。
@@ -46,6 +48,7 @@ class AgentLoop:
             if result.finished:
                 return result.text
 
+        self.state = AgentState.FINISHED
         return "\n(已达到最大工具调用轮数，停止循环)"
 
     def step(self, messages: list):
@@ -56,6 +59,7 @@ class AgentLoop:
           - 模型直接回复    → StepResult(finished=True, text=最终回复)
           - 执行了工具      → StepResult(finished=False)（还需下一轮让模型看到结果）
         """
+        self.state = AgentState.THINKING
         yield AgentEvent("turn_start")
 
         text_parts: list[str] = []
@@ -74,6 +78,7 @@ class AgentLoop:
                     tool_calls.append(event)
         except ProviderError as e:
             # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
+            self.state = AgentState.ERROR
             yield AgentEvent("error", {"message": str(e)})
             yield AgentEvent("turn_end")
             return StepResult(finished=True, text=f"(模型服务出错：{e})")
@@ -83,6 +88,7 @@ class AgentLoop:
 
         # 没有工具调用，说明模型已经回答完了
         if not tool_calls:
+            self.state = AgentState.FINISHED
             yield AgentEvent("turn_end")
             return StepResult(finished=True, text="".join(text_parts))
 
@@ -104,6 +110,7 @@ class AgentLoop:
         })
 
         # 依次执行工具并回填结果
+        self.state = AgentState.CALLING_TOOL
         for call in tool_calls:
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
             result = self._execute(call)
