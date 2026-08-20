@@ -1,4 +1,6 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
 from ai import ProviderError, TextDelta, ToolCall
 
@@ -13,12 +15,13 @@ class AgentLoop:
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
     """
 
-    def __init__(self, provider, model, tools, max_iterations: int = 10):
+    def __init__(self, provider, model, tools, max_iterations: int = 10, tool_timeout: float = 30.0):
         self.provider = provider
         self.model = model
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
+        self.tool_timeout = tool_timeout
 
     def run(self, messages: list) -> str:
         for _ in range(self.max_iterations):
@@ -77,7 +80,7 @@ class AgentLoop:
         return "\n(已达到最大工具调用轮数，停止循环)"
 
     def _execute(self, call: ToolCall) -> ToolResult:
-        """执行单个工具调用；任何错误都转成 ToolResult(is_error=True) 回填给模型，而不是让循环崩溃。"""
+        """执行单个工具调用；任何错误或超时都转成 ToolResult(is_error=True) 回填给模型，而不是让循环崩溃。"""
         tool = self.tool_map.get(call.name)
         if tool is None:
             return ToolResult(content=f"Error: unknown tool '{call.name}'", is_error=True)
@@ -86,7 +89,16 @@ class AgentLoop:
         if errors:
             return ToolResult(content="Error: " + "; ".join(errors), is_error=True)
 
+        # 在独立线程里执行工具，主线程用 future.result(timeout=...) 限时等待。
+        # 注意：超时后线程无法被强制终止（Python 线程的限制），因此用 shutdown(wait=False)
+        # 立即放手——主流程继续，卡死的工具线程在进程退出时随主进程结束。
+        executor = ThreadPoolExecutor(max_workers=1)
         try:
-            return tool.execute(**call.arguments)
+            future = executor.submit(tool.execute, **call.arguments)
+            return future.result(timeout=self.tool_timeout)
+        except FutureTimeout:
+            return ToolResult(content="Tool timeout", is_error=True)
         except Exception as e:
             return ToolResult(content=f"Error: {e}", is_error=True)
+        finally:
+            executor.shutdown(wait=False)
