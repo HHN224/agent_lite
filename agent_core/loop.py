@@ -15,13 +15,12 @@ class AgentLoop:
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
     """
 
-    def __init__(self, provider, model, tools, max_iterations: int = 10, tool_timeout: float = 30.0):
+    def __init__(self, provider, model, tools, max_iterations: int = 10):
         self.provider = provider
         self.model = model
         self.tools = tools
         self.tool_map = {t.name: t for t in tools}
         self.max_iterations = max_iterations
-        self.tool_timeout = tool_timeout
 
     def run(self, messages: list) -> str:
         for _ in range(self.max_iterations):
@@ -90,12 +89,13 @@ class AgentLoop:
             return ToolResult(content="Error: " + "; ".join(errors), is_error=True)
 
         # 在独立线程里执行工具，主线程用 future.result(timeout=...) 限时等待。
+        # 超时阈值取自工具自身的 timeout metadata；每个工具可以声明不同的时限。
         # 注意：超时后线程无法被强制终止（Python 线程的限制），因此用 shutdown(wait=False)
         # 立即放手——主流程继续，卡死的工具线程在进程退出时随主进程结束。
         executor = ThreadPoolExecutor(max_workers=1)
         try:
             future = executor.submit(tool.execute, **call.arguments)
-            return future.result(timeout=self.tool_timeout)
+            return future.result(timeout=tool.timeout)
         except FutureTimeout:
             return ToolResult(content="Tool timeout", is_error=True)
         except Exception as e:

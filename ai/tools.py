@@ -9,6 +9,8 @@ class Tool:
     name: str
     description: str
     parameters: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
+    timeout: int = 30
+    dangerous: bool = False
 
     def to_schema(self) -> dict:
         """转成 OpenAI function calling 的 schema。"""

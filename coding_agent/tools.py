@@ -29,6 +29,8 @@ class ReadTool(AgentTool):
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
             },
+            timeout=10,
+            dangerous=False,
         )
 
     def execute(self, path: str) -> ToolResult:
@@ -58,6 +60,8 @@ class WriteTool(AgentTool):
                 },
                 "required": ["path", "content"],
             },
+            timeout=10,
+            dangerous=False,
         )
 
     def execute(self, path: str, content: str) -> ToolResult:
@@ -73,7 +77,6 @@ class BashTool(AgentTool):
     argument_types = {"command": str}
 
     IMAGE = "python:3.12-slim"
-    TIMEOUT = 30
 
     def __init__(self, workspace: Path):
         self.workspace = workspace.resolve()
@@ -91,6 +94,8 @@ class BashTool(AgentTool):
                 },
                 "required": ["command"],
             },
+            timeout=60,
+            dangerous=True,
         )
 
     def execute(self, command: str) -> ToolResult:
@@ -115,7 +120,7 @@ class BashTool(AgentTool):
             ],
             capture_output=True,
             text=True,
-            timeout=self.TIMEOUT,
+            timeout=self.timeout,
         )
         output = result.stdout + result.stderr
         return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
@@ -137,6 +142,8 @@ class EditTool(AgentTool):
                 },
                 "required": ["path", "old_string", "new_string"],
             },
+            timeout=10,
+            dangerous=False,
         )
 
     def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
