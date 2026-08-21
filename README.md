@@ -86,9 +86,11 @@ agent lite/
 │   ├── session.py    # SessionStore：会话状态 ↔ JSON 存档
 │   └── agent_tools.py
 ├── coding_agent/     # 应用层（最上层）：四个具体工具 + CLI 入口
-│   ├── tools.py      # read / write / bash / edit
-│   └── __main__.py   # 入口：python -m coding_agent
+│   ├── tools.py      # read / write / bash / edit（build_tools 工厂按工作目录组装）
+│   └── __main__.py   # 入口：agent-lite 命令 / python -m coding_agent
+├── tests/            # pytest 测试：FauxProvider 确定性驱动 AgentLoop + 工具/会话单测
 ├── sessions/         # 会话存档（每轮自动保存，已 gitignore）
+├── pyproject.toml    # 打包配置 + agent-lite console script
 └── README.md         # 项目说明文档
 ```
 
@@ -105,7 +107,11 @@ agent lite/
 ### 2. 安装依赖
 
 ```bash
-pip install openai python-dotenv
+# 推荐：可编辑安装（含 console script `agent-lite`，任意目录可启动）
+pip install -e .[dev]
+
+# 或仅安装运行依赖
+pip install -r requirements.txt
 ```
 
 ### 3. 配置 API Key（必需）
@@ -129,6 +135,8 @@ export DEEPSEEK_API_KEY="sk-xxxx"
 ### 4. 运行
 
 ```bash
+agent-lite
+# 或从源码直接运行
 python -m coding_agent
 ```
 
@@ -140,9 +148,22 @@ python -m coding_agent
 
 每轮对话自动存档到 `sessions/default.json`，重启后自动恢复历史。可选参数：
 
-- `--session NAME`：使用不同会话（存档为 `sessions/NAME.json`）
-- `--new`：忽略已有历史，从新会话开始
-- 对话中输入 `/clear` 清空当前会话历史
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--session NAME` | `default` | 使用不同会话（存档为 `sessions/NAME.json`） |
+| `--new` | — | 忽略已有历史，从新会话开始 |
+| `--workspace PATH` | 当前目录 | 工作目录：文件工具与 bash 沙箱的活动范围 |
+| `--model NAME` | `deepseek-v4-flash` | 模型名 |
+| `--base-url URL` | `https://api.deepseek.com` | OpenAI 兼容 API 的 base_url（可切换到其他兼容服务） |
+
+对话中输入 `/clear` 清空当前会话历史。
+
+### 5. 运行测试
+
+```bash
+pip install -e .[dev]
+pytest
+```
 
 ---
 

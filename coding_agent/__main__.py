@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from ai import OpenAIProvider
 from agent_core import Agent, AgentEvent, AgentLoop, SessionStore
-from coding_agent.tools import tools
+from coding_agent.tools import build_tools
 
 
 SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."
@@ -56,10 +56,30 @@ def parse_args(argv=None):
         action="store_true",
         help="不恢复历史，从新会话开始（仍会存档到同一文件）",
     )
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path.cwd(),
+        help="工作目录：文件工具与 bash 沙箱的活动范围（默认当前目录）",
+    )
+    parser.add_argument(
+        "--model",
+        default="deepseek-v4-flash",
+        help="模型名（默认 deepseek-v4-flash）",
+    )
+    parser.add_argument(
+        "--base-url",
+        default="https://api.deepseek.com",
+        help="OpenAI 兼容 API 的 base_url（默认 DeepSeek）",
+    )
     args = parser.parse_args(argv)
 
     if not SESSION_NAME_RE.match(args.session):
         parser.error("会话名只能包含字母、数字、下划线和连字符，长度 1-64")
+
+    args.workspace = args.workspace.resolve()
+    if not args.workspace.is_dir():
+        parser.error(f"工作目录不存在: {args.workspace}")
 
     return args
 
@@ -67,7 +87,9 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
 
+    # 优先加载项目根目录 .env（源码直跑场景），再兜底加载当前目录 .env（全局安装后任意目录启动）
     load_dotenv(ENV_FILE)
+    load_dotenv()
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
@@ -80,18 +102,21 @@ def main():
     # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态 + 会话存档
     provider = OpenAIProvider(
         api_key=api_key,
-        base_url="https://api.deepseek.com",
+        base_url=args.base_url,
     )
+
+    tools = build_tools(args.workspace)
 
     loop = AgentLoop(
         provider=provider,
-        model="deepseek-v4-flash",
+        model=args.model,
         tools=tools,
     )
 
     store = SessionStore(SESSIONS_DIR / f"{args.session}.json")
 
     print(f">>> 会话: {args.session}（存档: {store.path}）")
+    print(f">>> 工作目录: {args.workspace}")
 
     agent = Agent(
         loop=loop,

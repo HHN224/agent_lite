@@ -4,14 +4,12 @@ import subprocess
 from agent_core import AgentTool, ToolResult
 
 
-WORKSPACE = Path(__file__).resolve().parent.parent
-
-
-def safe_path(path: str) -> Path:
+def safe_path(workspace: Path, path: str) -> Path:
     """把路径解析到工作目录内，越界则抛 PermissionError。"""
-    file = (WORKSPACE / path).resolve()
+    workspace = workspace.resolve()
+    file = (workspace / path).resolve()
 
-    if file != WORKSPACE and WORKSPACE not in file.parents:
+    if file != workspace and workspace not in file.parents:
         raise PermissionError(f"不能访问工作目录之外的文件: {path}")
 
     return file
@@ -20,7 +18,9 @@ def safe_path(path: str) -> Path:
 class ReadTool(AgentTool):
     argument_types = {"path": str}
 
-    def __init__(self):
+    def __init__(self, workspace: Path):
+        self.workspace = workspace.resolve()
+
         super().__init__(
             name="read",
             description="Read a text file",
@@ -34,7 +34,7 @@ class ReadTool(AgentTool):
         )
 
     def execute(self, path: str) -> ToolResult:
-        file = safe_path(path)
+        file = safe_path(self.workspace, path)
 
         if not file.exists():
             return ToolResult(content=f"Error: file not found: {path}", is_error=True)
@@ -48,7 +48,9 @@ class ReadTool(AgentTool):
 class WriteTool(AgentTool):
     argument_types = {"path": str, "content": str}
 
-    def __init__(self):
+    def __init__(self, workspace: Path):
+        self.workspace = workspace.resolve()
+
         super().__init__(
             name="write",
             description="Write content to a text file",
@@ -65,7 +67,7 @@ class WriteTool(AgentTool):
         )
 
     def execute(self, path: str, content: str) -> ToolResult:
-        file = safe_path(path)
+        file = safe_path(self.workspace, path)
         file.write_text(content, encoding="utf-8")
         return ToolResult(content=f"Successfully wrote to {path}")
 
@@ -129,7 +131,9 @@ class BashTool(AgentTool):
 class EditTool(AgentTool):
     argument_types = {"path": str, "old_string": str, "new_string": str}
 
-    def __init__(self):
+    def __init__(self, workspace: Path):
+        self.workspace = workspace.resolve()
+
         super().__init__(
             name="edit",
             description="Replace an exact substring in a text file with new content",
@@ -147,7 +151,7 @@ class EditTool(AgentTool):
         )
 
     def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
-        file = safe_path(path)
+        file = safe_path(self.workspace, path)
 
         if not file.exists():
             return ToolResult(content=f"Error: file not found: {path}", is_error=True)
@@ -167,4 +171,6 @@ class EditTool(AgentTool):
         return ToolResult(content=f"Successfully edited {path}")
 
 
-tools = [ReadTool(), WriteTool(), BashTool(WORKSPACE), EditTool()]
+def build_tools(workspace: Path) -> list[AgentTool]:
+    """按工作目录组装全部工具（read / write / bash / edit）。"""
+    return [ReadTool(workspace), WriteTool(workspace), BashTool(workspace), EditTool(workspace)]

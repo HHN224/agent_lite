@@ -107,7 +107,11 @@ class AgentLoop:
         if not tool_calls:
             self.state = AgentState.FINISHED
             yield AgentEvent("turn_end")
-            return StepResult(finished=True, text="".join(text_parts))
+            final_text = "".join(text_parts)
+            # 最终回复也要记入历史，否则下一轮与持久化存档都缺这条 assistant 消息
+            if final_text:
+                messages.append({"role": "assistant", "content": final_text})
+            return StepResult(finished=True, text=final_text)
 
         # 把这一轮 assistant 消息以标准 dict 形式记入历史
         messages.append({
