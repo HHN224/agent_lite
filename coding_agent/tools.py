@@ -121,10 +121,14 @@ class BashTool(AgentTool):
                 "sh", "-lc", command,
             ],
             capture_output=True,
-            text=True,
             timeout=self.timeout,
         )
-        output = result.stdout + result.stderr
+        # 字节模式 + 显式 UTF-8 解码：容器输出可能是任意字节（如中文文件名），
+        # 若用 text=True 交给宿主 locale（中文 Windows 是 GBK）解码，解码线程抛错会
+        # 让 stdout 变成 None，导致下面的 None + str 崩溃；这里统一按 UTF-8 容错解码。
+        out = (result.stdout or b"").decode("utf-8", errors="replace")
+        err = (result.stderr or b"").decode("utf-8", errors="replace")
+        output = out + err
         return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
 
 

@@ -19,20 +19,29 @@ from coding_agent.tools import build_tools
 SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."
 
 
+def safe_print(s: str, **kwargs):
+    """按终端编码打印，无法编码的字符用替换符兜底，避免 GBK 终端上 print 抛 UnicodeEncodeError。"""
+    try:
+        print(s, **kwargs)
+    except UnicodeEncodeError:
+        print(s.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8"), **kwargs)
+
+
 def cli_listener(event: AgentEvent):
     """把 Agent 的事件流渲染成终端输出（复刻原来的 >>> 提示格式）。"""
     if event.type == "turn_start":
         print("\n>>> 调用 API ...")
     elif event.type == "message_update":
-        print(event.data["content"], end="", flush=True)
+        safe_print(event.data["content"], end="", flush=True)
     elif event.type == "message_end":
         print()
     elif event.type == "tool_execution_start":
-        print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
+        safe_print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
     elif event.type == "tool_execution_end":
-        print(f">>> 工具返回: {event.data['content'][:200]}")
+        safe_print(f">>> 工具返回: {event.data['content'][:200]}")
     elif event.type == "error":
-        print(f"\n>>> 模型服务出错: {event.data['message']}")
+        safe_print(f"\n>>> 模型服务出错: {event.data['message']}")
 
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
