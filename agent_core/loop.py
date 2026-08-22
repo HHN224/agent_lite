@@ -1,12 +1,10 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
 
 from ai import ProviderError, TextDelta, ToolCall
 
-from .agent_tools import ToolResult
 from .events import AgentEvent
 from .states import AgentState
+from .tool_executor import ToolExecutor
 
 
 class StepResult:
@@ -29,11 +27,25 @@ class AgentLoop:
     最终回复通过生成器 return 值返回（yield from 可捕获）。
     """
 
-    def __init__(self, provider, model, tools, max_iterations: int = 10):
+    def __init__(
+        self,
+        provider,
+        model,
+        tools,
+        max_iterations: int = 10,
+        permission_policy: str = "ask",
+        confirm=None,
+    ):
         self.provider = provider
         self.model = model
         self.tools = tools
-        self.tool_map = {t.name: t for t in tools}
+        # 工具执行统一交给 ToolExecutor：参数校验、权限判断、超时、审计、结果规范化都在它里面
+        self.executor = ToolExecutor(
+            tools,
+            permission_policy=permission_policy,
+            confirm=confirm,
+        )
+        self.tool_map = self.executor.tool_map
         self.max_iterations = max_iterations
         self.state = AgentState.IDLE
         self._aborted = False
@@ -136,8 +148,12 @@ class AgentLoop:
             if self._aborted:
                 break
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
-            result = self._execute(call)
-            yield AgentEvent("tool_execution_end", {"content": result.content, "is_error": result.is_error})
+            result = self.executor.execute(call)
+            yield AgentEvent("tool_execution_end", {
+                "content": result.content,
+                "is_error": result.is_error,
+                "denied": result.denied,
+            })
 
             messages.append({
                 "role": "tool",
@@ -153,28 +169,3 @@ class AgentLoop:
 
         yield AgentEvent("turn_end")
         return StepResult(finished=False)
-
-    def _execute(self, call: ToolCall) -> ToolResult:
-        """执行单个工具调用；任何错误或超时都转成 ToolResult(is_error=True) 回填给模型，而不是让循环崩溃。"""
-        tool = self.tool_map.get(call.name)
-        if tool is None:
-            return ToolResult(content=f"Error: unknown tool '{call.name}'", is_error=True)
-
-        errors = tool.validate_arguments(call.arguments)
-        if errors:
-            return ToolResult(content="Error: " + "; ".join(errors), is_error=True)
-
-        # 在独立线程里执行工具，主线程用 future.result(timeout=...) 限时等待。
-        # 超时阈值取自工具自身的 timeout metadata；每个工具可以声明不同的时限。
-        # 注意：超时后线程无法被强制终止（Python 线程的限制），因此用 shutdown(wait=False)
-        # 立即放手——主流程继续，卡死的工具线程在进程退出时随主进程结束。
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(tool.execute, **call.arguments)
-            return future.result(timeout=tool.timeout)
-        except FutureTimeout:
-            return ToolResult(content="Tool timeout", is_error=True)
-        except Exception as e:
-            return ToolResult(content=f"Error: {e}", is_error=True)
-        finally:
-            executor.shutdown(wait=False)

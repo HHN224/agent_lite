@@ -3,6 +3,8 @@ import subprocess
 
 from agent_core import AgentTool, ToolResult
 
+DEFAULT_BASH_IMAGE = "python:3.12-slim"
+
 
 def safe_path(workspace: Path, path: str) -> Path:
     """把路径解析到工作目录内，越界则抛 PermissionError。"""
@@ -63,8 +65,15 @@ class WriteTool(AgentTool):
                 "required": ["path", "content"],
             },
             timeout=10,
-            dangerous=False,
+            dangerous=True,
         )
+
+    def describe_call(self, arguments: dict) -> str:
+        content = arguments.get("content", "")
+        summary = content[:80].replace("\n", "\\n")
+        if len(content) > 80:
+            summary += "..."
+        return f"写入文件 {arguments.get('path')}（共 {len(content)} 字符，内容摘要: {summary!r}）"
 
     def execute(self, path: str, content: str) -> ToolResult:
         file = safe_path(self.workspace, path)
@@ -74,14 +83,17 @@ class WriteTool(AgentTool):
 
 class BashTool(AgentTool):
     """在一次性 Docker 容器中执行命令：无网络、只读根文件系统、资源限额，
-    仅通过 bind mount 把工作目录暴露给容器。"""
+    仅通过 bind mount 把工作目录暴露给容器。
+
+    运行镜像可配置（__init__ 的 image 参数），默认 python:3.12-slim。
+    返回结构化结果：exit_code / stdout / stderr 分开携带，非零退出码标记为失败。
+    """
 
     argument_types = {"command": str}
 
-    IMAGE = "python:3.12-slim"
-
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, image: str = DEFAULT_BASH_IMAGE):
         self.workspace = workspace.resolve()
+        self.image = image
 
         super().__init__(
             name="bash",
@@ -100,6 +112,9 @@ class BashTool(AgentTool):
             dangerous=True,
         )
 
+    def describe_call(self, arguments: dict) -> str:
+        return f"在 Docker 沙箱中执行命令: {arguments.get('command')}"
+
     def execute(self, command: str) -> ToolResult:
         result = subprocess.run(
             [
@@ -117,7 +132,7 @@ class BashTool(AgentTool):
 
                 "--workdir", "/workspace",
 
-                self.IMAGE,
+                self.image,
                 "sh", "-lc", command,
             ],
             capture_output=True,
@@ -128,8 +143,26 @@ class BashTool(AgentTool):
         # 让 stdout 变成 None，导致下面的 None + str 崩溃；这里统一按 UTF-8 容错解码。
         out = (result.stdout or b"").decode("utf-8", errors="replace")
         err = (result.stderr or b"").decode("utf-8", errors="replace")
-        output = out + err
-        return ToolResult(content=output.strip() or f"(exit code {result.returncode}, no output)")
+        output = (out + err).strip()
+
+        if result.returncode != 0:
+            content = output or f"(exit code {result.returncode}, no output)"
+            if output:
+                content = f"(exit code {result.returncode})\n{output}"
+            return ToolResult(
+                content=content,
+                is_error=True,
+                exit_code=result.returncode,
+                stdout=out,
+                stderr=err,
+            )
+
+        return ToolResult(
+            content=output or "(exit code 0, no output)",
+            exit_code=0,
+            stdout=out,
+            stderr=err,
+        )
 
 
 class EditTool(AgentTool):
@@ -151,7 +184,13 @@ class EditTool(AgentTool):
                 "required": ["path", "old_string", "new_string"],
             },
             timeout=10,
-            dangerous=False,
+            dangerous=True,
+        )
+
+    def describe_call(self, arguments: dict) -> str:
+        return (
+            f"编辑文件 {arguments.get('path')}: "
+            f"{arguments.get('old_string')!r} → {arguments.get('new_string')!r}"
         )
 
     def execute(self, path: str, old_string: str, new_string: str) -> ToolResult:
@@ -175,6 +214,11 @@ class EditTool(AgentTool):
         return ToolResult(content=f"Successfully edited {path}")
 
 
-def build_tools(workspace: Path) -> list[AgentTool]:
-    """按工作目录组装全部工具（read / write / bash / edit）。"""
-    return [ReadTool(workspace), WriteTool(workspace), BashTool(workspace), EditTool(workspace)]
+def build_tools(workspace: Path, bash_image: str = DEFAULT_BASH_IMAGE) -> list[AgentTool]:
+    """按工作目录组装全部工具（read / write / bash / edit）；bash 运行镜像可配置。"""
+    return [
+        ReadTool(workspace),
+        WriteTool(workspace),
+        BashTool(workspace, image=bash_image),
+        EditTool(workspace),
+    ]

@@ -75,12 +75,40 @@ def test_edit_ambiguous_match(tmp_path):
 def test_bash_tool_marks_dangerous(tmp_path):
     tools = {t.name: t for t in build_tools(tmp_path)}
     assert tools["bash"].dangerous is True
+    assert tools["write"].dangerous is True
+    assert tools["edit"].dangerous is True
     assert tools["read"].dangerous is False
 
 
 def test_build_tools_has_four_defaults(tmp_path):
     names = sorted(t.name for t in build_tools(tmp_path))
     assert names == ["bash", "edit", "read", "write"]
+
+
+def test_describe_call_default_uses_repr(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    assert "read" in tools["read"].describe_call({"path": "x.txt"})
+    assert "'x.txt'" in tools["read"].describe_call({"path": "x.txt"})
+
+
+def test_describe_call_write_shows_path_and_summary(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    desc = tools["write"].describe_call({"path": "notes.md", "content": "line1\nline2"})
+    assert "notes.md" in desc
+    assert "line1" in desc
+
+
+def test_describe_call_edit_shows_diff(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    desc = tools["edit"].describe_call({"path": "f.txt", "old_string": "a", "new_string": "b"})
+    assert "f.txt" in desc
+    assert "'a'" in desc and "'b'" in desc
+
+
+def test_describe_call_bash_shows_command(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    desc = tools["bash"].describe_call({"command": "ls -la"})
+    assert "ls -la" in desc
 
 
 class _FakeSubprocessResult:
@@ -135,8 +163,49 @@ def test_bash_tool_undecodable_bytes_become_replace_char(tmp_path, monkeypatch):
 
 
 def test_bash_tool_no_output_reports_exit_code(tmp_path, monkeypatch):
+    # 非零退出码：无输出时也要让模型看到退出码，且标记为失败
     _stub_subprocess(monkeypatch, _FakeSubprocessResult(returncode=3))
     tools = {t.name: t for t in build_tools(tmp_path)}
     result = tools["bash"].execute(command="exit 3")
-    assert not result.is_error
+    assert result.is_error
+    assert result.exit_code == 3
     assert "exit code 3" in result.content
+
+
+def test_bash_tool_structured_fields(tmp_path, monkeypatch):
+    # 结构化返回：exit_code / stdout / stderr 分开携带，非零退出码标记失败
+    _stub_subprocess(
+        monkeypatch,
+        _FakeSubprocessResult(returncode=1, stdout=b"out line", stderr=b"err line"),
+    )
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    result = tools["bash"].execute(command="false")
+    assert result.is_error
+    assert result.exit_code == 1
+    assert result.stdout == "out line"
+    assert result.stderr == "err line"
+    assert "out line" in result.content and "err line" in result.content
+
+
+def test_bash_tool_success_zero_exit(tmp_path, monkeypatch):
+    _stub_subprocess(monkeypatch, _FakeSubprocessResult(returncode=0, stdout=b"ok"))
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    result = tools["bash"].execute(command="echo ok")
+    assert not result.is_error
+    assert result.exit_code == 0
+    assert result.stdout == "ok"
+
+
+def test_bash_image_configurable(tmp_path, monkeypatch):
+    # 运行镜像可配置：build_tools / BashTool 都能指定
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return _FakeSubprocessResult()
+
+    monkeypatch.setattr("coding_agent.tools.subprocess.run", fake_run)
+    tools = {t.name: t for t in build_tools(tmp_path, bash_image="custom:1.0")}
+    tools["bash"].execute(command="true")
+    assert "custom:1.0" in captured["args"]
+    assert tools["bash"].image == "custom:1.0"

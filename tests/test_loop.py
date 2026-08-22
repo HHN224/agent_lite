@@ -46,9 +46,37 @@ class BoomTool(AgentTool):
         raise RuntimeError("boom!")
 
 
-def make_loop(script, tools=None, max_iterations=10):
+class DangerousTool(AgentTool):
+    """测试用危险工具：受权限策略约束。"""
+
+    argument_types = {"text": str}
+
+    def __init__(self):
+        super().__init__(
+            name="risky",
+            description="Dangerous echo",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            timeout=5,
+            dangerous=True,
+        )
+
+    def execute(self, text: str) -> ToolResult:
+        return ToolResult(content=f"risky:{text}")
+
+
+def make_loop(script, tools=None, max_iterations=10, **kwargs):
     provider = FauxProvider(script)
-    loop = AgentLoop(provider=provider, model="faux-model", tools=tools or [], max_iterations=max_iterations)
+    loop = AgentLoop(
+        provider=provider,
+        model="faux-model",
+        tools=tools or [],
+        max_iterations=max_iterations,
+        **kwargs,
+    )
     return loop, provider
 
 
@@ -147,3 +175,42 @@ def test_max_iterations_cap():
 
     assert event_types(events).count("turn_start") == 2
     assert loop.state == AgentState.FINISHED
+
+
+def test_deny_policy_blocks_dangerous_tool_and_backfills():
+    # deny 策略：危险工具被拒绝，拒绝结果（is_error）回填给模型，不产生副作用
+    script = [
+        [ToolCall(id="t1", name="risky", arguments={"text": "hi"})],
+        [TextDelta("收尾")],
+    ]
+    loop, _ = make_loop(script, tools=[DangerousTool()], permission_policy="deny")
+    _, messages = run_all(loop, messages=[{"role": "user", "content": "x"}])
+
+    assert messages[2]["role"] == "tool"
+    assert "permission denied" in messages[2]["content"]
+    assert loop.executor.audit_log[0]["denied"] is True
+
+
+def test_ask_policy_uses_confirm_and_auto_skips():
+    # ask：confirm 返回 False → 拒绝；auto：跳过 confirm 直接执行
+    script = [
+        [ToolCall(id="t1", name="risky", arguments={"text": "hi"})],
+        [TextDelta("收尾")],
+    ]
+    loop, _ = make_loop(
+        script,
+        tools=[DangerousTool()],
+        permission_policy="ask",
+        confirm=lambda desc: False,
+    )
+    _, messages = run_all(loop, messages=[{"role": "user", "content": "x"}])
+    assert "permission denied" in messages[2]["content"]
+
+    loop, _ = make_loop(
+        script,
+        tools=[DangerousTool()],
+        permission_policy="auto",
+        confirm=lambda desc: False,  # auto 下不应被调用
+    )
+    _, messages = run_all(loop, messages=[{"role": "user", "content": "x"}])
+    assert messages[2]["content"] == "risky:hi"

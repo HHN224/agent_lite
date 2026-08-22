@@ -80,9 +80,10 @@ agent lite/
 ├── ai/               # 最底层：Tool 数据类与 Provider 流式调用契约
 │   ├── tools.py      # Tool（name / description / parameters → schema）
 │   └── providers.py  # LLMProvider 抽象 + OpenAI 兼容流式实现
-├── agent_core/       # 核心层：Agent（对话状态 + 会话持久化）、AgentLoop（模型循环）、AgentTool 抽象接口
+├── agent_core/       # 核心层：Agent（对话状态 + 会话持久化）、AgentLoop（模型循环）、ToolExecutor（统一工具执行器）、AgentTool 抽象接口
 │   ├── agent.py
 │   ├── loop.py
+│   ├── tool_executor.py  # 参数校验 → 权限策略（ask/deny/auto）→ 超时 → 审计 → 结果规范化
 │   ├── session.py    # SessionStore：会话状态 ↔ JSON 存档
 │   └── agent_tools.py
 ├── coding_agent/     # 应用层（最上层）：四个具体工具 + CLI 入口
@@ -155,6 +156,8 @@ python -m coding_agent
 | `--workspace PATH` | 当前目录 | 工作目录：文件工具与 bash 沙箱的活动范围 |
 | `--model NAME` | `deepseek-v4-flash` | 模型名 |
 | `--base-url URL` | `https://api.deepseek.com` | OpenAI 兼容 API 的 base_url（可切换到其他兼容服务） |
+| `--permission-policy MODE` | `ask` | 危险工具（写文件 / 编辑 / bash）的权限策略：`ask` 每次询问、`deny` 直接拒绝、`auto` 自动放行 |
+| `--bash-image IMAGE` | `python:3.12-slim` | `bash` 工具使用的 Docker 运行镜像 |
 
 对话中输入 `/clear` 清空当前会话历史。
 
@@ -170,15 +173,16 @@ pytest
 ## ⚠️ 安全须知
 
 - `bash` 工具在 Docker 沙箱中运行（断网 + 资源限额），但工作目录以可写方式挂载进容器，AI 仍可通过命令修改项目内文件
+- **权限策略**（`--permission-policy`，默认 `ask`）：写文件、精确编辑与 bash 属危险工具，每次调用都会展示「路径 / 变更摘要 / 命令」并等你确认；`deny` 直接拒绝、`auto` 自动放行。被拒绝的操作以错误结果回传模型，不会产生副作用
 - 请勿将 API Key 硬编码进代码并提交到 Git 仓库（当前代码已从环境变量 `DEEPSEEK_API_KEY` 读取密钥）
-- 文件工具通过 `safe_path` 限制在工作目录内，但本项目的工具仍没有完整的权限校验，仅适合本地学习与实验
+- 文件工具通过 `safe_path` 限制在工作目录内；`auto` 模式下无人工把关，仅适合完全可信的本地实验场景
 
 ---
 
 ## 🔭 扩展思路
 
 - 增加更多工具：网络请求（`requests`）、数据库查询、图片处理等
-- 为工具加入路径白名单 / 命令黑名单等安全校验
+- 为工具加入命令黑名单 / 白名单等更细粒度的安全校验
 - 增加上下文压缩（超长对话自动总结），见 pi 的 compaction 设计
 
 ---

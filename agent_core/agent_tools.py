@@ -4,19 +4,31 @@ from ai import Tool
 
 
 class ToolResult:
-    """工具 execute() 的统一返回类型：把"内容"与"是否出错"分开携带。
+    """工具 execute() 的统一返回类型：内容与元信息分开携带。
 
     content    要回填给模型的字符串结果。
     is_error   True 表示这是一次失败的结果（如权限拒绝、文件不存在、命令超时）。
+    denied     本次调用是否因权限策略被拒绝（未产生副作用）。
+    exit_code  Bash 等命令类工具的退出码；非命令工具为 None。
+    stdout     Bash 的标准输出（原始文本，未拼接 stderr）。
+    stderr     Bash 的标准错误。
     """
 
     def __init__(
         self,
         content: str,
         is_error: bool = False,
+        denied: bool = False,
+        exit_code: int | None = None,
+        stdout: str = "",
+        stderr: str = "",
     ):
         self.content = content
         self.is_error = is_error
+        self.denied = denied
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class AgentTool(Tool, ABC):
@@ -44,6 +56,14 @@ class AgentTool(Tool, ABC):
             elif not isinstance(args[key], typ):
                 errors.append(f"{key} should be {typ.__name__}, got {type(args[key]).__name__}")
         return errors
+
+    def describe_call(self, arguments: dict) -> str:
+        """把一次调用翻译成给用户看的人类可读描述（权限确认时展示）。
+
+        默认展示工具名与参数；写文件 / 编辑 / 执行命令等工具应覆盖，
+        用「路径 / 变更摘要 / 命令」让用户能看懂即将发生什么。
+        """
+        return f"{self.name}({arguments!r})"
 
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:

@@ -81,6 +81,17 @@ def parse_args(argv=None):
         default="https://api.deepseek.com",
         help="OpenAI 兼容 API 的 base_url（默认 DeepSeek）",
     )
+    parser.add_argument(
+        "--permission-policy",
+        choices=["ask", "deny", "auto"],
+        default="ask",
+        help="危险工具的权限策略：ask 每次确认 / deny 直接拒绝 / auto 自动放行（默认 ask）",
+    )
+    parser.add_argument(
+        "--bash-image",
+        default="python:3.12-slim",
+        help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim）",
+    )
     args = parser.parse_args(argv)
 
     if not SESSION_NAME_RE.match(args.session):
@@ -91,6 +102,21 @@ def parse_args(argv=None):
         parser.error(f"工作目录不存在: {args.workspace}")
 
     return args
+
+
+def make_confirm():
+    """生成权限确认函数：展示工具调用的人类可读描述，等待用户 y/N。
+    非交互环境（EOF / Ctrl+C）一律视为拒绝，保证不产生副作用。"""
+
+    def confirm(description: str) -> bool:
+        try:
+            answer = input(f">>> {description}\n>>> 是否允许执行？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return answer in ("y", "yes")
+
+    return confirm
 
 
 def main():
@@ -114,18 +140,21 @@ def main():
         base_url=args.base_url,
     )
 
-    tools = build_tools(args.workspace)
+    tools = build_tools(args.workspace, bash_image=args.bash_image)
 
     loop = AgentLoop(
         provider=provider,
         model=args.model,
         tools=tools,
+        permission_policy=args.permission_policy,
+        confirm=make_confirm(),
     )
 
     store = SessionStore(SESSIONS_DIR / f"{args.session}.json")
 
     print(f">>> 会话: {args.session}（存档: {store.path}）")
     print(f">>> 工作目录: {args.workspace}")
+    print(f">>> 权限策略: {args.permission_policy}（bash 镜像: {args.bash_image}）")
 
     agent = Agent(
         loop=loop,
