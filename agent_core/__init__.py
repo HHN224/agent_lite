@@ -8,7 +8,6 @@ from .session import (
     SessionEntry,
     SessionMeta,
     SessionRepository,
-    SessionStore,
 )
 from .tool_executor import PermissionPolicy, ToolExecutor
 
@@ -23,7 +22,6 @@ __all__ = [
     "SessionEntry",
     "SessionMeta",
     "SessionRepository",
-    "SessionStore",
     "PermissionPolicy",
     "ToolExecutor",
 ]

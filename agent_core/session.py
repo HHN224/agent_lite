@@ -1,14 +1,13 @@
 """会话持久化：把 Agent 的对话状态（system prompt + 消息）以 JSON 存到磁盘。
 
 设计目标：
-  - 会话是可寻址的「条目（entry）列表」，每条消息有稳定的 id 与 parent_id，
+  - 会话是「可寻址的条目（entry）列表」，每条消息有稳定的 id 与 parent_id，
     为将来的「压缩（compaction）」与「分支 / 回溯」留好接缝。
   - 追加式、不可变：每轮只追加新条目，不改写旧条目。
   - 存储按「会话 id」组织：sessions/<session_id>.json（文件名是 id，人类可读名在文件内）。
 
-向下兼容：本模块仍保留旧的 SessionStore（单文件 flat JSON，
-结构为 {version, system_prompt, messages}），因为 Agent / CLI 目前仍在用它；
-新的 Session + SessionRepository 供 Phase 2 起接入。二者并存，互不干扰。
+注：早期有一个「单文件 flat JSON（{version, system_prompt, messages}）」的旧格式，
+现已废弃删除；只在注释里留此一笔，不再做任何向后兼容。
 """
 
 import time
@@ -17,9 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 VERSION = 2
-LEGACY_VERSION = 1
 
-# 会话名白名单长度限制（校验用，防止 session_id 越界）
+# 会话名 / session_id 的长度上限（防止 id 越界、避免文件系统意外）
 MAX_ID_LEN = 64
 
 
@@ -135,7 +133,7 @@ class Session:
         self.created_at = created_at if created_at is not None else time.time()
         self.updated_at = updated_at if updated_at is not None else self.created_at
         self.token_count = token_count
-        self._token_estimate = None  # Phase 4 注入的 tokenizer：Callable[[SessionEntry], int]
+        self._token_estimate = None  # 由 SessionManager 注入：Callable[[SessionEntry], int]
 
     # ------------------------------------------------------------------ #
     # 追加
@@ -181,7 +179,7 @@ class Session:
         *,
         timestamp: float | None = None,
     ) -> SessionEntry:
-        """追加一次压缩记录。今天只负责数据层；真正的总结在 Phase 4 接入。"""
+        """追加一次压缩记录。数据层已就绪；真正的 LLM 总结由 SessionManager 的 compact() 驱动。"""
         entry = SessionEntry(
             id=self._new_id(),
             parent_id=self.head_id,
@@ -198,8 +196,7 @@ class Session:
     def record_turn(self, messages: list[dict]) -> list[SessionEntry]:
         """把「本轮新产生的消息」（含开头的 user 消息）追加成条目。
 
-        messages 是按顺序排列的 dict 列表（role/content/tool_call_id/tool_calls），
-        Phase 2 里 Agent 会把 loop 吐回的增量消息交给这里。
+        messages 是按顺序排列的 dict 列表（role/content/tool_call_id/tool_calls）。
         """
         appended: list[SessionEntry] = []
         for m in messages:
@@ -211,6 +208,14 @@ class Session:
             )
             appended.append(e)
         return appended
+
+    def clear_history(self) -> None:
+        """清空对话历史，仅保留 system_prompt（供 /clear 使用）。"""
+        self.entries = {}
+        self.head_id = None
+        self.next_id = 1
+        self.token_count = 0
+        self._touch()
 
     # ------------------------------------------------------------------ #
     # 重建发给模型的 payload
@@ -233,7 +238,7 @@ class Session:
     def build_llm_payload(self) -> list[dict]:
         """重建发给模型的消息列表：system → （最新的压缩 summary）→ 保留的消息。
 
-        保留的消息从最新的 compression 的 first_kept_entry_id 开始；
+        保留的消息从最新的 compaction 的 first_kept_entry_id 开始；
         若没有压缩，则返回从 root 到 head 的全部消息。
         """
         path = self._path_to_head()
@@ -267,7 +272,7 @@ class Session:
         self.token_count += self.estimate_tokens(entry)
 
     def estimate_tokens(self, entry: SessionEntry) -> int:
-        """粗略 token 估算：用于元数据与压缩阈值判断（Phase 4 的 tokenizer 会替换它）。"""
+        """粗略 token 估算：用于元数据与压缩阈值判断（后续可用 tokenizer 替换）。"""
         if self._token_estimate:
             return self._token_estimate(entry)
         text = ""
@@ -323,7 +328,6 @@ class SessionRepository:
     """sessions/<session_id>.json 的读写与管理：create / load / list / delete / rename。
 
     文件名是会话 id；人类可读的「会话名」存在文件内的 name 字段。
-    读旧版 v1 flat 存档（{version, system_prompt, messages}）时自动迁移到 v2。
     """
 
     def __init__(self, sessions_dir: Path):
@@ -361,43 +365,11 @@ class SessionRepository:
         if not path.exists():
             return None
         data = _json_loads(path.read_text(encoding="utf-8"))
-        session = self._migrate(data, session_id)
-        return session
-
-    def _migrate(self, data: dict, session_id: str) -> Session:
-        """把（可能是 v1 的）存档 dict 归一成 Session。
-
-        v1: {version:1, system_prompt, messages}
-        v2: {version:2, session_id, name, entries, head_id, next_id, ...}
-        迁移 v1 → v2：把 flat messages 逐条转成线性 entry 链。
-        """
-        version = data.get("version", LEGACY_VERSION)
-        if version == VERSION:
-            session = Session.from_dict(data)
-            # 文件名优先作为真 id（外部凭证），文件内 id 不一致时以文件名为主
-            session.session_id = session_id
-            return session
-
-        # v1 迁移：flat {messages} → entry 链
-        sys_prompt = data.get("system_prompt", "")
-        messages = data.get("messages", [])
-        if not isinstance(messages, list):
-            raise ValueError("存档结构不合法")
-
-        session = Session(
-            session_id=session_id,
-            name=data.get("name", ""),
-            system_prompt=sys_prompt,
-        )
-        for m in messages:
-            if not isinstance(m, dict):
-                raise ValueError("存档结构不合法")
-            session.append_message(
-                m.get("role"),
-                m.get("content"),
-                tool_call_id=m.get("tool_call_id"),
-                tool_calls=m.get("tool_calls"),
-            )
+        if data.get("version") != VERSION:
+            raise ValueError(f"不支持的存档版本: {data.get('version')!r}")
+        session = Session.from_dict(data)
+        # 文件名优先作为真 id（外部凭证），文件内 id 不一致时以文件名为主
+        session.session_id = session_id
         return session
 
     def list(self) -> list[SessionMeta]:
@@ -412,26 +384,17 @@ class SessionRepository:
                 data = _json_loads(path.read_text(encoding="utf-8"))
             except Exception:
                 continue  # 损坏文件直接跳过，不阻塞列表
-            session_id = path.stem
-            if data.get("version") == VERSION:
-                metas.append(SessionMeta(
-                    session_id=session_id,
-                    name=data.get("name", ""),
-                    created_at=data.get("created_at", 0.0),
-                    updated_at=data.get("updated_at", 0.0),
-                    message_count=sum(
-                        1 for e in data.get("entries", []) if e.get("type") == "message"
-                    ),
-                ))
-            else:
-                # v1 文件：name 取文件名，消息数取 messages 长度
-                metas.append(SessionMeta(
-                    session_id=session_id,
-                    name=session_id,
-                    created_at=0.0,
-                    updated_at=0.0,
-                    message_count=len(data.get("messages", [])),
-                ))
+            if data.get("version") != VERSION:
+                continue
+            metas.append(SessionMeta(
+                session_id=path.stem,
+                name=data.get("name", ""),
+                created_at=data.get("created_at", 0.0),
+                updated_at=data.get("updated_at", 0.0),
+                message_count=sum(
+                    1 for e in data.get("entries", []) if e.get("type") == "message"
+                ),
+            ))
         metas.sort(key=lambda m: m.updated_at, reverse=True)
         return metas
 
@@ -449,40 +412,6 @@ class SessionRepository:
         session.name = new_name
         self.save(session)
         return session
-
-
-class SessionStore:
-    """（旧版，保留兼容）一个 JSON 文件对应一个会话：{version, system_prompt, messages}。
-
-    仍被 Agent / CLI 使用；Phase 2 会把它切换成 Session + SessionRepository。
-    """
-
-    def __init__(self, path: Path):
-        self.path = path
-
-    def save(self, system_prompt: str, messages: list) -> None:
-        data = {
-            "version": LEGACY_VERSION,
-            "system_prompt": system_prompt,
-            "messages": messages,
-        }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(
-            _json_dumps(data), encoding="utf-8"
-        )
-        tmp.replace(self.path)
-
-    def load(self):
-        """读回会话状态；文件不存在返回 None，损坏则抛异常由调用方决定如何兜底。"""
-        if not self.path.exists():
-            return None
-        data = _json_loads(self.path.read_text(encoding="utf-8"))
-        system_prompt = data.get("system_prompt", "")
-        messages = data.get("messages", [])
-        if not isinstance(system_prompt, str) or not isinstance(messages, list):
-            raise ValueError("存档结构不合法")
-        return system_prompt, messages
 
 
 def _json_dumps(data: dict) -> str:

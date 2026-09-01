@@ -1,5 +1,6 @@
 from .events import AgentEvent
 from .states import AgentState
+from .session import Session, SessionRepository
 
 
 class Agent:
@@ -11,23 +12,25 @@ class Agent:
 
     prompt() 是一个生成器：yield agent_start → 转发 loop 的全部事件 → yield agent_end。
     消费者（CLI / Web）用 for event in agent.prompt(...) 迭代。
+
+    state 与持久化：
+      session  一个 Session（对话状态：条目链 + system prompt + head）。
+      repo     一个 SessionRepository（把 session 持久化到磁盘）；可空，空则不存档。
     """
 
-    def __init__(self, loop, system_prompt: str = "", store=None, resume: bool = True):
+    def __init__(self, loop, session: Session, repo: SessionRepository | None = None):
         self.loop = loop
-        self.system_prompt = system_prompt
-        self.store = store
-        self.messages = (
-            [{"role": "system", "content": system_prompt}] if system_prompt else []
-        )
-
-        if store is not None and resume:
-            self._restore()
+        self.session = session
+        self.repo = repo
 
     @property
     def state(self) -> AgentState:
         """当前运行时状态（委托给 loop，单一真相源）。"""
         return self.loop.state
+
+    @property
+    def session_id(self) -> str:
+        return self.session.session_id
 
     def abort(self):
         """请求中止当前运行（委托给 loop）。"""
@@ -36,43 +39,35 @@ class Agent:
     def prompt(self, user_input: str):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
 
-        对话历史由本类维护并原样传给 AgentLoop；
-        AgentLoop 在运行过程中会把模型回复与工具结果追加回 self.messages。
+        对话历史由 session 维护：每次先用 build_llm_payload() 重建发给模型的列表
+        （system → 压缩 summary → 保留消息），再把本轮新消息记录回 session。
+        AgentLoop 会在运行过程中把模型回复与工具结果追加到 payload 尾部。
         """
-        self.messages.append({"role": "user", "content": user_input})
+        session = self.session
+        payload = session.build_llm_payload()
+        payload.append({"role": "user", "content": user_input})
+        prior = len(payload)  # payload 已含本轮的 user 消息，位于尾部
 
         yield AgentEvent("agent_start")
-        final_text = yield from self.loop.run(self.messages)
+        try:
+            final_text = yield from self.loop.run(payload)
+        finally:
+            # 本轮新产生的消息 = 用户消息 + loop 追加到 payload 尾部的那批
+            new_messages = payload[prior - 1:]
+            session.record_turn(new_messages)
+            self._save()
         yield AgentEvent("agent_end", {"text": final_text})
-
-        self._save()
 
     def clear_history(self):
         """清空对话历史，仅保留 system prompt，并同步存档。"""
-        self.messages = (
-            [{"role": "system", "content": self.system_prompt}] if self.system_prompt else []
-        )
+        self.session.clear_history()
         self._save()
-
-    def _restore(self):
-        """从存档恢复会话；文件缺失 / 损坏都不影响启动（损坏时放弃存档、从新开始）。"""
-        try:
-            loaded = self.store.load()
-        except Exception as e:
-            print(f">>> 会话存档损坏，已忽略并从新会话开始: {e}")
-            return
-
-        if loaded is None:
-            return
-
-        self.system_prompt, self.messages = loaded
-        print(f">>> 已恢复会话（{len(self.messages)} 条历史消息）")
 
     def _save(self):
         """存档失败只警告，不打断使用。"""
-        if self.store is None:
+        if self.repo is None:
             return
         try:
-            self.store.save(self.system_prompt, self.messages)
+            self.repo.save(self.session)
         except Exception as e:
             print(f">>> 警告：会话存档失败: {e}")

@@ -2,68 +2,16 @@ import json
 
 import pytest
 
-from agent_core import Session, SessionEntry, SessionRepository, SessionStore
+from agent_core import (
+    Agent,
+    AgentLoop,
+    Session,
+    SessionEntry,
+    SessionRepository,
+)
+from ai import TextDelta
 
-
-# --------------------------------------------------------------------------- #
-# 旧版 SessionStore（保留兼容）
-# --------------------------------------------------------------------------- #
-def test_save_load_round_trip(tmp_path):
-    store = SessionStore(tmp_path / "s.json")
-    messages = [
-        {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "世界"},
-    ]
-    store.save("sys", messages)
-
-    assert store.load() == ("sys", messages)
-
-
-def test_save_creates_parent_dirs(tmp_path):
-    store = SessionStore(tmp_path / "a" / "b" / "s.json")
-    store.save("sys", [])
-
-    assert store.load() == ("sys", [])
-
-
-def test_no_tmp_file_left_after_save(tmp_path):
-    path = tmp_path / "s.json"
-    store = SessionStore(path)
-    store.save("sys", [])
-
-    assert path.exists()
-    assert not (tmp_path / "s.json.tmp").exists()
-
-
-def test_load_missing_returns_none(tmp_path):
-    store = SessionStore(tmp_path / "missing.json")
-    assert store.load() is None
-
-
-def test_load_corrupt_raises(tmp_path):
-    path = tmp_path / "s.json"
-    path.write_text("{ 这不是合法 JSON", encoding="utf-8")
-    store = SessionStore(path)
-
-    with pytest.raises(Exception):
-        store.load()
-
-
-def test_load_missing_optional_keys_returns_defaults(tmp_path):
-    path = tmp_path / "s.json"
-    path.write_text('{"version": 1}', encoding="utf-8")
-    store = SessionStore(path)
-
-    assert store.load() == ("", [])
-
-
-def test_load_wrong_structure_raises(tmp_path):
-    path = tmp_path / "s.json"
-    path.write_text('{"system_prompt": 123, "messages": []}', encoding="utf-8")
-    store = SessionStore(path)
-
-    with pytest.raises(ValueError):
-        store.load()
+from faux_provider import FauxProvider
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +39,17 @@ def test_append_does_not_mutate_old_entries():
     assert s.entries[b.id].content == "世界"
     assert b.parent_id == a.id
     assert c.parent_id == b.id
+
+
+def test_clear_history_keeps_system_prompt():
+    s = Session(session_id="abc", system_prompt="sys")
+    s.append_message("user", "hi")
+    s.append_message("assistant", "hello")
+    s.clear_history()
+
+    assert s.message_count == 0
+    assert s.head_id is None
+    assert s.build_llm_payload() == [{"role": "system", "content": "sys"}]
 
 
 def test_build_payload_system_plus_messages():
@@ -143,7 +102,7 @@ def test_build_payload_no_system_prompt():
 
 
 # --------------------------------------------------------------------------- #
-# SessionRepository：save / load / list / delete / rename / migrate
+# SessionRepository：save / load / list / delete / rename
 # --------------------------------------------------------------------------- #
 def test_repo_save_load_round_trip(tmp_path):
     repo = SessionRepository(tmp_path)
@@ -203,35 +162,6 @@ def test_repo_rename_missing_raises(tmp_path):
         repo.rename("nope", "x")
 
 
-def test_repo_migrate_v1_to_v2(tmp_path):
-    # 写一个 v1 flat 存档，repo.load 时应迁移成 v2 Session
-    path = tmp_path / "legacy.json"
-    path.write_text(
-        json.dumps({
-            "version": 1,
-            "system_prompt": "sys",
-            "messages": [
-                {"role": "user", "content": "你好"},
-                {"role": "assistant", "content": "世界"},
-            ],
-        }, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    repo = SessionRepository(tmp_path)
-    s = repo.load("legacy")
-
-    assert s is not None
-    assert s.system_prompt == "sys"
-    assert s.message_count == 2
-    assert s.head_id is not None
-    # 迁移后能正常重建 payload
-    assert s.build_llm_payload() == [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "世界"},
-    ]
-
-
 def test_repo_list_skips_tmp_and_corrupt(tmp_path):
     repo = SessionRepository(tmp_path)
     s = repo.create(name="ok")
@@ -241,6 +171,14 @@ def test_repo_list_skips_tmp_and_corrupt(tmp_path):
     metas = repo.list()
     assert all(m.session_id != "broken" for m in metas)
     assert any(m.session_id == s.session_id for m in metas)
+
+
+def test_repo_load_wrong_version_raises(tmp_path):
+    repo = SessionRepository(tmp_path)
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps({"version": 1, "messages": []}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        repo.load("legacy")
 
 
 # --------------------------------------------------------------------------- #
@@ -261,3 +199,56 @@ def test_session_roundtrip_with_compaction(tmp_path):
 
 def test_session_id_is_dir_safe():
     assert SessionRepository.new_session_id().isalnum()
+
+
+# --------------------------------------------------------------------------- #
+# Agent：用 Session + SessionRepository 驱动一轮，并正确记录本轮消息
+# --------------------------------------------------------------------------- #
+def make_agent(script, repo=None):
+    provider = FauxProvider(script)
+    loop = AgentLoop(provider=provider, model="faux-model", tools=[])
+    session = Session(
+        session_id=(repo.new_session_id() if repo else "abc"),
+        name="t",
+        system_prompt="sys",
+    )
+    agent = Agent(loop=loop, session=session, repo=repo)
+    return agent, provider
+
+
+def test_agent_prompt_records_turn_into_session():
+    agent, _ = make_agent([[TextDelta("你好")]])
+    events = list(agent.prompt("请打招呼"))
+
+    assert events[0].type == "agent_start"
+    assert events[-1].type == "agent_end"
+
+    s = agent.session
+    # 本轮应记录 user + assistant 两条消息
+    assert s.message_count == 2
+    assert s.head_id is not None
+    assert s.build_llm_payload() == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "请打招呼"},
+        {"role": "assistant", "content": "你好"},
+    ]
+
+
+def test_agent_prompt_saves_to_repo(tmp_path):
+    repo = SessionRepository(tmp_path)
+    agent, _ = make_agent([[TextDelta("ok")]], repo=repo)
+    list(agent.prompt("喂"))
+
+    loaded = repo.load(agent.session_id)
+    assert loaded is not None
+    assert loaded.message_count == 2
+
+
+def test_agent_clear_history_syncs(tmp_path):
+    repo = SessionRepository(tmp_path)
+    agent, _ = make_agent([[TextDelta("ok")]], repo=repo)
+    list(agent.prompt("喂"))
+    agent.clear_history()
+
+    assert agent.session.message_count == 0
+    assert repo.load(agent.session_id).message_count == 0
