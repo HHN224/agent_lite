@@ -1,9 +1,8 @@
 from pathlib import Path
-import subprocess
 
 from agent_core import AgentTool, ToolResult
 
-DEFAULT_BASH_IMAGE = "python:3.12-slim"
+from .sandbox import CommandRunner, DockerRunner, DEFAULT_BASH_IMAGE
 
 
 def safe_path(workspace: Path, path: str) -> Path:
@@ -82,22 +81,27 @@ class WriteTool(AgentTool):
 
 
 class BashTool(AgentTool):
-    """在一次性 Docker 容器中执行命令：无网络、只读根文件系统、资源限额，
-    仅通过 bind mount 把工作目录暴露给容器。
+    """执行 shell 命令，隔离机制由注入的 CommandRunner 决定（host / wsl / docker）。
 
-    运行镜像可配置（__init__ 的 image 参数），默认 python:3.12-slim。
+    命令实际怎么跑（以及是否隔离）由 runner 负责；本工具只负责：
+      · 定义 bash 的工具元数据（dangerous=True，受权限门约束）；
+      · 把命令行转发给 runner.run(command)。
+    运行镜像可配置（仅当 runner 是 DockerRunner 时通过 image 指定），默认 python:3.12-slim。
     返回结构化结果：exit_code / stdout / stderr 分开携带，非零退出码标记为失败。
     """
 
     argument_types = {"command": str}
 
-    def __init__(self, workspace: Path, image: str = DEFAULT_BASH_IMAGE):
+    def __init__(self, workspace: Path, runner: CommandRunner | None = None):
         self.workspace = workspace.resolve()
-        self.image = image
+        # 未显式注入时，默认用 Docker 档（保持向后兼容；普通路径仍是"宿主 docker"语义）。
+        # 注意：这里不调用 detect_backend，避免在工具构造期执行探测（探测是启动期的事，由 __main__ 做）。
+        self.runner = runner or DockerRunner(self.workspace)
+        self.command_timeout = self.runner.timeout
 
         super().__init__(
             name="bash",
-            description="Run a shell command in a Docker sandbox (no network); the project is mounted at /workspace",
+            description="Run a shell command (isolation depends on the configured sandbox backend)",
             parameters={
                 "type": "object",
                 "properties": {
@@ -112,57 +116,16 @@ class BashTool(AgentTool):
             dangerous=True,
         )
 
+    @property
+    def image(self):
+        """向后兼容：bash 工具的镜像（仅为 DockerRunner 存在，其他后端为 None）。"""
+        return getattr(self.runner, "image", None)
+
     def describe_call(self, arguments: dict) -> str:
-        return f"在 Docker 沙箱中执行命令: {arguments.get('command')}"
+        return f"执行命令: {arguments.get('command')}（沙箱后端: {self.runner.mode}）"
 
     def execute(self, command: str) -> ToolResult:
-        result = subprocess.run(
-            [
-                "docker", "run",
-                "--rm",
-
-                "--network", "none",
-                "--read-only",
-                "--tmpfs", "/tmp",
-                "--pids-limit", "100",
-                "--memory", "512m",
-
-                "--mount",
-                f"type=bind,source={self.workspace},target=/workspace",
-
-                "--workdir", "/workspace",
-
-                self.image,
-                "sh", "-lc", command,
-            ],
-            capture_output=True,
-            timeout=self.timeout,
-        )
-        # 字节模式 + 显式 UTF-8 解码：容器输出可能是任意字节（如中文文件名），
-        # 若用 text=True 交给宿主 locale（中文 Windows 是 GBK）解码，解码线程抛错会
-        # 让 stdout 变成 None，导致下面的 None + str 崩溃；这里统一按 UTF-8 容错解码。
-        out = (result.stdout or b"").decode("utf-8", errors="replace")
-        err = (result.stderr or b"").decode("utf-8", errors="replace")
-        output = (out + err).strip()
-
-        if result.returncode != 0:
-            content = output or f"(exit code {result.returncode}, no output)"
-            if output:
-                content = f"(exit code {result.returncode})\n{output}"
-            return ToolResult(
-                content=content,
-                is_error=True,
-                exit_code=result.returncode,
-                stdout=out,
-                stderr=err,
-            )
-
-        return ToolResult(
-            content=output or "(exit code 0, no output)",
-            exit_code=0,
-            stdout=out,
-            stderr=err,
-        )
+        return self.runner.run(command)
 
 
 class EditTool(AgentTool):
@@ -214,11 +177,19 @@ class EditTool(AgentTool):
         return ToolResult(content=f"Successfully edited {path}")
 
 
-def build_tools(workspace: Path, bash_image: str = DEFAULT_BASH_IMAGE) -> list[AgentTool]:
-    """按工作目录组装全部工具（read / write / bash / edit）；bash 运行镜像可配置。"""
+def build_tools(
+    workspace: Path,
+    bash_image: str = DEFAULT_BASH_IMAGE,
+    runner: CommandRunner | None = None,
+) -> list[AgentTool]:
+    """按工作目录组装全部工具（read / write / bash / edit）。
+
+    bash 的隔离后端通过 runner 注入（host / wsl / docker）；
+    未注入时默认用 DockerRunner（image 由 bash_image 决定），保持向后兼容。
+    """
     return [
         ReadTool(workspace),
         WriteTool(workspace),
-        BashTool(workspace, image=bash_image),
+        BashTool(workspace, runner=runner or DockerRunner(workspace, image=bash_image)),
         EditTool(workspace),
     ]

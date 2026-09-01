@@ -1,5 +1,6 @@
 import pytest
 
+from coding_agent.sandbox import DockerRunner
 from coding_agent.tools import build_tools, safe_path
 
 
@@ -122,51 +123,45 @@ class _FakeSubprocessResult:
 
 def _stub_subprocess(monkeypatch, result):
     monkeypatch.setattr(
-        "coding_agent.tools.subprocess.run", lambda *a, **k: result
+        "coding_agent.sandbox.subprocess.run", lambda *a, **k: result
     )
+
+
+def _bash_tool(tmp_path, monkeypatch, result):
+    """构造一个注入 DockerRunner 的 BashTool，并把 subprocess.run 打桩成返回 result。"""
+    _stub_subprocess(monkeypatch, result)
+    from coding_agent.tools import BashTool
+    return BashTool(tmp_path, runner=DockerRunner(tmp_path))
 
 
 def test_bash_tool_survives_none_stdout(tmp_path, monkeypatch):
     # 回归：Python 3.12 text=True 解码失败时 stdout 可能为 None，历史上会 None + str 崩溃
-    _stub_subprocess(
-        monkeypatch,
-        _FakeSubprocessResult(stdout=None, stderr=b"some stderr"),
-    )
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="whatever")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(stdout=None, stderr=b"some stderr"))
+    result = tool.execute(command="whatever")
     assert not result.is_error
     assert "some stderr" in result.content
 
 
 def test_bash_tool_decodes_utf8_stdout(tmp_path, monkeypatch):
     # docker 容器按 UTF-8 输出中文文件名，宿主应正确解码而不是乱码/崩溃
-    _stub_subprocess(
-        monkeypatch,
-        _FakeSubprocessResult(stdout="实习计划\n".encode("utf-8")),
-    )
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="ls")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(stdout="实习计划\n".encode("utf-8")))
+    result = tool.execute(command="ls")
     assert not result.is_error
     assert "实习计划" in result.content
 
 
 def test_bash_tool_undecodable_bytes_become_replace_char(tmp_path, monkeypatch):
     # 任何字节都不应让工具崩溃，坏字节用替换符兜底
-    _stub_subprocess(
-        monkeypatch,
-        _FakeSubprocessResult(stdout=b"\xff\xfe\xff abc"),
-    )
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="ls")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(stdout=b"\xff\xfe\xff abc"))
+    result = tool.execute(command="ls")
     assert not result.is_error
     assert "abc" in result.content
 
 
 def test_bash_tool_no_output_reports_exit_code(tmp_path, monkeypatch):
     # 非零退出码：无输出时也要让模型看到退出码，且标记为失败
-    _stub_subprocess(monkeypatch, _FakeSubprocessResult(returncode=3))
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="exit 3")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(returncode=3))
+    result = tool.execute(command="exit 3")
     assert result.is_error
     assert result.exit_code == 3
     assert "exit code 3" in result.content
@@ -174,12 +169,8 @@ def test_bash_tool_no_output_reports_exit_code(tmp_path, monkeypatch):
 
 def test_bash_tool_structured_fields(tmp_path, monkeypatch):
     # 结构化返回：exit_code / stdout / stderr 分开携带，非零退出码标记失败
-    _stub_subprocess(
-        monkeypatch,
-        _FakeSubprocessResult(returncode=1, stdout=b"out line", stderr=b"err line"),
-    )
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="false")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(returncode=1, stdout=b"out line", stderr=b"err line"))
+    result = tool.execute(command="false")
     assert result.is_error
     assert result.exit_code == 1
     assert result.stdout == "out line"
@@ -188,23 +179,22 @@ def test_bash_tool_structured_fields(tmp_path, monkeypatch):
 
 
 def test_bash_tool_success_zero_exit(tmp_path, monkeypatch):
-    _stub_subprocess(monkeypatch, _FakeSubprocessResult(returncode=0, stdout=b"ok"))
-    tools = {t.name: t for t in build_tools(tmp_path)}
-    result = tools["bash"].execute(command="echo ok")
+    tool = _bash_tool(tmp_path, monkeypatch, _FakeSubprocessResult(returncode=0, stdout=b"ok"))
+    result = tool.execute(command="echo ok")
     assert not result.is_error
     assert result.exit_code == 0
     assert result.stdout == "ok"
 
 
 def test_bash_image_configurable(tmp_path, monkeypatch):
-    # 运行镜像可配置：build_tools / BashTool 都能指定
+    # 运行镜像可配置：注入的 DockerRunner 携带镜像，build_tools 透传 bash_image
     captured = {}
 
     def fake_run(args, **kwargs):
         captured["args"] = args
         return _FakeSubprocessResult()
 
-    monkeypatch.setattr("coding_agent.tools.subprocess.run", fake_run)
+    monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
     tools = {t.name: t for t in build_tools(tmp_path, bash_image="custom:1.0")}
     tools["bash"].execute(command="true")
     assert "custom:1.0" in captured["args"]

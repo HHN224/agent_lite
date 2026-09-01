@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 from ai import OpenAIProvider
 from agent_core import Agent, AgentEvent, AgentLoop, SessionStore
+from coding_agent.sandbox import detect_backend
 from coding_agent.tools import build_tools
 
 
@@ -90,7 +91,13 @@ def parse_args(argv=None):
     parser.add_argument(
         "--bash-image",
         default="python:3.12-slim",
-        help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim）",
+        help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim，仅 --sandbox=docker 时生效）",
+    )
+    parser.add_argument(
+        "--sandbox",
+        choices=["auto", "host", "wsl", "docker"],
+        default="auto",
+        help="bash 命令的沙箱后端：auto 自动探测（docker→wsl→host）/ host 宿主直跑 / wsl WSL2 / docker Docker（默认 auto）",
     )
     args = parser.parse_args(argv)
 
@@ -140,7 +147,17 @@ def main():
         base_url=args.base_url,
     )
 
-    tools = build_tools(args.workspace, bash_image=args.bash_image)
+    # 探测沙箱后端（auto 会自动选 docker→wsl→host；强制指定不可用则 fail-closed 报错）
+    try:
+        runner = detect_backend(
+            sandbox=args.sandbox,
+            workspace=args.workspace,
+            bash_image=args.bash_image,
+        )
+    except Exception as e:
+        sys.exit(f"错误：{e}")
+
+    tools = build_tools(args.workspace, bash_image=args.bash_image, runner=runner)
 
     loop = AgentLoop(
         provider=provider,
@@ -154,7 +171,8 @@ def main():
 
     print(f">>> 会话: {args.session}（存档: {store.path}）")
     print(f">>> 工作目录: {args.workspace}")
-    print(f">>> 权限策略: {args.permission_policy}（bash 镜像: {args.bash_image}）")
+    print(f">>> 权限策略: {args.permission_policy}")
+    print(f">>> bash 沙箱: {runner.mode} —— {runner.describe()}")
 
     agent = Agent(
         loop=loop,
