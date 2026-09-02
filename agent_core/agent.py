@@ -21,6 +21,10 @@ class Agent:
       每轮 build payload 之前，通过 context_manager 量出当前上下文占用并判定是否达到
       压缩阈值，把结果以 AgentEvent("context_check") 发射出来供展示/观测；
       真正的压缩动作属于阶段 B，此处不做。context_window 为当前窗口（如 128000）。
+
+      计量口径为「两变量 + 校准式」：
+        session.usage     老历史真实基准；每轮结束后用 provider 本轮真实 last_usage 校准
+        session.new_usage 本轮启动后新增内容（本轮 user 输入 + 上轮输出/工具结果）的估算，每轮归零
     """
 
     def __init__(
@@ -50,43 +54,46 @@ class Agent:
         """请求中止当前运行（委托给 loop）。"""
         self.loop.abort()
 
-    def _context_check_event(self, pending_messages=None):
+    def _context_check_event(self):
         """在 build payload 前量出上下文占用并发射观测事件（阶段 A 只观测，不压缩）。
 
-        计量采用「锚点 + 增量」：
-          锚点 = provider 上一次成功调用的真实 usage 总量，并绑定当时的会话 head，
-                作为「增量从哪起算」的边界；
-          增量 = 锚点之后新 append 进 session 的条目 + 本轮 pending 的 user 消息（启发式估算）。
-        这样即便锚点落后于当前会话，也能算出当前真实占用，避免漏检。
+        计量口径为「两变量 + 校准式」：total = session.usage + session.new_usage。
+        session.new_usage 在每轮开始时由 prompt() 负责累积（本轮 user 输入 + 上轮输出/工具结果）。
+        这里只负责量出并判定，返回 (pressure, event)。
         """
         if self.context_manager is None or not self.context_window:
             return None
-        # 用 provider 最近一次真实 usage 构造锚点，并记录当时的会话 head 边界
-        anchor = None
-        usage = getattr(self.loop.provider, "last_usage", None)
-        if usage:
-            from .context_manager import UsageAnchor, usage_total
-
-            total = usage_total(usage)
-            if total is not None:
-                anchor = UsageAnchor(total_tokens=total, head_id=self.session.head_id)
-        pressure = self.context_manager.measure(
-            self.session,
-            self.context_window,
-            anchor=anchor,
-            pending_messages=pending_messages,
-        )
+        pressure = self.context_manager.measure(self.session, self.context_window)
         needs_compaction = self.context_manager.requires_compaction(pressure)
         event = AgentEvent("context_check", {
             "total_tokens": pressure.total_tokens,
             "context_window": pressure.context_window,
             "ratio": pressure.ratio,
-            "used_anchor": pressure.used_anchor,
-            "incremental": pressure.incremental,
+            "usage": pressure.usage,
+            "new_usage": pressure.new_usage,
             "needs_compaction": needs_compaction,
             "threshold_ratio": self.context_manager.threshold_ratio,
         })
         return pressure, event
+
+    def _accumulate_new_usage(self, messages: list[dict]):
+        """把一段消息的估算 token 累加进 session.new_usage（表：还没被 usage 覆盖的新增）。"""
+        if self.context_manager is None:
+            return
+        meter = self.context_manager.meter
+        self.session.new_usage += sum(meter.estimate_message(m) for m in messages)
+
+    def _set_new_usage(self, messages: list[dict]):
+        """把 session.new_usage 重置为「一段消息」的估算值。
+
+        用于校准式口径的收尾：此时 session.usage 已被 provider 真实 last_usage 校准为
+        「模型本轮实际看到的输入」，new_usage 应只保留「输出后新增、下一轮待估」的部分，
+        因此整体重置而不是继续累加，避免与已校准进 usage 的内容重复计数。
+        """
+        if self.context_manager is None:
+            return
+        meter = self.context_manager.meter
+        self.session.new_usage = sum(meter.estimate_message(m) for m in messages)
 
     def prompt(self, user_input: str):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
@@ -95,14 +102,17 @@ class Agent:
         （system → 压缩 summary → 保留消息），再把本轮新消息记录回 session。
         AgentLoop 会在运行过程中把模型回复与工具结果追加到 payload 尾部。
 
-        阶段 A：在 build payload 前发射一个 context_check 事件（把本轮 user 输入
-        作为 pending 一起计量），让调用方看到「当前占用 / 是否到阈值」，但不执行压缩（阶段 B）。
+        阶段 A 生命周期（校准式 + 两变量）：
+          开场：把本轮 user 输入累加进 new_usage，量出占用、发射 context_check 事件；
+          收尾：用 provider 本轮真实 last_usage 校准 session.usage（= 模型本轮实际看到的输入），
+                再把 new_usage 重置为「本轮输出侧新增」（assistant 回复 / 工具结果的估算），
+                这样 usage 代表「真实输入」，new_usage 代表「输出之后又新增的待估部分」。
         """
         session = self.session
 
-        # 本轮的 user 输入即将发给模型但尚未 record 进 session，作为 pending 参与计量
-        pending = [{"role": "user", "content": user_input}]
-        check = self._context_check_event(pending_messages=pending)
+        # 开场：本轮 user 输入即将发给模型但尚未 record 进 session，累加进 new_usage
+        self._accumulate_new_usage([{"role": "user", "content": user_input}])
+        check = self._context_check_event()
         if check is not None:
             _pressure, event = check
             yield event
@@ -115,9 +125,21 @@ class Agent:
         try:
             final_text = yield from self.loop.run(payload)
         finally:
-            # 本轮新产生的消息 = 用户消息 + loop 追加到 payload 尾部的那批
-            new_messages = payload[prior - 1:]
-            session.record_turn(new_messages)
+            # 本轮 loop 追加到 payload 尾部的消息 = 输出侧新增（assistant 回复 / 工具结果）
+            produced = payload[prior:]
+            # 校准：provider 本轮真实 usage 的**输入侧**（prompt_tokens）等于
+            # 「system + 历史 + 本轮 input」这个模型实际看到的上下文，用作 session.usage。
+            # （不用 total_tokens，因为它已含 completion，会造成与 new_usage 里的输出侧新增重复计数。）
+            usage = getattr(self.loop.provider, "last_usage", None)
+            from .context_manager import usage_input_total
+
+            real_input = usage_input_total(usage) if usage else None
+            if real_input is not None:
+                session.usage = real_input
+            # new_usage 重置为输出侧新增（避免与已校准进 usage 的输入重复计数）
+            self._set_new_usage(produced)
+            # record_turn 会把本轮新消息追加进历史（含 user 输入），并 touch + bump token_count
+            session.record_turn(payload[prior - 1:])
             self._save()
         yield AgentEvent("agent_end", {"text": final_text})
 

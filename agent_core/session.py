@@ -123,6 +123,8 @@ class Session:
         created_at: float | None = None,
         updated_at: float | None = None,
         token_count: int = 0,
+        usage: int = 0,
+        new_usage: int = 0,
     ):
         self.session_id = session_id
         self.name = name
@@ -133,6 +135,11 @@ class Session:
         self.created_at = created_at if created_at is not None else time.time()
         self.updated_at = updated_at if updated_at is not None else self.created_at
         self.token_count = token_count
+        # 上下文计量（阶段 A）：两个变量
+        #   usage      = 老历史的真实 token 基准（provider 真实上报 / 校准）
+        #   new_usage  = 上次合并后、新增内容的估算 token（过程变量，每轮归零）
+        self.usage = usage
+        self.new_usage = new_usage
         self._token_estimate = None  # 由 SessionManager 注入：Callable[[SessionEntry], int]
 
     # ------------------------------------------------------------------ #
@@ -215,6 +222,8 @@ class Session:
         self.head_id = None
         self.next_id = 1
         self.token_count = 0
+        self.usage = 0
+        self.new_usage = 0
         self._touch()
 
     # ------------------------------------------------------------------ #
@@ -300,6 +309,8 @@ class Session:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "token_count": self.token_count,
+            "usage": self.usage,
+            "new_usage": self.new_usage,
             "head_id": self.head_id,
             "next_id": self.next_id,
             "entries": [e.to_dict() for e in self.entries.values()],
@@ -321,6 +332,8 @@ class Session:
             created_at=d.get("created_at"),
             updated_at=d.get("updated_at"),
             token_count=d.get("token_count", 0),
+            usage=d.get("usage", 0),
+            new_usage=d.get("new_usage", 0),
         )
 
 
