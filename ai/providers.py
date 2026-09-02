@@ -65,6 +65,8 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, api_key: str, base_url: str | None = None):
         self.client = OpenAI(api_key=api_key, base_url=base_url, max_retries=2)
+        # 最近一次调用的真实 usage（anchor），供上下文计量锚定；None 表示尚未拿到
+        self.last_usage: dict | None = None
 
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
@@ -78,9 +80,18 @@ class OpenAIProvider(LLMProvider):
                 messages=messages,
                 tools=[t.to_schema() for t in tools],
                 stream=True,
+                stream_options={"include_usage": True},
             )
 
+            # 收集流末的真实 usage（非流式末 chunk，通常无 choices）
+            usage: dict | None = None
             for chunk in response:
+                if chunk.usage:
+                    usage = {
+                        k: v
+                        for k, v in chunk.usage.model_dump().items()
+                        if v is not None
+                    }
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -98,6 +109,9 @@ class OpenAIProvider(LLMProvider):
                         acc["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         acc["args"] += tc.function.arguments
+
+            # 流成功结束：把最近一次真实 usage 记录为锚点
+            self.last_usage = usage
         except OpenAIError as e:
             raise ProviderError(f"模型 API 错误: {e}") from e
 

@@ -1,6 +1,11 @@
 from .loop import AgentLoop
 from .agent import Agent
 from .agent_tools import AgentTool, ToolResult
+from .context_manager import (
+    ContextManager,
+    ContextPressure,
+    TokenMeter,
+)
 from .events import AgentEvent
 from .states import AgentState
 from .session import (
@@ -16,6 +21,9 @@ __all__ = [
     "Agent",
     "AgentTool",
     "ToolResult",
+    "ContextManager",
+    "ContextPressure",
+    "TokenMeter",
     "AgentEvent",
     "AgentState",
     "Session",

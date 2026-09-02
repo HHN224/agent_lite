@@ -12,7 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dotenv import load_dotenv
 
 from ai import OpenAIProvider
-from agent_core import Agent, AgentEvent, AgentLoop, SessionRepository
+from agent_core import (
+    Agent,
+    AgentEvent,
+    AgentLoop,
+    ContextManager,
+    SessionRepository,
+)
 from coding_agent.sandbox import detect_backend
 from coding_agent.tools import build_tools
 
@@ -43,6 +49,13 @@ def cli_listener(event: AgentEvent):
         safe_print(f">>> 工具返回: {event.data['content'][:200]}")
     elif event.type == "error":
         safe_print(f"\n>>> 模型服务出错: {event.data['message']}")
+    elif event.type == "context_check":
+        d = event.data
+        safe_print(
+            f">>> 上下文: {d['total_tokens']} / {d['context_window']} tokens "
+            f"({d['ratio']:.0%}) | 阈值 {d['threshold_ratio']:.0%} "
+            f"| {'将压缩' if d['needs_compaction'] else '正常'}"
+        )
 
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -92,6 +105,18 @@ def parse_args(argv=None):
         choices=["ask", "deny", "auto"],
         default="ask",
         help="危险工具的权限策略：ask 每次确认 / deny 直接拒绝 / auto 自动放行（默认 ask）",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=128000,
+        help="模型上下文窗口（token），用于触发上下文压缩的计量（默认 128000，0 表示不启用）",
+    )
+    parser.add_argument(
+        "--compact-threshold",
+        type=float,
+        default=0.8,
+        help="触发压缩的窗口占用阈值（0~1，默认 0.8）",
     )
     parser.add_argument(
         "--bash-image",
@@ -196,13 +221,23 @@ def main():
     if is_new:
         repo.save(session)  # 新建的立即落盘
 
-    agent = Agent(loop=loop, session=session, repo=repo)
+    # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
+    context_manager = ContextManager(threshold_ratio=args.compact_threshold)
+
+    agent = Agent(
+        loop=loop,
+        session=session,
+        repo=repo,
+        context_manager=context_manager,
+        context_window=args.context_window,
+    )
 
     print(f">>> 会话: {session.session_id}（{session.name or '<未命名>'}，{session.message_count} 条消息）")
     print(f">>> 存档: {repo._path(session.session_id)}")
     print(f">>> 工作目录: {args.workspace}")
     print(f">>> 权限策略: {args.permission_policy}")
     print(f">>> bash 沙箱: {runner.mode} —— {runner.describe()}")
+    print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}）")
     print(f">>> 输入 /sessions 查看 / 重命名 / 删除会话")
 
     while True:

@@ -395,7 +395,9 @@ class SessionRepository:
                     1 for e in data.get("entries", []) if e.get("type") == "message"
                 ),
             ))
-        metas.sort(key=lambda m: m.updated_at, reverse=True)
+        # 先按 updated_at 倒序，再以 session_id 作为稳定 tiebreaker，
+        # 避免同一 tick 内多条会话时间戳相等时排序不稳定（Windows time 分辨率）。
+        metas.sort(key=lambda m: (-m.updated_at, m.session_id))
         return metas
 
     def delete(self, session_id: str) -> bool:

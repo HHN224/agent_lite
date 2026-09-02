@@ -16,12 +16,26 @@ class Agent:
     state 与持久化：
       session  一个 Session（对话状态：条目链 + system prompt + head）。
       repo     一个 SessionRepository（把 session 持久化到磁盘）；可空，空则不存档。
+
+    上下文管理（阶段 A：计量 + 触发）：
+      每轮 build payload 之前，通过 context_manager 量出当前上下文占用并判定是否达到
+      压缩阈值，把结果以 AgentEvent("context_check") 发射出来供展示/观测；
+      真正的压缩动作属于阶段 B，此处不做。context_window 为当前窗口（如 128000）。
     """
 
-    def __init__(self, loop, session: Session, repo: SessionRepository | None = None):
+    def __init__(
+        self,
+        loop,
+        session: Session,
+        repo: SessionRepository | None = None,
+        context_manager=None,
+        context_window: int = 0,
+    ):
         self.loop = loop
         self.session = session
         self.repo = repo
+        self.context_manager = context_manager
+        self.context_window = context_window
 
     @property
     def state(self) -> AgentState:
@@ -36,14 +50,43 @@ class Agent:
         """请求中止当前运行（委托给 loop）。"""
         self.loop.abort()
 
+    def _context_check_event(self):
+        """在 build payload 前量出上下文占用并发射观测事件（阶段 A 只观测，不压缩）。"""
+        if self.context_manager is None or not self.context_window:
+            return None
+        # 优先用 provider 最近一次真实 usage 锚点；拿不到则回退启发式
+        usage = getattr(self.loop.provider, "last_usage", None)
+        pressure = self.context_manager.measure(
+            self.session, self.context_window, usage=usage
+        )
+        needs_compaction = self.context_manager.requires_compaction(pressure)
+        event = AgentEvent("context_check", {
+            "total_tokens": pressure.total_tokens,
+            "context_window": pressure.context_window,
+            "ratio": pressure.ratio,
+            "used_anchor": pressure.used_anchor,
+            "needs_compaction": needs_compaction,
+            "threshold_ratio": self.context_manager.threshold_ratio,
+        })
+        return pressure, event
+
     def prompt(self, user_input: str):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
 
         对话历史由 session 维护：每次先用 build_llm_payload() 重建发给模型的列表
         （system → 压缩 summary → 保留消息），再把本轮新消息记录回 session。
         AgentLoop 会在运行过程中把模型回复与工具结果追加到 payload 尾部。
+
+        阶段 A：在 build payload 前发射一个 context_check 事件，
+        让调用方看到「当前占用 / 是否到阈值」，但不执行压缩（阶段 B）。
         """
         session = self.session
+
+        check = self._context_check_event()
+        if check is not None:
+            _pressure, event = check
+            yield event
+
         payload = session.build_llm_payload()
         payload.append({"role": "user", "content": user_input})
         prior = len(payload)  # payload 已含本轮的 user 消息，位于尾部
