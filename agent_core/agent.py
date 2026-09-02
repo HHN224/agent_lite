@@ -50,14 +50,31 @@ class Agent:
         """请求中止当前运行（委托给 loop）。"""
         self.loop.abort()
 
-    def _context_check_event(self):
-        """在 build payload 前量出上下文占用并发射观测事件（阶段 A 只观测，不压缩）。"""
+    def _context_check_event(self, pending_messages=None):
+        """在 build payload 前量出上下文占用并发射观测事件（阶段 A 只观测，不压缩）。
+
+        计量采用「锚点 + 增量」：
+          锚点 = provider 上一次成功调用的真实 usage 总量，并绑定当时的会话 head，
+                作为「增量从哪起算」的边界；
+          增量 = 锚点之后新 append 进 session 的条目 + 本轮 pending 的 user 消息（启发式估算）。
+        这样即便锚点落后于当前会话，也能算出当前真实占用，避免漏检。
+        """
         if self.context_manager is None or not self.context_window:
             return None
-        # 优先用 provider 最近一次真实 usage 锚点；拿不到则回退启发式
+        # 用 provider 最近一次真实 usage 构造锚点，并记录当时的会话 head 边界
+        anchor = None
         usage = getattr(self.loop.provider, "last_usage", None)
+        if usage:
+            from .context_manager import UsageAnchor, usage_total
+
+            total = usage_total(usage)
+            if total is not None:
+                anchor = UsageAnchor(total_tokens=total, head_id=self.session.head_id)
         pressure = self.context_manager.measure(
-            self.session, self.context_window, usage=usage
+            self.session,
+            self.context_window,
+            anchor=anchor,
+            pending_messages=pending_messages,
         )
         needs_compaction = self.context_manager.requires_compaction(pressure)
         event = AgentEvent("context_check", {
@@ -65,6 +82,7 @@ class Agent:
             "context_window": pressure.context_window,
             "ratio": pressure.ratio,
             "used_anchor": pressure.used_anchor,
+            "incremental": pressure.incremental,
             "needs_compaction": needs_compaction,
             "threshold_ratio": self.context_manager.threshold_ratio,
         })
@@ -77,12 +95,14 @@ class Agent:
         （system → 压缩 summary → 保留消息），再把本轮新消息记录回 session。
         AgentLoop 会在运行过程中把模型回复与工具结果追加到 payload 尾部。
 
-        阶段 A：在 build payload 前发射一个 context_check 事件，
-        让调用方看到「当前占用 / 是否到阈值」，但不执行压缩（阶段 B）。
+        阶段 A：在 build payload 前发射一个 context_check 事件（把本轮 user 输入
+        作为 pending 一起计量），让调用方看到「当前占用 / 是否到阈值」，但不执行压缩（阶段 B）。
         """
         session = self.session
 
-        check = self._context_check_event()
+        # 本轮的 user 输入即将发给模型但尚未 record 进 session，作为 pending 参与计量
+        pending = [{"role": "user", "content": user_input}]
+        check = self._context_check_event(pending_messages=pending)
         if check is not None:
             _pressure, event = check
             yield event

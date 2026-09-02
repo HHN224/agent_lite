@@ -7,11 +7,16 @@
 
 设计对齐研究结论（docs/research/05-synthesis-and-recommendations.md §3 阶段 A）：
   - 计量与压缩引擎解耦（DSH 的 meter / compaction 拆分），可各自独立测试、独立替换。
-  - 计量「启发式 + provider usage 锚点」：优先复用 provider 上报的真实 usage 作锚点，
-    拿不到（usage=None）则整体回退到 chars/4 启发式。
+  - 计量「启发式 + provider usage 锚点」：优先复用 provider 上报的真实 usage 作**锚点**，
+    再对「锚点之后新增的内容」用启发式估算出**增量**，两者相加得到当前真实占用；
+    拿不到 usage（usage=None）则整体回退到 chars/4 启发式。
   - 触发阈值 threshold_ratio 默认 0.8，做成配置项而非硬编码。
 
-本模块不触碰具体 LLM SDK；只与 Session（build_llm_payload）协作。
+「锚点 + 增量」的含义：
+  usage 锚点 = 上一次成功调用模型时，模型实际看到的上下文 token 数（真实、准）。
+  增量       = 锚点之后会话又新增的内容（新条目 + 即将发送但这轮还没入历史的 pending 消息），
+              用启发式估算。这样即便锚点早已落后于当前会话，也能算出「当前真实占用」，
+              避免「锚点一直等于会话末尾、从不增长」导致的漏检。
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ def _estimate_message(message: dict, estimate_text) -> int:
     return max(0, total)
 
 
-def _usage_total(usage) -> int | None:
+def usage_total(usage) -> int | None:
     """从 provider usage（OpenAI 风格 dict）里取出总 token 数；取不到返回 None。"""
     if not isinstance(usage, dict):
         return None
@@ -55,6 +60,21 @@ def _usage_total(usage) -> int | None:
 
 
 # --------------------------------------------------------------------------- #
+# 计量锚点：真实 usage 总量 + 它覆盖到的会话条目边界
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class UsageAnchor:
+    """一次「计量锚点」：真实 usage 总量，以及当时会话推进到的 head 条目。
+
+    head_id 用来计算增量：从该条目之后到当前 head 的内容是「锚点之后新增的」，
+    需要用启发式估算补上，才是当前真实占用。
+    """
+
+    total_tokens: int
+    head_id: str | None
+
+
+# --------------------------------------------------------------------------- #
 # 计量结果
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -64,7 +84,9 @@ class ContextPressure:
     total_tokens: int
     context_window: int
     ratio: float
-    used_anchor: bool  # True 表示这次计量用了 provider 真实 usage 锚点，否则纯启发式
+    used_anchor: bool  # True 表示这次计量以真实 usage 锚点为基准，否则纯启发式
+    anchor_total: int | None = None  # 用了锚点时的锚点基准值（否则 None）
+    incremental: int = 0  # 锚点之上的启发式增量（新条目 + pending）
 
 
 class TokenMeter:
@@ -84,40 +106,64 @@ class TokenMeter:
     def estimate_payload(self, payload: list[dict]) -> int:
         return sum(self.estimate_message(m) for m in payload)
 
+    def _estimate_entries_after(self, session, head_id: str | None) -> int:
+        """估算从锚点 head_id 之后到当前 head 的条目 token 数（不包含 pending）。"""
+        if not head_id:
+            return 0
+        path = session._path_to_head()  # root → head 的线性链
+        start = None
+        for i, e in enumerate(path):
+            if e.id == head_id:
+                start = i + 1
+                break
+        if start is None:
+            # 锚点边界不在当前链上（如已被压缩），保守起见增量记 0，避免重复计数
+            return 0
+        return sum(
+            self.estimate_message(e.to_llm())
+            for e in path[start:]
+            if e.type == "message"
+        )
+
     def measure(
         self,
         session,
         context_window: int,
-        usage=None,
+        anchor: UsageAnchor | None = None,
+        pending_messages: list[dict] | None = None,
     ) -> ContextPressure:
-        """量出当前 session 的上下文占用。
+        """量出当前 session 的上下文占用 = 锚点（真实 usage）+ 增量（启发式）。
 
-        usage  可选：provider 最近一次上报的真实 usage 字典。若其能给出总 token
-               数，则作为锚点直接采用（used_anchor=True）；否则整体回退启发式。
+        anchor            可选：provider 最近一次成功调用的真实 usage 锚点。
+                         若有，则以其 total_tokens 为基准，再补「锚点之后的新增内容」；
+                         若没有（usage=None / 第一次还没调用过），则整体回退启发式。
+        pending_messages  可选：即将发送、但尚未 record 进 session 的消息（如本轮 user 输入）。
         """
-        if context_window and context_window > 0:
-            if usage is not None:
-                total = _usage_total(usage)
-                if total is not None:
-                    return ContextPressure(
-                        total_tokens=total,
-                        context_window=context_window,
-                        ratio=total / context_window,
-                        used_anchor=True,
-                    )
-            total = self.estimate_payload(session.build_llm_payload())
-            return ContextPressure(
-                total_tokens=total,
-                context_window=context_window,
-                ratio=total / context_window,
-                used_anchor=False,
-            )
-        # 未配置 context_window：无从判定比例，返回 0 占用
+        if not context_window or context_window <= 0:
+            return ContextPressure(0, 0, 0.0, False, anchor_total=None, incremental=0)
+
+        pending = pending_messages or []
+
+        if anchor is not None and anchor.total_tokens is not None:
+            base = anchor.total_tokens
+            delta = self._estimate_entries_after(session, anchor.head_id)
+            used_anchor = True
+            anchor_total = base
+        else:
+            base = self.estimate_payload(session.build_llm_payload())
+            delta = 0
+            used_anchor = False
+            anchor_total = None
+
+        pending_total = sum(self.estimate_message(m) for m in pending)
+        total = base + delta + pending_total
         return ContextPressure(
-            total_tokens=0,
-            context_window=0,
-            ratio=0.0,
-            used_anchor=False,
+            total_tokens=total,
+            context_window=context_window,
+            ratio=total / context_window,
+            used_anchor=used_anchor,
+            anchor_total=anchor_total,
+            incremental=delta + pending_total,
         )
 
 
@@ -157,16 +203,32 @@ class ContextManager:
         self._overflow_patterns = overflow_patterns or list(_OVERFLOW_PATTERNS)
 
     # --- 计量 / 触发 ---
-    def measure(self, session, context_window: int, usage=None) -> ContextPressure:
-        return self.meter.measure(session, context_window, usage=usage)
+    def measure(
+        self,
+        session,
+        context_window: int,
+        anchor: UsageAnchor | None = None,
+        pending_messages: list[dict] | None = None,
+    ) -> ContextPressure:
+        return self.meter.measure(
+            session, context_window, anchor=anchor, pending_messages=pending_messages
+        )
 
     def requires_compaction(self, pressure: ContextPressure) -> bool:
         """按阈值判定一次计量结果是否到了该压缩的临界点。"""
         return pressure.ratio >= self.threshold_ratio
 
-    def should_compact(self, session, context_window: int, usage=None) -> bool:
+    def should_compact(
+        self,
+        session,
+        context_window: int,
+        anchor: UsageAnchor | None = None,
+        pending_messages: list[dict] | None = None,
+    ) -> bool:
         """一键判定：当前上下文是否达到压缩阈值（阶段 A 只判定，不执行压缩）。"""
-        pressure = self.measure(session, context_window, usage=usage)
+        pressure = self.measure(
+            session, context_window, anchor=anchor, pending_messages=pending_messages
+        )
         return self.requires_compaction(pressure)
 
     # --- 溢出检测（provider 报错时强制压缩的依据，阶段 D 用）---
