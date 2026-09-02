@@ -11,6 +11,7 @@ from .context_manager import (
     ContextManager,
     ContextPressure,
     TokenMeter,
+    ToolResultPruner,
 )
 from .events import AgentEvent
 from .states import AgentState
@@ -34,6 +35,7 @@ __all__ = [
     "ContextManager",
     "ContextPressure",
     "TokenMeter",
+    "ToolResultPruner",
     "AgentEvent",
     "AgentState",
     "Session",

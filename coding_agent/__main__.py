@@ -48,7 +48,8 @@ def cli_listener(event: AgentEvent):
     elif event.type == "tool_execution_start":
         safe_print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
     elif event.type == "tool_execution_end":
-        safe_print(f">>> 工具返回: {event.data['content'][:200]}")
+        suffix = "（已截断）" if event.data.get("pruned") else ""
+        safe_print(f">>> 工具返回: {event.data['content'][:200]}{suffix}")
     elif event.type == "error":
         safe_print(f"\n>>> 模型服务出错: {event.data['message']}")
     elif event.type == "context_check":

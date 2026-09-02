@@ -45,6 +45,42 @@ def _estimate_message(message: dict, estimate_text) -> int:
     return max(0, total)
 
 
+TOOL_PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"
+
+
+class ToolResultPruner:
+    """把超长工具结果折叠成「叠加头尾」（head + marker + tail），省上下文。
+
+    阈值与头尾长度都可配置（默认对齐 DSH pruner：threshold 8192 / head 4096 / tail 1024）。
+    关键：截断只影响 content，**不触碰与 tool_call 的配对关系**（tool_call_id 不变），
+    因此模型历史不会损坏。
+    """
+
+    def __init__(
+        self,
+        threshold_chars: int = 8192,
+        head_chars: int = 4096,
+        tail_chars: int = 1024,
+    ):
+        self.threshold_chars = threshold_chars
+        self.head_chars = head_chars
+        self.tail_chars = tail_chars
+
+    def prune(self, content: str) -> tuple[str, bool]:
+        """对一段工具输出做叠加头尾截断。返回 (处理后的内容, 是否被截断)。
+
+        不超阈值则原样返回（pruned=False）；超阈值则 head + marker + tail（pruned=True）。
+        """
+        if content is None:
+            return (content or "", False)
+        if len(content) <= self.threshold_chars:
+            return content, False
+        head = content[: self.head_chars]
+        tail = content[-self.tail_chars :]
+        pruned = head + TOOL_PRUNE_MARKER + tail
+        return pruned, True
+
+
 def usage_total(usage) -> int | None:
     """从 provider usage（OpenAI 风格 dict）里取出总 token 数；取不到返回 None。"""
     if not isinstance(usage, dict):
