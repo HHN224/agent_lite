@@ -245,10 +245,14 @@ class Session:
         return path
 
     def build_llm_payload(self) -> list[dict]:
-        """重建发给模型的消息列表：system → （最新的压缩 summary）→ 保留的消息。
+        """重建发给模型的消息列表：system → （最新的压缩 summary 作为 user 消息）→ 保留的消息。
 
         保留的消息从最新的 compaction 的 first_kept_entry_id 开始；
         若没有压缩，则返回从 root 到 head 的全部消息。
+
+        决策（对齐用户锁定的设计）：压缩摘要渲染成一条 **user 消息**，置于保留消息头部，
+        而不是第二条 system 消息。这样更贴近 Claude Code / Codex / DSH 等成熟厂商的做法，
+        且不额外改变 system prompt 前缀。
         """
         path = self._path_to_head()
 
@@ -267,8 +271,9 @@ class Session:
         payload: list[dict] = []
         if self.system_prompt:
             payload.append({"role": "system", "content": self.system_prompt})
+        # 压缩摘要作为一条 user 消息，紧跟在 system 之后、保留消息之前
         if latest_cmp and latest_cmp.summary:
-            payload.append({"role": "system", "content": latest_cmp.summary})
+            payload.append({"role": "user", "content": latest_cmp.summary})
         for e in path[kept_start_index:]:
             if e.type == "message":
                 payload.append(e.to_llm())

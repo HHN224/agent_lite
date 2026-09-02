@@ -16,8 +16,10 @@ from agent_core import (
     Agent,
     AgentEvent,
     AgentLoop,
+    CompactionEngine,
     ContextManager,
     SessionRepository,
+    make_summarizer,
 )
 from coding_agent.sandbox import detect_backend
 from coding_agent.tools import build_tools
@@ -56,6 +58,16 @@ def cli_listener(event: AgentEvent):
             f"({d['ratio']:.0%}) | 阈值 {d['threshold_ratio']:.0%} "
             f"| {'将压缩' if d['needs_compaction'] else '正常'}"
         )
+    elif event.type == "compaction_start":
+        safe_print(f">>> 正在压缩上下文（折叠前 {event.data['compacted_count']} 条）...")
+    elif event.type == "compaction_end":
+        d = event.data
+        if d["success"]:
+            safe_print(f">>> 压缩完成：已折叠 {d['compacted_count']} 条，保留从 {d['first_kept_entry_id']} 起")
+        else:
+            safe_print(">>> 压缩中止（未找到安全切点）")
+    elif event.type == "compaction_skip":
+        safe_print(f">>> 跳过压缩：{event.data['reason']}")
 
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
@@ -117,6 +129,18 @@ def parse_args(argv=None):
         type=float,
         default=0.8,
         help="触发压缩的窗口占用阈值（0~1，默认 0.8）",
+    )
+    parser.add_argument(
+        "--compact-retain",
+        type=float,
+        default=0.16,
+        help="压缩时保留尾部原文的窗口占比（默认 0.16，DSH）",
+    )
+    parser.add_argument(
+        "--compact-max-tokens",
+        type=int,
+        default=2000,
+        help="压缩摘要的最大 token 数（默认 2000）",
     )
     parser.add_argument(
         "--bash-image",
@@ -224,12 +248,19 @@ def main():
     # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
     context_manager = ContextManager(threshold_ratio=args.compact_threshold)
 
+    # 阶段 B：真压缩引擎。摘要走独立 provider 调用；保留尾部按窗口比例（默认 0.16 DSH）。
+    compaction_engine = CompactionEngine(
+        summarizer=make_summarizer(provider=provider, model=args.model, max_tokens=args.compact_max_tokens),
+        retain_ratio=args.compact_retain,
+    )
+
     agent = Agent(
         loop=loop,
         session=session,
         repo=repo,
         context_manager=context_manager,
         context_window=args.context_window,
+        compaction_engine=compaction_engine,
     )
 
     print(f">>> 会话: {session.session_id}（{session.name or '<未命名>'}，{session.message_count} 条消息）")
@@ -237,7 +268,7 @@ def main():
     print(f">>> 工作目录: {args.workspace}")
     print(f">>> 权限策略: {args.permission_policy}")
     print(f">>> bash 沙箱: {runner.mode} —— {runner.describe()}")
-    print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}）")
+    print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}，保留 {args.compact_retain:.0%}）")
     print(f">>> 输入 /sessions 查看 / 重命名 / 删除会话")
 
     while True:
@@ -272,8 +303,13 @@ def main():
             continue
 
         if user_input.strip() == "/compact":
-            # 压缩的数据层已就绪；真正的 LLM 总结在后续阶段实现
-            print(">>> 上下文压缩尚未实现（数据层已就绪，将在后续阶段接入）")
+            # 阶段 B：手动触发一次真压缩（边界吸附 + 保留尾部 + 独立摘要）
+            print(">>> 手动压缩 ...")
+            for ev in agent.compaction_engine.compact_if_needed(
+                agent.session, agent.context_window
+            ):
+                cli_listener(ev)
+            agent._save()
             continue
 
         # 执行阶段：Ctrl+C 触发 abort（中止本轮），而非退出 REPL

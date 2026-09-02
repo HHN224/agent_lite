@@ -86,7 +86,8 @@ def test_build_payload_with_compaction_uses_kept_start():
 
     payload = s.build_llm_payload()
     assert payload[0] == {"role": "system", "content": "sys"}
-    assert payload[1] == {"role": "system", "content": "这是总结"}
+    # 压缩摘要渲染成一条 user 消息（阶段 B 决策），而非第二条 system
+    assert payload[1] == {"role": "user", "content": "这是总结"}
     # 只保留 first_kept(e2) 之后的 message，e1 被打包进 summary 不再出现
     roles = [p["role"] for p in payload[2:]]
     assert roles == ["assistant", "user"]
@@ -126,8 +127,11 @@ def test_repo_load_missing_returns_none(tmp_path):
 def test_repo_list_sorted_by_updated(tmp_path):
     repo = SessionRepository(tmp_path)
     a = repo.create(name="A")
-    repo.save(a)
     b = repo.create(name="B")
+    # 显式设置不同 updated_at，确保排序不依赖 Windows 时间戳分辨率（同 tick 会相等）
+    a.updated_at = 100.0
+    b.updated_at = 200.0
+    repo.save(a)
     repo.save(b)
 
     metas = repo.list()

@@ -17,10 +17,12 @@ class Agent:
       session  一个 Session（对话状态：条目链 + system prompt + head）。
       repo     一个 SessionRepository（把 session 持久化到磁盘）；可空，空则不存档。
 
-    上下文管理（阶段 A：计量 + 触发）：
+    上下文管理（阶段 A：计量 + 触发；阶段 B：真的压缩）：
       每轮 build payload 之前，通过 context_manager 量出当前上下文占用并判定是否达到
-      压缩阈值，把结果以 AgentEvent("context_check") 发射出来供展示/观测；
-      真正的压缩动作属于阶段 B，此处不做。context_window 为当前窗口（如 128000）。
+      压缩阈值。阶段 A 只发射 context_check 事件观测；阶段 B 在此基础上，若达到阈值
+      就用 compaction_engine 做一次真压缩（边界吸附 + 保留尾部 + 独立摘要 + 走 user 消息），
+      并以 "compaction_start"/"compaction_end" 事件播报，然后继续本轮任务。
+      context_window 为当前窗口（如 128000）。
 
       计量口径为「两变量 + 校准式」：
         session.usage     老历史真实基准；每轮结束后用 provider 本轮真实 last_usage 校准
@@ -34,12 +36,14 @@ class Agent:
         repo: SessionRepository | None = None,
         context_manager=None,
         context_window: int = 0,
+        compaction_engine=None,
     ):
         self.loop = loop
         self.session = session
         self.repo = repo
         self.context_manager = context_manager
         self.context_window = context_window
+        self.compaction_engine = compaction_engine
 
     @property
     def state(self) -> AgentState:
@@ -107,6 +111,9 @@ class Agent:
           收尾：用 provider 本轮真实 last_usage 校准 session.usage（= 模型本轮实际看到的输入），
                 再把 new_usage 重置为「本轮输出侧新增」（assistant 回复 / 工具结果的估算），
                 这样 usage 代表「真实输入」，new_usage 代表「输出之后又新增的待估部分」。
+        阶段 B：若开场判定达到阈值，则在此处用 compaction_engine 做一次真压缩
+          （发射 compaction_start/end 事件，并把压缩摘要渲染成 user 消息），
+          压缩成功后重建 payload，再继续本轮任务——不中断。
         """
         session = self.session
 
@@ -116,6 +123,17 @@ class Agent:
         if check is not None:
             _pressure, event = check
             yield event
+            # 阶段 B：达到阈值则先压缩，再继续
+            if event.data["needs_compaction"] and self.compaction_engine is not None:
+                for cev in self.compaction_engine.compact_if_needed(
+                    self.session, self.context_window
+                ):
+                    yield cev
+                self._save()  # 压缩落地后立即存档
+                # 压缩后：被折叠的旧内容已并入摘要，usage/new_usage 不再代表当前占用，
+                # 重置为「仅剩待估输出侧」的起点，避免把已被压缩的旧内容重复计入。
+                self.session.usage = 0
+                self.session.new_usage = 0
 
         payload = session.build_llm_payload()
         payload.append({"role": "user", "content": user_input})
