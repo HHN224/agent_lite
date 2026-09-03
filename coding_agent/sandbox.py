@@ -90,8 +90,11 @@ class CommandRunner(ABC):
         self.timeout = timeout
 
     @abstractmethod
-    def run(self, command: str) -> ToolResult:
-        """执行一条命令并返回规范化结果。"""
+    def run(self, command: str, timeout: int | None = None) -> ToolResult:
+        """执行一条命令并返回规范化结果。
+
+        timeout 覆盖默认限时；None 用 self.timeout。由 BashTool 传入（可选 command 超时）。
+        """
         raise NotImplementedError
 
     def describe(self) -> str:
@@ -110,13 +113,14 @@ class HostRunner(CommandRunner):
 
     mode = "host"
 
-    def run(self, command: str) -> ToolResult:
+    def run(self, command: str, timeout: int | None = None) -> ToolResult:
+        t = self.timeout if timeout is None else timeout
         proc = subprocess.run(
             command,
             cwd=self.workspace,
             capture_output=True,
             shell=True,
-            timeout=self.timeout,
+            timeout=t,
         )
         return _compose_result(proc)
 
@@ -136,14 +140,15 @@ class WslRunner(CommandRunner):
 
     mode = "wsl"
 
-    def run(self, command: str) -> ToolResult:
+    def run(self, command: str, timeout: int | None = None) -> ToolResult:
+        t = self.timeout if timeout is None else timeout
         mapped = windows_to_wsl(self.workspace)
         # 先 cd 到映射的工作目录再执行；路径含空格时用双引号包裹
         full = f'cd "{mapped}" && {command}'
         proc = subprocess.run(
             ["wsl", "-e", "sh", "-lc", full],
             capture_output=True,
-            timeout=self.timeout,
+            timeout=t,
         )
         return _compose_result(proc)
 
@@ -167,7 +172,8 @@ class DockerRunner(CommandRunner):
         super().__init__(workspace, timeout)
         self.image = image
 
-    def run(self, command: str) -> ToolResult:
+    def run(self, command: str, timeout: int | None = None) -> ToolResult:
+        t = self.timeout if timeout is None else timeout
         args = [
             "docker", "run",
             "--rm",
@@ -185,7 +191,7 @@ class DockerRunner(CommandRunner):
         proc = subprocess.run(
             args,
             capture_output=True,
-            timeout=self.timeout,
+            timeout=t,
         )
         return _compose_result(proc)
 

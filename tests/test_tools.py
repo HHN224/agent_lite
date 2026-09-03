@@ -36,8 +36,10 @@ def test_write_then_read_round_trip(tmp_path):
     result = tools["write"].execute(path="notes.txt", content="hello 世界")
     assert not result.is_error
 
+    # read 现在返回带行号（cat -n 风格）的内容
     result = tools["read"].execute(path="notes.txt")
-    assert result.content == "hello 世界"
+    assert "hello 世界" in result.content
+    assert result.content.startswith("     1\thello 世界")
 
 
 def test_write_rejects_outside_workspace(tmp_path):
@@ -81,9 +83,9 @@ def test_bash_tool_marks_dangerous(tmp_path):
     assert tools["read"].dangerous is False
 
 
-def test_build_tools_has_four_defaults(tmp_path):
+def test_build_tools_has_seven_defaults(tmp_path):
     names = sorted(t.name for t in build_tools(tmp_path))
-    assert names == ["bash", "edit", "read", "write"]
+    assert names == ["bash", "edit", "find", "grep", "ls", "read", "write"]
 
 
 def test_describe_call_default_uses_repr(tmp_path):
@@ -199,3 +201,140 @@ def test_bash_image_configurable(tmp_path, monkeypatch):
     tools["bash"].execute(command="true")
     assert "custom:1.0" in captured["args"]
     assert tools["bash"].image == "custom:1.0"
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1: grep / ls / find + read offset+limit / bash timeout
+# --------------------------------------------------------------------------- #
+
+
+def test_read_offset_and_limit(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "f.txt").write_text("a\nb\nc\nd\ne", encoding="utf-8")
+
+    result = tools["read"].execute(path="f.txt", offset=2, limit=3)
+    assert not result.is_error
+    # 行号为 2,3,4（cat -n 风格）
+    assert result.content == "     2\tb\n     3\tc\n     4\td"
+
+
+def test_read_line_numbers_cat_n(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "f.txt").write_text("x\ny", encoding="utf-8")
+    result = tools["read"].execute(path="f.txt")
+    assert result.content == "     1\tx\n     2\ty"
+
+
+def test_read_image_returns_data_uri(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+    result = tools["read"].execute(path="img.png")
+    assert not result.is_error
+    assert result.content.startswith("data:image/png;base64,")
+
+
+def test_bash_tool_timeout_param(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _FakeSubprocessResult()
+
+    monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    tools["bash"].execute(command="sleep 10", timeout=5)
+    assert captured["timeout"] == 5
+
+
+def test_bash_tool_default_timeout_uses_runner(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _FakeSubprocessResult()
+
+    monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    tools["bash"].execute(command="true")
+    # 未传 timeout 时应使用 runner 默认（DockerRunner 默认 60）
+    assert captured["timeout"] == 60
+
+
+def test_grep_literal_finds_match(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "a.py").write_text("import os\nprint('hello')\n", encoding="utf-8")
+    result = tools["grep"].execute(pattern="print", glob="*.py")
+    assert not result.is_error
+    assert "a.py:2:" in result.content
+    assert "print" in result.content
+
+
+def test_grep_no_match(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "a.txt").write_text("nothing here", encoding="utf-8")
+    result = tools["grep"].execute(pattern="zzz")
+    assert not result.is_error
+    assert "No matches found" in result.content
+
+
+def test_grep_limit(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "a.txt").write_text("x\nx\nx\nx", encoding="utf-8")
+    result = tools["grep"].execute(pattern="x", limit=2)
+    assert not result.is_error
+    assert "match limit reached" in result.content
+    assert result.content.count("a.txt:") == 2
+
+
+def test_ls_lists_entries(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "file1.txt").write_text("hi", encoding="utf-8")
+    (tmp_path / "sub").mkdir()
+    result = tools["ls"].execute(path="")
+    assert not result.is_error
+    assert "file1.txt" in result.content
+    assert "sub/" in result.content
+
+
+def test_ls_empty_dir(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    result = tools["ls"].execute(path="")
+    assert not result.is_error
+    assert "empty directory" in result.content
+
+
+def test_find_by_name_glob(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "data.txt").write_text("x", encoding="utf-8")
+    result = tools["find"].execute(name="*.json")
+    assert not result.is_error
+    assert "config.json" in result.content
+    assert "data.txt" not in result.content
+
+
+def test_find_by_type_dir(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x", encoding="utf-8")
+    result = tools["find"].execute(name="*", type="d")
+    assert not result.is_error
+    assert "src" in result.content
+    assert "main.py" not in result.content
+
+
+def test_find_invalid_type(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    result = tools["find"].execute(name="*", type="x")
+    assert result.is_error
+    assert "type must be" in result.content
+
+
+def test_find_size_min(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "big.bin").write_bytes(b"\x00" * 100)
+    (tmp_path / "small.txt").write_text("hi", encoding="utf-8")
+    result = tools["find"].execute(name="*", type="f", size_min=50)
+    assert not result.is_error
+    assert "big.bin" in result.content
+    assert "small.txt" not in result.content
