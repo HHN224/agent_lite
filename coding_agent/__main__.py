@@ -25,6 +25,14 @@ from agent_core import (
 )
 from coding_agent.modes import get_mode, mode_names
 from coding_agent.sandbox import detect_backend
+# textual TUI 为可选依赖；缺失时回退到 CLI（不影响纯命令行使用）
+try:
+    from coding_agent.tui import run_tui
+    _HAS_TUI = True
+except ImportError:
+    _HAS_TUI = False
+    def run_tui(*a, **k):
+        raise RuntimeError("textual 未安装，请 pip install textual 后使用 --ui tui")
 from coding_agent.tools import build_tools
 
 
@@ -149,6 +157,12 @@ def parse_args(argv=None):
         "--mode",
         default="default",
         help="任务模式：default / plan / code / review（默认 default）",
+    )
+    parser.add_argument(
+        "--ui",
+        choices=["tui", "cli"],
+        default="tui",
+        help="界面：tui（textual，默认）/ cli（行式 REPL）",
     )
     parser.add_argument(
         "--base-url",
@@ -323,6 +337,15 @@ def main():
 
     # 当前任务模式（/mode 会更新）；新建会话用 get_mode(current_mode) 作为 system prompt
     current_mode = args.mode
+
+    # TUI（默认界面）：textual 交互，支持运行中 steer / 粘图。
+    if args.ui == "tui" and _HAS_TUI:
+        run_tui(agent)
+        return
+
+    if args.ui == "tui" and not _HAS_TUI:
+        print(">>> textual 未安装，回退到 CLI。请 pip install textual（或 pip install -e .[tui]）")
+        # 继续走 CLI（fallthrough）
 
     while True:
         try:

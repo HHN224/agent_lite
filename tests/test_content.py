@@ -86,3 +86,25 @@ def test_content_to_llm_keeps_image():
     out = content_to_llm(blocks)
     assert isinstance(out, list)
     assert out[0]["type"] == "image_url"
+
+
+def test_prompt_with_images_constructs_block_content():
+    # 4D：Agent.prompt(images=...) 应把 user content 构造成 [text_block, *image_blocks]，
+    # 走完整 loop 链路并存档。用 FauxProvider 不碰真实 API。
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from agent_core import Agent, AgentLoop, Session
+    from faux_provider import FauxProvider
+    from ai import TextDelta
+
+    provider = FauxProvider([[TextDelta("这是一只猫")]])
+    loop = AgentLoop(provider=provider, model="m", tools=[])
+    session = Session(session_id="s_img", system_prompt="sys")
+    agent = Agent(loop=loop, session=session)
+    img = image_block("cGF0", "image/png")
+    events = list(agent.prompt("这是什么动物？", images=[img]))
+    assert any(e.type == "agent_end" for e in events)
+    # session 里第一条 user 消息的 content 应为结构块 [text, image]
+    entries = [e for e in session._path_to_head() if e.type == "message" and e.role == "user"]
+    assert entries[0].content[0]["type"] == "text"
+    assert entries[0].content[1]["type"] == "image_url"

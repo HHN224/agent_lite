@@ -17,6 +17,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+tui = [
+    "textual>=0.60",
+]
 
 [project.scripts]
 agent-lite = "coding_agent.__main__:main"

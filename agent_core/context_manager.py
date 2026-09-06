@@ -24,6 +24,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from .content import content_length
+
 
 # --------------------------------------------------------------------------- #
 # 启发式估算（与 session.estimate_tokens 的 chars/4 思路一致，但作用于 message dict）
@@ -36,8 +38,16 @@ def default_estimate_text(text: str) -> int:
 
 
 def _estimate_message(message: dict, estimate_text) -> int:
-    """估算一条发给模型的消息 dict 的 token 数：content + tool_calls + 结构开销。"""
-    total = estimate_text(message.get("content") or "")
+    """估算一条发给模型的消息 dict 的 token 数：content + tool_calls + 结构开销。
+
+    content 可能是纯字符串，也可能是结构块列表（text/image_url/tool_result/thinking）。
+    对列表用 content_length（图片按固定当量）；对字符串用 charset 估算。
+    """
+    content = message.get("content")
+    if isinstance(content, list):
+        total = content_length(content)
+    else:
+        total = estimate_text(content or "")
     if message.get("tool_calls"):
         total += estimate_text(json.dumps(message["tool_calls"], ensure_ascii=False))
     # 每个消息的角色标签 / 字段分隔等结构性 token，给一个小的固定开销

@@ -1,3 +1,4 @@
+from .content import image_block, text_block
 from .events import AgentEvent
 from .states import AgentState
 from .session import Session, SessionRepository
@@ -135,8 +136,11 @@ class Agent:
         meter = self.context_manager.meter
         self.session.new_usage = sum(meter.estimate_message(m) for m in messages)
 
-    def prompt(self, user_input: str):
+    def prompt(self, user_input: str, images: list[dict] | None = None):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
+
+        images 可选：传入结构块列表（如 image_block(...)），则本轮 user 消息的
+        content 构造成 [text_block(user_input), *images]，支持多模态。否则用纯文本。
 
         对话历史由 session 维护：每次先用 build_llm_payload() 重建发给模型的列表
         （system → 压缩 summary → 保留消息），再把本轮新消息记录回 session。
@@ -153,8 +157,15 @@ class Agent:
         """
         session = self.session
 
+        # 构造本轮 user 消息：有 images 时 content 为 [text_block, *images] 结构块，否则纯文本
+        if images:
+            user_content = [text_block(user_input or "")] + list(images)
+        else:
+            user_content = user_input
+        user_msg = {"role": "user", "content": user_content}
+
         # 开场：本轮 user 输入即将发给模型但尚未 record 进 session，累加进 new_usage
-        self._accumulate_new_usage([{"role": "user", "content": user_input}])
+        self._accumulate_new_usage([user_msg])
         check = self._context_check_event()
         if check is not None:
             _pressure, event = check
@@ -172,7 +183,7 @@ class Agent:
                 self.session.new_usage = 0
 
         payload = session.build_llm_payload()
-        payload.append({"role": "user", "content": user_input})
+        payload.append(user_msg)
         prior = len(payload)  # payload 已含本轮的 user 消息，位于尾部
 
         # 让 loop 在轮间查询 agent 的 steer 队列（运行中插话）
