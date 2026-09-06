@@ -141,8 +141,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--model",
-        default="deepseek-v4-flash",
-        help="模型名（默认 deepseek-v4-flash）",
+        default="deepseek-v4-flash-vision-exp",
+        help="模型名（默认 deepseek-v4-flash-vision-exp，支持图片输入）",
     )
     parser.add_argument(
         "--base-url",
