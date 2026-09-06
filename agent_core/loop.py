@@ -4,6 +4,7 @@ from ai import ProviderError, TextDelta, ThinkingDelta, ToolCall
 
 from .content import (
     content_length,
+    content_to_llm,
     is_content_blocks,
     thinking_block,
 )
@@ -107,6 +108,22 @@ class AgentLoop:
         except Exception:
             return []
 
+    @staticmethod
+    def _llm_messages(messages: list[dict]) -> list[dict]:
+        """把运行中的 messages 转成可发给模型的形式：过滤 content 里的 thinking 块。
+
+        运行循环累积的 payload 会把 assistant 的 content 存成 [thinking, text] 结构块，
+        但 DeepSeek / OpenAI 的下游不认 thinking 变体。在对 provider 发送前，
+        每个 message 的 content 经 content_to_llm 过滤（保留 text / image_url）。
+        """
+        out = []
+        for m in messages:
+            mm = dict(m)
+            if mm.get("content") is not None:
+                mm["content"] = content_to_llm(mm["content"])
+            out.append(mm)
+        return out
+
     def step(self, messages: list):
         """单步生成器：跑一轮（调模型 → 可能执行工具），yield AgentEvent，return StepResult。
 
@@ -124,8 +141,11 @@ class AgentLoop:
         message_started = False
         thinking_started = False
 
+        # 送入 provider 前，把 messages 里每个 content 过滤掉 thinking 块等非法变体。
+        # （运行中累积的 payload 可能含 [thinking, text] 结构块，而 DeepSeek/OpenAI 不认 thinking。）
+        llm_messages = self._llm_messages(messages)
         try:
-            for event in self.provider.stream(messages, self.tools, self.model):
+            for event in self.provider.stream(llm_messages, self.tools, self.model):
                 if self._aborted:
                     break
                 if isinstance(event, ThinkingDelta):

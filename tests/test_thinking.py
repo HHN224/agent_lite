@@ -115,3 +115,21 @@ def test_unresolved_tool_call_recovery_synthetic_message():
     assert "SYSTEM NOTE" in text
     assert "call_1" in text
     assert "unknown" in text
+
+
+def test_llm_messages_filters_thinking_from_running_payload():
+    # 运行中累积的 payload（loop 内部 messages）可能含 [thinking, text] 结构块；
+    # 发送给 provider 前必须过滤掉 thinking，否则 DeepSeek/OpenAI 报 400。
+    from agent_core.content import thinking_block, text_block
+
+    msgs = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": [thinking_block("我想想"), text_block("你好！")]},
+    ]
+    out = AgentLoop._llm_messages(msgs)
+    # 发给模型的 assistant content：thinking 被去掉、只剩 text（简化为字符串）
+    assert out[1]["role"] == "assistant"
+    assert out[1]["content"] == "你好！"
+    # 原来的 messages 不被修改（存档仍保留 thinking）
+    assert is_content_blocks(msgs[1]["content"])
+    assert msgs[1]["content"][0]["type"] == "thinking"
