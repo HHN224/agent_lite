@@ -1,11 +1,16 @@
 import json
 
-from ai import ProviderError, TextDelta, ToolCall
+from ai import ProviderError, TextDelta, ThinkingDelta, ToolCall
 
+from .content import (
+    content_length,
+    is_content_blocks,
+    thinking_block,
+)
 from .events import AgentEvent
 from .states import AgentState
 from .tool_executor import ToolExecutor
-from .truncate import ToolOutputTruncator
+from .truncate import ToolOutputTruncator, TruncationResult
 
 
 class StepResult:
@@ -93,14 +98,22 @@ class AgentLoop:
         yield AgentEvent("turn_start")
 
         text_parts: list[str] = []
+        thinking_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         message_started = False
+        thinking_started = False
 
         try:
             for event in self.provider.stream(messages, self.tools, self.model):
                 if self._aborted:
                     break
-                if isinstance(event, TextDelta):
+                if isinstance(event, ThinkingDelta):
+                    if not thinking_started:
+                        yield AgentEvent("thinking_start")
+                        thinking_started = True
+                    yield AgentEvent("thinking_update", {"content": event.content})
+                    thinking_parts.append(event.content)
+                elif isinstance(event, TextDelta):
                     if not message_started:
                         yield AgentEvent("message_start")
                         message_started = True
@@ -115,6 +128,8 @@ class AgentLoop:
             yield AgentEvent("turn_end")
             return StepResult(finished=True, text=f"(模型服务出错：{e})")
 
+        if thinking_started:
+            yield AgentEvent("thinking_end")
         if message_started:
             yield AgentEvent("message_end")
 
@@ -131,13 +146,25 @@ class AgentLoop:
             final_text = "".join(text_parts)
             # 最终回复也要记入历史，否则下一轮与持久化存档都缺这条 assistant 消息
             if final_text:
-                messages.append({"role": "assistant", "content": final_text})
+                # 若同时有 thinking，content 用结构块（thinking + text）；否则纯文本
+                if thinking_parts:
+                    content = [thinking_block("".join(thinking_parts))]
+                    if final_text:
+                        content.append({"type": "text", "text": final_text})
+                else:
+                    content = final_text
+                messages.append({"role": "assistant", "content": content})
             return StepResult(finished=True, text=final_text)
 
         # 把这一轮 assistant 消息以标准 dict 形式记入历史
+        assistant_content: str | list[dict] = "".join(text_parts) or None
+        if thinking_parts:
+            assistant_content = [thinking_block("".join(thinking_parts))]
+            if text_parts:
+                assistant_content.append({"type": "text", "text": "".join(text_parts)})
         messages.append({
             "role": "assistant",
-            "content": "".join(text_parts) or None,
+            "content": assistant_content,
             "tool_calls": [
                 {
                     "id": call.id,
@@ -159,12 +186,20 @@ class AgentLoop:
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
             result = self.executor.execute(call)
             # Phase 2：工具结果做 truncate_* 截断 + 可选全文写盘（只改 content，tool_call_id 配对不变）
-            tr = self.truncator.truncate(
-                result.content,
-                tool_name=call.name,
-                tool_call_id=call.id,
-                session_id=self.session_id,
-            )
+            # 若工具结果本身是结构块（如 read 图片返回 image_url），跳过字符串截断，直接透传。
+            if is_content_blocks(result.content):
+                tr = TruncationResult(
+                    content=result.content,
+                    truncated=False,
+                    full_length=content_length(result.content),
+                )
+            else:
+                tr = self.truncator.truncate(
+                    result.content,
+                    tool_name=call.name,
+                    tool_call_id=call.id,
+                    session_id=self.session_id,
+                )
             yield AgentEvent("tool_execution_end", {
                 "content": tr.content,
                 "is_error": result.is_error,

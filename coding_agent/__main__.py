@@ -39,13 +39,44 @@ def safe_print(s: str, **kwargs):
             sys.stdout.encoding or "utf-8"), **kwargs)
 
 
+def _content_text(content) -> str:
+    """把消息 content（str 或结构块列表）提取为纯文本，供终端显示。
+
+    图片块显示为 [image:<mime>]，thinking 块不在此显示（由 thinking_start/update 单列）。
+    避免在 GBK 终端上打印超长 base64 出问题。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            parts.append(b.get("text") or "")
+        elif t == "image_url":
+            url = b.get("image_url", {})
+            parts.append(f"[image:{url.get('url', '')[:40]}]")
+        elif t == "tool_result":
+            parts.append(b.get("content") or "")
+    return "".join(parts)
+
+
 def cli_listener(event: AgentEvent):
     """把 Agent 的事件流渲染成终端输出（复刻原来的 >>> 提示格式）。"""
     if event.type == "turn_start":
         print("\n>>> 调用 API ...")
     elif event.type == "message_update":
-        safe_print(event.data["content"], end="", flush=True)
+        safe_print(_content_text(event.data["content"]), end="", flush=True)
     elif event.type == "message_end":
+        print()
+    elif event.type == "thinking_start":
+        safe_print("\n>>> 思考中...", end="", flush=True)
+    elif event.type == "thinking_update":
+        safe_print(_content_text(event.data["content"]), end="", flush=True)
+    elif event.type == "thinking_end":
         print()
     elif event.type == "tool_execution_start":
         safe_print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
@@ -54,7 +85,7 @@ def cli_listener(event: AgentEvent):
         full_path = event.data.get("full_output_path")
         if full_path:
             suffix += f" —— 全文: {full_path}"
-        safe_print(f">>> 工具返回: {event.data['content'][:200]}{suffix}")
+        safe_print(f">>> 工具返回: {_content_text(event.data['content'])[:200]}{suffix}")
     elif event.type == "error":
         safe_print(f"\n>>> 模型服务出错: {event.data['message']}")
     elif event.type == "context_check":

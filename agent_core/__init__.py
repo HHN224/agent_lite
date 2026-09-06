@@ -1,6 +1,20 @@
 from .loop import AgentLoop
 from .agent import Agent
 from .agent_tools import AgentTool, ToolResult
+from .content import (
+    BLOCK_IMAGE,
+    BLOCK_TEXT,
+    BLOCK_THINKING,
+    BLOCK_TOOL_RESULT,
+    content_length,
+    content_to_llm,
+    content_to_text,
+    image_block,
+    is_content_blocks,
+    text_block,
+    thinking_block,
+    tool_result_block,
+)
 from .compaction import (
     SUMMARY_PROMPT,
     CompactionEngine,
@@ -44,6 +58,18 @@ __all__ = [
     "ContextManager",
     "ContextPressure",
     "TokenMeter",
+    "BLOCK_IMAGE",
+    "BLOCK_TEXT",
+    "BLOCK_THINKING",
+    "BLOCK_TOOL_RESULT",
+    "content_length",
+    "content_to_llm",
+    "content_to_text",
+    "image_block",
+    "is_content_blocks",
+    "text_block",
+    "thinking_block",
+    "tool_result_block",
     "TruncationResult",
     "ToolOutputTruncator",
     "ToolResultStore",

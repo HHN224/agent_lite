@@ -1,12 +1,15 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 from ai import Tool
+from agent_core.content import content_to_text
 
 
 class ToolResult:
     """工具 execute() 的统一返回类型：内容与元信息分开携带。
 
-    content    要回填给模型的字符串结果。
+    content    要回填给模型的结果：可以是纯字符串，或是结构块列表
+               （text / image_url / tool_result 等，见 agent_core.content）。
     is_error   True 表示这是一次失败的结果（如权限拒绝、文件不存在、命令超时）。
     denied     本次调用是否因权限策略被拒绝（未产生副作用）。
     exit_code  Bash 等命令类工具的退出码；非命令工具为 None。
@@ -16,7 +19,7 @@ class ToolResult:
 
     def __init__(
         self,
-        content: str,
+        content: str | list[dict],
         is_error: bool = False,
         denied: bool = False,
         exit_code: int | None = None,
@@ -29,6 +32,10 @@ class ToolResult:
         self.exit_code = exit_code
         self.stdout = stdout
         self.stderr = stderr
+
+    def content_as_text(self) -> str:
+        """把 content 提取为纯文本字符串（供截断 / UI / 估算）。"""
+        return content_to_text(self.content)
 
 
 class AgentTool(Tool, ABC):

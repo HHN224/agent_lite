@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agent_core import AgentTool, ToolResult
+from agent_core.content import image_block
 
 from .sandbox import CommandRunner, DockerRunner, DEFAULT_BASH_IMAGE
 
@@ -62,14 +63,14 @@ class ReadTool(AgentTool):
         if not file.is_file():
             return ToolResult(content=f"Error: not a file: {path}", is_error=True)
 
-        # 图片文件：返回 base64 图片内容（多模态模型可查看）
+        # 图片文件：返回 ImageBlock（结构块，多模态模型可查看）
         if file.suffix.lower() in _IMAGE_EXTENSIONS:
             try:
                 import base64
                 import mimetypes
                 data = base64.b64encode(file.read_bytes()).decode("ascii")
                 mime = mimetypes.guess_type(str(file))[0] or "image/png"
-                return ToolResult(content=f"data:{mime};base64,{data}")
+                return ToolResult(content=[image_block(data, mime)])
             except Exception as e:
                 return ToolResult(content=f"Error reading image: {e}", is_error=True)
 

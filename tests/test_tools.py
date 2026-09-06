@@ -230,7 +230,11 @@ def test_read_image_returns_data_uri(tmp_path):
     (tmp_path / "img.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
     result = tools["read"].execute(path="img.png")
     assert not result.is_error
-    assert result.content.startswith("data:image/png;base64,")
+    # Phase 3：图片返回结构块（image_url），不再返回裸 base64 字符串
+    assert isinstance(result.content, list)
+    assert result.content[0]["type"] == "image_url"
+    url = result.content[0]["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
 
 
 def test_bash_tool_timeout_param(tmp_path, monkeypatch):

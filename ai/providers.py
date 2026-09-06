@@ -29,6 +29,17 @@ class TextDelta:
 
 
 @dataclass
+class ThinkingDelta:
+    """一段模型推理（thinking / reasoning）增量。
+
+    DeepSeek 等带 reasoning 的模型会在内容之前产出 thinking 片段；
+    它与最终答案 TextDelta 分开，进历史时用 ThinkingBlock，不进入最终回复。
+    """
+
+    content: str
+
+
+@dataclass
 class ToolCall:
     """一次完整的工具调用（参数已由 provider 拼装并解析为 dict）。"""
 
@@ -37,7 +48,7 @@ class ToolCall:
     arguments: dict
 
 
-StreamEvent = Union[TextDelta, ToolCall]
+StreamEvent = Union[TextDelta, ThinkingDelta, ToolCall]
 
 
 class LLMProvider(ABC):
@@ -51,7 +62,7 @@ class LLMProvider(ABC):
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
-        """以流式方式请求模型，依次产出 TextDelta / ToolCall 事件。"""
+        """以流式方式请求模型，依次产出 TextDelta / ThinkingDelta / ToolCall 事件。"""
         raise NotImplementedError
 
 
@@ -97,6 +108,11 @@ class OpenAIProvider(LLMProvider):
                 delta = chunk.choices[0].delta
                 if delta is None:
                     continue
+
+                # thinking / reasoning 增量（DeepSeek 等）
+                thinking = getattr(delta, "reasoning_content", None) or getattr(delta, "thinking", None)
+                if thinking:
+                    yield ThinkingDelta(thinking)
 
                 if delta.content:
                     yield TextDelta(delta.content)

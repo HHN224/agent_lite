@@ -15,6 +15,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .content import content_to_text
+
 VERSION = 2
 
 # 会话名 / session_id 的长度上限（防止 id 越界、避免文件系统意外）
@@ -49,7 +51,10 @@ class SessionEntry:
     first_kept_entry_id: str | None = None
 
     def to_llm(self) -> dict:
-        """转成发给模型的消息 dict（仅对 message 有效）。"""
+        """转成发给模型的消息 dict（仅对 message 有效）。
+
+        content 为 str 或结构块列表（见 agent_core.content），两者都直接透传给 OpenAI。
+        """
         msg: dict = {"role": self.role}
         if self.content is not None:
             msg["content"] = self.content
@@ -244,15 +249,54 @@ class Session:
         path.reverse()
         return path
 
+    def _find_unresolved_tool_calls(self) -> list[dict]:
+        """扫描消息链，找出"assistant 已发起 tool_calls 但无对应 tool 结果"的区间。
+
+        用于中断恢复：从磁盘恢复会话时，若发现这样的未闭合工具调用，合成一条状态消息，
+        告知模型哪些工具结果未知，避免模型误以为工具已成功 / 未执行。
+
+        返回 list[dict]，每项形如：
+          {"tool_call_id": ..., "tool_name": ..., "status": "unknown" | "not_started"}
+        """
+        path = self._path_to_head()
+        # tool_call_id -> tool name（已发起的调用）
+        started: dict[str, str] = {}
+        # tool_call_id -> 是否有对应结果回填
+        resolved: set[str] = set()
+
+        for e in path:
+            if e.type != "message":
+                continue
+            if e.role == "assistant" and e.tool_calls:
+                for tc in e.tool_calls:
+                    tid = tc.get("id")
+                    if tid:
+                        started[tid] = tc.get("function", {}).get("name", "tool")
+            elif e.role == "tool" and e.tool_call_id:
+                resolved.add(e.tool_call_id)
+
+        unresolved = []
+        for tid, tname in started.items():
+            if tid not in resolved:
+                # 无法区分"未开始"还是"已开始但结果被中断"：保守标记 unknown，
+                # 让模型只做幂等/只读重试或询问用户。
+                unresolved.append({
+                    "tool_call_id": tid,
+                    "tool_name": tname,
+                    "status": "unknown",
+                })
+        return unresolved
+
     def build_llm_payload(self) -> list[dict]:
-        """重建发给模型的消息列表：system → （最新的压缩 summary 作为 user 消息）→ 保留的消息。
+        """重建发给模型的消息列表：system → （中断恢复合成消息）→ （压缩 summary）→ 保留消息。
 
         保留的消息从最新的 compaction 的 first_kept_entry_id 开始；
         若没有压缩，则返回从 root 到 head 的全部消息。
 
-        决策（对齐用户锁定的设计）：压缩摘要渲染成一条 **user 消息**，置于保留消息头部，
-        而不是第二条 system 消息。这样更贴近 Claude Code / Codex / DSH 等成熟厂商的做法，
-        且不额外改变 system prompt 前缀。
+        决策（对齐用户锁定的设计）：
+          - 压缩摘要渲染成一条 **user 消息**，置于保留消息头部。
+          - 中断恢复时，若有未闭合工具调用，在 system 之后插入一条 **_SYNTHETIC_ 用户消息**，
+            告知模型哪些工具结果未知，只可重试只读/幂等操作或询问用户。
         """
         path = self._path_to_head()
 
@@ -271,6 +315,22 @@ class Session:
         payload: list[dict] = []
         if self.system_prompt:
             payload.append({"role": "system", "content": self.system_prompt})
+
+        # 中断恢复：未闭合工具调用的合成提示
+        unresolved = self._find_unresolved_tool_calls()
+        if unresolved:
+            lines = ["[SYSTEM NOTE] 检测到以下工具调用没有对应的结果记录（可能在中断时丢失）："]
+            for u in unresolved:
+                lines.append(
+                    f"  - tool_call_id={u['tool_call_id']!r}, tool={u['tool_name']!r}, "
+                    f"status={u['status']!r}"
+                )
+            lines.append(
+                "请不要假设这些工具已成功。若它们是只读/幂等操作，你可以安全重试；"
+                "否则请验证副作用或向用户确认后再继续。"
+            )
+            payload.append({"role": "user", "content": "\n".join(lines)})
+
         # 压缩摘要作为一条 user 消息，紧跟在 system 之后、保留消息之前
         if latest_cmp and latest_cmp.summary:
             payload.append({"role": "user", "content": latest_cmp.summary})
@@ -289,9 +349,7 @@ class Session:
         """粗略 token 估算：用于元数据与压缩阈值判断（后续可用 tokenizer 替换）。"""
         if self._token_estimate:
             return self._token_estimate(entry)
-        text = ""
-        if entry.content:
-            text += entry.content
+        text = content_to_text(entry.content)
         if entry.tool_calls:
             text += str(entry.tool_calls)
         if entry.summary:
