@@ -2,10 +2,10 @@ import json
 
 from ai import ProviderError, TextDelta, ToolCall
 
-from .context_manager import ToolResultPruner
 from .events import AgentEvent
 from .states import AgentState
 from .tool_executor import ToolExecutor
+from .truncate import ToolOutputTruncator
 
 
 class StepResult:
@@ -23,9 +23,9 @@ class AgentLoop:
     上下文管理（system prompt、历史累积、消息改写）由 Agent 负责。
     模型访问完全经由 ai 层的 LLMProvider 契约，本层不接触任何具体 API SDK。
 
-    工具输出管理（阶段 C）：大工具结果在回填给模型前，经 ToolResultPruner 做「叠加头尾」截断，
-    只保留 head + marker + tail 进上下文，且 tool_call_id 配对不变。
-    ToolResultPruner 可注入；缺省用默认阈值（8192 / 4096 / 1024）。
+    工具输出管理（阶段 C / Phase 2）：大工具结果在回填给模型前，经 ToolOutputTruncator 做
+    截断（truncate_* 体系），只保留 preview 进上下文，且 tool_call_id 配对不变；
+    可选把原文全文写盘（ToolResultStore），模型见 preview + 路径。
 
     run() 是生成器薄壳：反复调 step() 直到某轮 finished；单轮逻辑在 step()。
     两者都逐个 yield AgentEvent，消费者（CLI / Web）用 for 迭代。
@@ -40,7 +40,8 @@ class AgentLoop:
         max_iterations: int = 10,
         permission_policy: str = "ask",
         confirm=None,
-        tool_pruner: ToolResultPruner | None = None,
+        truncator: ToolOutputTruncator | None = None,
+        session_id: str | None = None,
     ):
         self.provider = provider
         self.model = model
@@ -52,7 +53,8 @@ class AgentLoop:
             confirm=confirm,
         )
         self.tool_map = self.executor.tool_map
-        self.tool_pruner = tool_pruner or ToolResultPruner()
+        self.truncator = truncator or ToolOutputTruncator()
+        self.session_id = session_id
         self.max_iterations = max_iterations
         self.state = AgentState.IDLE
         self._aborted = False
@@ -156,19 +158,26 @@ class AgentLoop:
                 break
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
             result = self.executor.execute(call)
-            # 阶段 C：大工具结果做「叠加头尾」截断（只改 content，tool_call_id 配对不变）
-            pruned_content, was_pruned = self.tool_pruner.prune(result.content)
+            # Phase 2：工具结果做 truncate_* 截断 + 可选全文写盘（只改 content，tool_call_id 配对不变）
+            tr = self.truncator.truncate(
+                result.content,
+                tool_name=call.name,
+                tool_call_id=call.id,
+                session_id=self.session_id,
+            )
             yield AgentEvent("tool_execution_end", {
-                "content": pruned_content,
+                "content": tr.content,
                 "is_error": result.is_error,
                 "denied": result.denied,
-                "pruned": was_pruned,
+                "pruned": tr.truncated,
+                "full_output_path": tr.full_output_path,
+                "full_length": tr.full_length,
             })
 
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.id,
-                "content": pruned_content,
+                "content": tr.content,
             })
 
         # 用户中止：在工具执行后安全退出

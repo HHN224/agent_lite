@@ -11,7 +11,6 @@ from .context_manager import (
     ContextManager,
     ContextPressure,
     TokenMeter,
-    ToolResultPruner,
 )
 from .events import AgentEvent
 from .states import AgentState
@@ -22,6 +21,16 @@ from .session import (
     SessionRepository,
 )
 from .tool_executor import PermissionPolicy, ToolExecutor
+from .truncate import (
+    TruncationResult,
+    ToolOutputTruncator,
+    ToolResultStore,
+    truncate_head,
+    truncate_tail,
+    truncate_head_tail,
+    truncate_line,
+    truncate_json,
+)
 
 __all__ = [
     "AgentLoop",
@@ -35,7 +44,14 @@ __all__ = [
     "ContextManager",
     "ContextPressure",
     "TokenMeter",
-    "ToolResultPruner",
+    "TruncationResult",
+    "ToolOutputTruncator",
+    "ToolResultStore",
+    "truncate_head",
+    "truncate_tail",
+    "truncate_head_tail",
+    "truncate_line",
+    "truncate_json",
     "AgentEvent",
     "AgentState",
     "Session",

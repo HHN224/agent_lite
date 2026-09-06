@@ -19,6 +19,8 @@ from agent_core import (
     CompactionEngine,
     ContextManager,
     SessionRepository,
+    ToolOutputTruncator,
+    ToolResultStore,
     make_summarizer,
 )
 from coding_agent.sandbox import detect_backend
@@ -49,6 +51,9 @@ def cli_listener(event: AgentEvent):
         safe_print(f">>> 正在使用工具: {event.data['name']} | 参数: {event.data['arguments']}")
     elif event.type == "tool_execution_end":
         suffix = "（已截断）" if event.data.get("pruned") else ""
+        full_path = event.data.get("full_output_path")
+        if full_path:
+            suffix += f" —— 全文: {full_path}"
         safe_print(f">>> 工具返回: {event.data['content'][:200]}{suffix}")
     elif event.type == "error":
         safe_print(f"\n>>> 模型服务出错: {event.data['message']}")
@@ -245,6 +250,12 @@ def main():
     session, is_new = pick_initial_session(repo, args)
     if is_new:
         repo.save(session)  # 新建的立即落盘
+
+    # Phase 2：工具输出管理 —— 按 session 粒度写盘，模型见 preview + 路径
+    loop.session_id = session.session_id
+    loop.truncator = ToolOutputTruncator(
+        store=ToolResultStore(SESSIONS_DIR / session.session_id),
+    )
 
     # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
     context_manager = ContextManager(threshold_ratio=args.compact_threshold)
