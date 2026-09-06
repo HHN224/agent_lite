@@ -9,6 +9,7 @@ from .tools import (
     LsTool,
     FindTool,
 )
+from .modes import MODES, get_mode, mode_names
 
 __all__ = [
     "build_tools",
@@ -20,4 +21,7 @@ __all__ = [
     "GrepTool",
     "LsTool",
     "FindTool",
+    "MODES",
+    "get_mode",
+    "mode_names",
 ]

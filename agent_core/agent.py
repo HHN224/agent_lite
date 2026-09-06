@@ -44,6 +44,9 @@ class Agent:
         self.context_manager = context_manager
         self.context_window = context_window
         self.compaction_engine = compaction_engine
+        # 运行中干预（steering / follow-up）队列
+        self.steer_queue: list[dict] = []
+        self.follow_up_queue: list[dict] = []
 
     @property
     def state(self) -> AgentState:
@@ -57,6 +60,39 @@ class Agent:
     def abort(self):
         """请求中止当前运行（委托给 loop）。"""
         self.loop.abort()
+
+    # ------------------------------------------------------------------ #
+    # 运行中干预：steer（插队） / follow_up（接力）
+    # ------------------------------------------------------------------ #
+    def steer(self, message: str):
+        """运行中向 Agent 插一条指令，模型会在下一检查点转向处理它。
+
+        message 可以是纯字符串；内部包装成一条 user 消息。
+        """
+        self.steer_queue.append({"role": "user", "content": message})
+
+    def follow_up(self, message: str):
+        """当前 prompt 结束后，自动接力处理这条指令。"""
+        self.follow_up_queue.append({"role": "user", "content": message})
+
+    def has_queued_messages(self) -> bool:
+        return bool(self.steer_queue or self.follow_up_queue)
+
+    def clear_queues(self):
+        self.steer_queue = []
+        self.follow_up_queue = []
+
+    def _dequeue_steer(self) -> list[dict]:
+        """取出所有待处理的 steer 消息（一次性清空）。"""
+        msgs = list(self.steer_queue)
+        self.steer_queue = []
+        return msgs
+
+    def _dequeue_follow_up(self) -> list[dict]:
+        """取出所有待处理的 follow-up 消息（一次性清空）。"""
+        msgs = list(self.follow_up_queue)
+        self.follow_up_queue = []
+        return msgs
 
     def _context_check_event(self):
         """在 build payload 前量出上下文占用并发射观测事件（阶段 A 只观测，不压缩）。
@@ -139,6 +175,9 @@ class Agent:
         payload.append({"role": "user", "content": user_input})
         prior = len(payload)  # payload 已含本轮的 user 消息，位于尾部
 
+        # 让 loop 在轮间查询 agent 的 steer 队列（运行中插话）
+        self.loop.get_steering_messages = self._dequeue_steer
+
         yield AgentEvent("agent_start")
         try:
             final_text = yield from self.loop.run(payload)
@@ -160,6 +199,12 @@ class Agent:
             session.record_turn(payload[prior - 1:])
             self._save()
         yield AgentEvent("agent_end", {"text": final_text})
+
+        # 处理 follow-up 队列：跑完自动接力执行后置指令
+        while self.follow_up_queue:
+            fmsgs = self._dequeue_follow_up()
+            for fmsg in fmsgs:
+                yield from self.prompt(fmsg["content"])
 
     def clear_history(self):
         """清空对话历史，仅保留 system prompt，并同步存档。"""

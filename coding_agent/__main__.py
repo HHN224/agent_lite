@@ -23,11 +23,12 @@ from agent_core import (
     ToolResultStore,
     make_summarizer,
 )
+from coding_agent.modes import get_mode, mode_names
 from coding_agent.sandbox import detect_backend
 from coding_agent.tools import build_tools
 
 
-SYSTEM_PROMPT = "You are a helpful AI agent with file and shell tools. Use them when needed, then answer concisely in the user's language."
+SYSTEM_PROMPT = get_mode("default")
 
 
 def safe_print(s: str, **kwargs):
@@ -145,6 +146,11 @@ def parse_args(argv=None):
         help="模型名（默认 deepseek-v4-flash-vision-exp，支持图片输入）",
     )
     parser.add_argument(
+        "--mode",
+        default="default",
+        help="任务模式：default / plan / code / review（默认 default）",
+    )
+    parser.add_argument(
         "--base-url",
         default="https://api.deepseek.com",
         help="OpenAI 兼容 API 的 base_url（默认 DeepSeek）",
@@ -233,7 +239,7 @@ def pick_initial_session(repo: SessionRepository, args):
         if metas:
             return repo.load(metas[0].session_id), False
 
-    return repo.create(name=args.name, system_prompt=SYSTEM_PROMPT), True
+    return repo.create(name=args.name, system_prompt=get_mode(args.mode)), True
 
 
 def main():
@@ -312,7 +318,11 @@ def main():
     print(f">>> 权限策略: {args.permission_policy}")
     print(f">>> bash 沙箱: {runner.mode} —— {runner.describe()}")
     print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}，保留 {args.compact_retain:.0%}）")
+    print(f">>> 模式: {args.mode}（/mode 切换，可选: {', '.join(mode_names())}）")
     print(f">>> 输入 /sessions 查看 / 重命名 / 删除会话")
+
+    # 当前任务模式（/mode 会更新）；新建会话用 get_mode(current_mode) 作为 system prompt
+    current_mode = args.mode
 
     while True:
         try:
@@ -327,10 +337,25 @@ def main():
             continue
 
         if user_input.strip() == "/new":
-            session = repo.create(system_prompt=SYSTEM_PROMPT)
+            session = repo.create(system_prompt=get_mode(current_mode))
             repo.save(session)
             agent.session = session
-            print(f">>> 已新建会话: {session.session_id}")
+            print(f">>> 已新建会话: {session.session_id}（mode: {current_mode}）")
+            continue
+
+        if user_input.strip().startswith("/mode"):
+            parts = user_input.strip().split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                print(f">>> 用法: /mode <{'/'.join(mode_names())}>（当前: {current_mode}）")
+                continue
+            new_mode = parts[1].strip()
+            if new_mode not in mode_names():
+                print(f">>> 未知 mode: {new_mode}，可选: {', '.join(mode_names())}")
+                continue
+            current_mode = new_mode
+            agent.session.system_prompt = get_mode(current_mode)
+            agent._save()
+            print(f">>> 已切换到 mode: {current_mode}")
             continue
 
         if user_input.strip().startswith("/sessions"):

@@ -47,6 +47,7 @@ class AgentLoop:
         confirm=None,
         truncator: ToolOutputTruncator | None = None,
         session_id: str | None = None,
+        get_steering_messages=None,
     ):
         self.provider = provider
         self.model = model
@@ -60,6 +61,8 @@ class AgentLoop:
         self.tool_map = self.executor.tool_map
         self.truncator = truncator or ToolOutputTruncator()
         self.session_id = session_id
+        # 可选：运行中注入的 steer 消息回调（返回 list[dict]，None 表示不支持 steering）
+        self.get_steering_messages = get_steering_messages
         self.max_iterations = max_iterations
         self.state = AgentState.IDLE
         self._aborted = False
@@ -79,12 +82,30 @@ class AgentLoop:
             if self._aborted:
                 self.state = AgentState.FINISHED
                 return "\n(已中止)"
+            # 运行中注入 steer 消息（在每轮之前，作为新的 user 指令追加，让模型转向）
+            steering = self._poll_steering()
+            if steering:
+                messages.extend(steering)
+                for msg in steering:
+                    yield AgentEvent("steer", {"content": msg.get("content")})
             result = yield from self.step(messages)
             if result.finished:
                 return result.text
 
         self.state = AgentState.FINISHED
         return "\n(已达到最大工具调用轮数，停止循环)"
+
+    def _poll_steering(self) -> list[dict]:
+        """在轮间查询是否有 steer 消息。返回消息 dict 列表；无则空列表。"""
+        if self.get_steering_messages is None:
+            return []
+        try:
+            result = self.get_steering_messages()
+            if result is None:
+                return []
+            return result if isinstance(result, list) else [result]
+        except Exception:
+            return []
 
     def step(self, messages: list):
         """单步生成器：跑一轮（调模型 → 可能执行工具），yield AgentEvent，return StepResult。
