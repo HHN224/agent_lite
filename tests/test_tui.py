@@ -30,8 +30,16 @@ def test_tui_sends_message_and_resets_busy():
             await asyncio.sleep(0.3)
             assert app._busy is False
             assert agent.session.message_count >= 2
-            hist = app.query_one("#history")
-            text = "".join("".join(seg.text for seg in line) for line in hist.lines)
-            assert "问题一" in text
-            assert "回复1" in text
+            from textual.widgets import Markdown, Static
+            from rich.console import Console
+            scroll = app.query_one("#scroll")
+            parts = []
+            for w in scroll.children:
+                if isinstance(w, Markdown):
+                    parts.append(str(getattr(w, "_markdown", "")))
+                elif isinstance(w, Static):
+                    parts.append(str(w.render()))
+            joined = "".join(parts)
+            assert "问题一" in joined
+            assert "回复1" in joined
     asyncio.run(run())
