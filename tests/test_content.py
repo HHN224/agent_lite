@@ -67,5 +67,22 @@ def test_content_length_counts_image_equivalent():
 
 def test_content_to_llm_passthrough():
     assert content_to_llm("str") == "str"
-    blocks = [text_block("x")]
-    assert content_to_llm(blocks) == blocks
+    # 单个纯 text 块会被简化为字符串（更省、更广泛支持）
+    assert content_to_llm([text_block("x")]) == "x"
+
+
+def test_content_to_llm_filters_thinking():
+    # thinking 块会被过滤掉，只剩 text（若只剩一个 text 则简化为字符串）
+    blocks = [{"type": "thinking", "text": "think"}, text_block("ans")]
+    assert content_to_llm(blocks) == "ans"
+
+
+def test_content_to_llm_single_text_returns_string():
+    assert content_to_llm([text_block("only")]) == "only"
+
+
+def test_content_to_llm_keeps_image():
+    blocks = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}}, text_block("看图")]
+    out = content_to_llm(blocks)
+    assert isinstance(out, list)
+    assert out[0]["type"] == "image_url"

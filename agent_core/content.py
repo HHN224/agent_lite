@@ -70,8 +70,24 @@ def is_content_blocks(content: Any) -> bool:
 
 
 def content_to_llm(content: Any) -> Any:
-    """把 content 转成发给 OpenAI 的格式（str 或结构块列表都原样）。"""
-    return content
+    """把 content 转成发给 OpenAI/DeepSeek 的合法格式。
+
+    - 纯字符串：原样返回。
+    - 结构块列表：过滤掉 thinking 块（下游不认 thinking 类型变体），
+      只保留 text / image_url / tool_result 等可发送的块。
+    - 过滤后若只剩一个纯 text 块，简化为字符串（更省、且被广泛支持）。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    sendable = [
+        b for b in content
+        if isinstance(b, dict) and b.get("type") != BLOCK_THINKING
+    ]
+    if len(sendable) == 1 and sendable[0].get("type") == BLOCK_TEXT:
+        return sendable[0].get("text") or ""
+    return sendable
 
 
 def content_to_text(content: Any) -> str:

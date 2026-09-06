@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .content import content_to_text
+from .content import content_to_llm, content_to_text
 
 VERSION = 2
 
@@ -53,11 +53,12 @@ class SessionEntry:
     def to_llm(self) -> dict:
         """转成发给模型的消息 dict（仅对 message 有效）。
 
-        content 为 str 或结构块列表（见 agent_core.content），两者都直接透传给 OpenAI。
+        content 为 str 或结构块列表（见 agent_core.content）。经 content_to_llm
+        过滤掉 thinking 块（下游不认 thinking 变体），只保留可发送的块。
         """
         msg: dict = {"role": self.role}
         if self.content is not None:
-            msg["content"] = self.content
+            msg["content"] = content_to_llm(self.content)
         if self.tool_call_id is not None:
             msg["tool_call_id"] = self.tool_call_id
         if self.tool_calls:
