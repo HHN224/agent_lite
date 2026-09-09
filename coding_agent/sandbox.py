@@ -132,9 +132,10 @@ class HostRunner(CommandRunner):
 
 
 class WslRunner(CommandRunner):
-    """免 daemon 中间档：命令丢进 WSL2 的 Linux 发行版执行。
+    """免 daemon 中间档：通过 WSL2 + Bubblewrap 隔离命令。
 
-    wsl -e 会自动拉起 VM，无需用户先启动服务；工作目录映射为 /mnt/<盘符>/...。
+    WSL 负责提供 Linux 内核，Bubblewrap 只暴露可写的 /workspace，隐藏 Windows
+    挂载目录和 Linux 用户目录，并为每条命令创建无网络的临时运行环境。
     注意：wsl 包装进程可能把容器输出转成宿主编码（潜在的地雷），这里统一按 UTF-8 容错解码。
     """
 
@@ -143,10 +144,28 @@ class WslRunner(CommandRunner):
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
         t = self.timeout if timeout is None else timeout
         mapped = windows_to_wsl(self.workspace)
-        # 先 cd 到映射的工作目录再执行；路径含空格时用双引号包裹
-        full = f'cd "{mapped}" && {command}'
+        args = [
+            "wsl", "-e", "bwrap",
+            "--unshare-all",
+            "--new-session",
+            "--die-with-parent",
+            "--ro-bind", "/", "/",
+            "--bind", mapped, "/workspace",
+            "--tmpfs", "/mnt",
+            "--tmpfs", "/home",
+            "--tmpfs", "/root",
+            "--tmpfs", "/run",
+            "--tmpfs", "/tmp",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--clearenv",
+            "--setenv", "HOME", "/tmp",
+            "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--chdir", "/workspace",
+            "sh", "-lc", command,
+        ]
         proc = subprocess.run(
-            ["wsl", "-e", "sh", "-lc", full],
+            args,
             capture_output=True,
             timeout=t,
         )
@@ -154,8 +173,8 @@ class WslRunner(CommandRunner):
 
     def describe(self) -> str:
         return (
-            f"WSL2（免 Docker daemon）：命令在 Linux 发行版内执行；"
-            f"工作目录映射为 {windows_to_wsl(self.workspace)}"
+            "WSL2 + Bubblewrap（免 Docker daemon）：无网络、系统只读，"
+            "仅工作目录映射为可写的 /workspace"
         )
 
 
@@ -216,10 +235,10 @@ def _docker_available(timeout: int = 5) -> bool:
 
 
 def _wsl_available(timeout: int = 10) -> bool:
-    """WSL2 是否安装且有发行版（`wsl -l -q` 列出已安装的发行版）。"""
+    """默认 WSL 发行版是否可用且已经安装 Bubblewrap。"""
     try:
         proc = subprocess.run(
-            ["wsl", "-l", "-q"],
+            ["wsl", "-e", "sh", "-lc", "command -v bwrap >/dev/null 2>&1"],
             capture_output=True,
             timeout=timeout,
         )
@@ -238,7 +257,7 @@ def detect_backend(
     模式：
       auto   自动探测，优先最强可用档：docker → wsl → host（host 无条件兜底）。
       host   强制宿主直跑（零配置兜底）。
-      wsl    强制 WSL2；不可用则抛 SandboxUnavailableError（fail-closed，不静默降级）。
+      wsl    强制 WSL2 + Bubblewrap；不可用则抛 SandboxUnavailableError（fail-closed，不静默降级）。
       docker 强制 Docker；不可用则抛 SandboxUnavailableError。
 
     探测行为：docker/wsl 各执行一次轻量探测命令；host 永远可用。
@@ -250,7 +269,7 @@ def detect_backend(
     if sandbox == "wsl":
         if not _wsl_available():
             raise SandboxUnavailableError(
-                "--sandbox=wsl 已指定，但检测不到可用的 WSL2 后端（请安装 WSL 并初始化一个发行版）"
+                "--sandbox=wsl 已指定，但默认 WSL 发行版不可用或未安装 bubblewrap"
             )
         return WslRunner(workspace)
     if sandbox == "docker":

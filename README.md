@@ -144,7 +144,7 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 | 后端 | 实际行为 |
 | --- | --- |
 | `docker` | 一次性容器，禁用网络、只读根文件系统、512 MB 内存和 100 进程限额；工作目录可写挂载到 `/workspace`，`/tmp` 可写 |
-| `wsl` | 在 WSL 发行版执行 `sh -lc`；可访问发行版及其挂载文件系统，不是工作目录隔离 |
+| `wsl` | 在默认 WSL 发行版中通过 Bubblewrap 执行；无网络、系统只读，仅工作目录可写 |
 | `host` | 在宿主机通过 `shell=True` 执行；仅设置工作目录，没有文件系统或网络隔离，也不保证使用 Bash |
 
 使用 Docker 前启动 Docker 服务并准备镜像：
@@ -154,7 +154,37 @@ docker pull python:3.12-slim
 agent-lite --ui cli --sandbox docker
 ```
 
-`read` / `write` / `edit` 使用 `safe_path` 限制路径，但当前搜索、目录工具与 TUI `/image` 并未统一采用这一检查。因此 `--workspace` 不能视作整个程序的安全沙箱，Docker 的隔离也只覆盖 `bash` 命令执行。
+使用 WSL 后端前，准备一个普通 Linux 发行版并安装 Bubblewrap（不要使用 Docker Desktop 的内部发行版）：
+
+```powershell
+wsl --install -d Ubuntu-24.04
+wsl --set-default Ubuntu-24.04
+```
+
+```bash
+sudo apt update
+sudo apt install bubblewrap
+sudo mkdir -p /workspace
+```
+
+建议在该发行版的 `/etc/wsl.conf` 中关闭 Windows 程序互操作；保留自动挂载，以便 Bubblewrap 只把当前工作目录映射到 `/workspace`：
+
+```ini
+[automount]
+enabled=true
+
+[interop]
+enabled=false
+appendWindowsPath=false
+```
+
+修改后在 PowerShell 运行 `wsl --shutdown`，再使用：
+
+```bash
+agent-lite --ui cli --sandbox wsl
+```
+
+`read` / `write` / `edit` 使用 `safe_path` 限制路径，但当前搜索、目录工具与 TUI `/image` 并未统一采用这一检查。因此 `--workspace` 不能视作整个程序的安全沙箱，Docker/WSL 的隔离也只覆盖 `bash` 命令执行。WSL 后端不提供 Docker 后端的内存和进程数限制。
 
 ## 上下文如何管理
 
