@@ -48,12 +48,12 @@ def test_host_runner_runs_in_workspace_cwd(tmp_path, monkeypatch):
 
 # ---------- WslRunner ----------
 
-def test_wsl_runner_composes_cd_with_quoted_path(tmp_path, monkeypatch):
+def test_wsl_runner_uses_bubblewrap_for_workspace(tmp_path, monkeypatch):
     captured = {}
-    import subprocess as sp
 
     def fake_run(args, **kwargs):
         captured["args"] = args
+        captured["kwargs"] = kwargs
         class P:
             returncode = 0
             stdout = b"ok"
@@ -63,16 +63,36 @@ def test_wsl_runner_composes_cd_with_quoted_path(tmp_path, monkeypatch):
     monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
     runner = WslRunner(tmp_path)
     result = runner.run("pwd")
-    # wsl -e sh -lc 'cd "<mapped>" && pwd'
-    assert captured["args"][0] == "wsl"
-    assert captured["args"][1] == "-e"
-    assert captured["args"][2] == "sh"
-    assert captured["args"][3] == "-lc"
-    full = captured["args"][4]
-    assert full.startswith('cd "')
-    assert windows_to_wsl(tmp_path) in full
-    assert full.endswith('" && pwd')
+
+    args = captured["args"]
+    assert args[:3] == ["wsl", "-e", "bwrap"]
+    assert "--unshare-all" in args
+    assert "--clearenv" in args
+    bind = args.index("--bind")
+    assert args[bind + 1:bind + 3] == [windows_to_wsl(tmp_path), "/workspace"]
+    assert ("--tmpfs", "/mnt") in zip(args, args[1:])
+    assert args[args.index("--chdir") + 1] == "/workspace"
+    assert args[-3:] == ["sh", "-lc", "pwd"]
+    assert "shell" not in captured["kwargs"]
     assert result.stdout == "ok"
+
+
+def test_wsl_available_requires_bubblewrap(monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        class P:
+            returncode = 0
+        return P()
+
+    monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
+    from coding_agent.sandbox import _wsl_available
+
+    assert _wsl_available() is True
+    assert captured["args"] == [
+        "wsl", "-e", "sh", "-lc", "command -v bwrap >/dev/null 2>&1",
+    ]
 
 
 # ---------- DockerRunner ----------
