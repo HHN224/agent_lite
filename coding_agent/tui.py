@@ -11,15 +11,40 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from rich.text import Text
+from textual import constants
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Input, Label, Markdown, Static
 
 from agent_core import Agent, AgentEvent
 from agent_core.content import image_block
+
+
+if os.name == "nt":
+    from textual.drivers.windows_driver import WindowsDriver
+
+    class _WindowsInlineDriver(WindowsDriver):
+        """Textual 的 Windows driver，但保留当前终端的 scrollback。"""
+
+        @property
+        def is_inline(self) -> bool:
+            return True
+
+        def write(self, data: str) -> None:
+            # WindowsDriver 会无条件进入备用屏幕。过滤这两个序列后仍复用它的
+            # 键盘、resize 和 Unicode 输入处理，界面则由 inline compositor 渲染。
+            data = data.replace("\x1b[?1049h", "").replace("\x1b[?1049l", "")
+            if data:
+                super().write(data)
+
+        def start_application_mode(self) -> None:
+            super().start_application_mode()
+            self.write("\n" * self._app.INLINE_PADDING)
+            self.flush()
 
 
 def _content_text(content) -> str:
@@ -106,7 +131,7 @@ class AgentApp(App):
     }
 
     #scroll {
-        height: 1fr;
+        height: auto;
         padding: 0 2;
         background: #0d0d0d;
         scrollbar-size: 0 0;
@@ -254,6 +279,25 @@ class AgentApp(App):
         self._tool_title_widget = None
         self._tool_content_widget = None
         self._tool_title = ""
+
+    def _build_driver(
+        self,
+        headless: bool,
+        inline: bool,
+        mouse: bool,
+        size: tuple[int, int] | None,
+    ):
+        """补上 Textual 在 Windows 上缺失的 inline driver 选择。"""
+        if os.name == "nt" and inline and not headless:
+            driver = _WindowsInlineDriver(
+                self,
+                debug=constants.DEBUG,
+                mouse=mouse,
+                size=size,
+            )
+            self._driver = driver
+            return driver
+        return super()._build_driver(headless, inline, mouse, size)
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="scroll")
@@ -561,5 +605,5 @@ class AgentApp(App):
 
 
 def run_tui(agent: Agent) -> None:
-    """启动 textual TUI。"""
-    AgentApp(agent).run()
+    """在当前终端缓冲区内启动 TUI，并在退出后保留 transcript。"""
+    AgentApp(agent).run(inline=True, inline_no_clear=True)
