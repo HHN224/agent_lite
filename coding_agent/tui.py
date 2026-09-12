@@ -1,8 +1,8 @@
-"""Textual TUI：Pico 风格的会话流、工具折叠与底部 composer。
+"""字符驱动的终端 TUI：Claude Code / Pico 风格 transcript。
 
 消费 Agent.prompt() 的事件流（agent_start / turn_start / message_update /
-thinking_update / tool_execution_* / agent_end），把每个消息渲染成独立卡片。
-放弃逐字流式，采用"整块/半块刷新"——更贴近 Claude Code / pi。
+thinking_update / tool_execution_* / agent_end），把事件渲染成连续的终端文本流。
+Textual 只负责布局、输入和事件循环；可见界面由字符而非应用式控件构成。
 
 运行方式：agent-lite --ui tui（默认）。
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Collapsible, Input, Label, Markdown, Static
+from textual.widgets import Input, Label, Markdown, Static
 
 from agent_core import Agent, AgentEvent
 from agent_core.content import image_block
@@ -63,25 +63,37 @@ def _fmt_count(value: int) -> str:
 
 
 class SessionIntro(Vertical):
-    """会话开场信息；结构对应 Pico 的轻量 session panel。"""
+    """由普通字符组成的会话开场信息。"""
 
-    def __init__(self, *, model: str, cwd: str, tool_count: int) -> None:
+    def __init__(self, *, model: str, cwd: str, session_id: str, tool_count: int) -> None:
         super().__init__(classes="session-intro")
         self.model = model
         self.cwd = cwd
+        self.session_id = session_id
         self.tool_count = tool_count
 
     def compose(self) -> ComposeResult:
-        with Horizontal(classes="intro-header"):
-            yield Label("[b]agent-lite[/b] [#6c6c6c]· coding agent[/]", classes="intro-name")
-            yield Label(self.model, classes="intro-model", markup=False)
-        yield Label(self.cwd, classes="intro-path", markup=False)
-        yield Label(f"▸ Tools ({self.tool_count})", classes="intro-tools", markup=False)
-        yield Label("/help  commands", classes="intro-help", markup=False)
+        brand = Text()
+        brand.append("◆ ", style="bold #f0c75e")
+        brand.append("agent-lite", style="bold #e6e6e6")
+        brand.append("  coding agent", style="#666666")
+
+        meta = Text("  ")
+        meta.append(self.model, style="#b8b8b8")
+        meta.append(f" · {self.tool_count} tools · {self.session_id}", style="#666666")
+
+        help_line = Text("  ")
+        help_line.append("/help", style="#7aa2f7")
+        help_line.append(" commands", style="#666666")
+
+        yield Static(brand, classes="intro-brand")
+        yield Static(Text(f"  {self.cwd}", style="#666666"), classes="intro-path")
+        yield Static(meta, classes="intro-meta")
+        yield Static(help_line, classes="intro-help")
 
 
 class AgentApp(App):
-    """Pico 风格：低噪音消息流 + 圆角 composer + 紧凑状态信息。"""
+    """Pico 风格：原生终端 transcript + 字符 composer。"""
 
     TITLE = "agent-lite"
     SUB_TITLE = "coding agent"
@@ -89,139 +101,122 @@ class AgentApp(App):
     CSS = """
     Screen {
         layout: vertical;
-        background: #141414;
-        color: #e1e1e1;
-    }
-
-    #topbar {
-        height: 1;
-        padding: 0 2;
-        background: #141414;
-        color: #6c6c6c;
-    }
-
-    #workspace {
-        width: 1fr;
-        color: #6c6c6c;
-        text-overflow: ellipsis;
-    }
-
-    #top-meta {
-        width: auto;
-        color: #c8c8c8;
-        text-align: right;
+        background: #0d0d0d;
+        color: #e6e6e6;
     }
 
     #scroll {
         height: 1fr;
         padding: 0 2;
-        background: #141414;
-        scrollbar-background: #141414;
-        scrollbar-color: #505058;
-        scrollbar-color-hover: #7aa2f7;
-        scrollbar-color-active: #c8c8c8;
+        background: #0d0d0d;
+        scrollbar-size: 0 0;
     }
 
     .session-intro {
         height: auto;
-        margin: 1 0;
+        margin: 1 0 2 0;
+        background: transparent;
     }
 
-    .intro-header {
+    .intro-brand, .intro-path, .intro-meta, .intro-help {
+        width: 1fr;
         height: 1;
-        padding: 0 1;
-        background: #242424;
+        background: transparent;
+        text-overflow: ellipsis;
     }
 
-    .intro-name { width: 1fr; }
-    .intro-model { width: auto; color: #6c6c6c; text-align: right; }
-    .intro-path { height: 1; padding: 0 1; color: #6c6c6c; text-overflow: ellipsis; }
-    .intro-tools { height: 1; padding: 0 1; color: #7aa2f7; text-style: bold; }
-    .intro-help { height: 1; padding: 0 1; color: #6c6c6c; }
-
-    .user-card {
+    .user-line {
         width: 1fr;
         height: auto;
         margin: 1 0;
-        padding: 0 1;
-        background: #242424;
-        color: #e1e1e1;
+        padding: 0;
+        background: transparent;
+        color: #e6e6e6;
     }
 
     .assistant-card {
         width: 1fr;
         height: auto;
-        margin: 0 0 1 3;
-        padding: 0 1;
-        border-left: solid #323237;
-        background: #141414;
-        color: #e1e1e1;
+        margin: 0 0 1 2;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: #e6e6e6;
     }
 
     .assistant-card.thinking {
         color: #bb9af7;
-        border-left: solid #bb9af7;
     }
 
     .tool-card {
         width: 1fr;
         height: auto;
-        margin: 0 0 1 3;
+        margin: 0 0 1 4;
         padding: 0;
         border: none;
-        background: #141414;
+        background: transparent;
     }
 
-    .tool-card:focus-within { background-tint: transparent; }
-    .tool-card CollapsibleTitle {
-        padding: 0;
+    .tool-title, .tool-result {
+        width: 1fr;
+        height: auto;
+        background: transparent;
         color: #6c6c6c;
-        background: #141414;
     }
-    .tool-card CollapsibleTitle:hover { color: #7aa2f7; background: #141414; }
-    .tool-card CollapsibleTitle:focus { color: #7aa2f7; background: #242424; }
-    .tool-card Contents { padding: 0 0 0 2; color: #6c6c6c; }
 
     .notice {
         width: 1fr;
         height: auto;
-        margin: 0 0 1 3;
+        margin: 0 0 1 2;
         color: #6c6c6c;
+        background: transparent;
     }
     .notice.info { color: #7aa2f7; }
     .notice.warn { color: #e0af68; }
     .notice.error { color: #f7768e; }
 
-    #status-row {
-        height: 1;
-        margin: 0 2;
-        background: #141414;
-        color: #6c6c6c;
+    .command-panel {
+        width: 1fr;
+        height: auto;
+        margin: 0 0 1 2;
+        padding: 0;
+        color: #b8b8b8;
+        background: transparent;
     }
 
-    #status { width: 1fr; color: #6c6c6c; }
-    #status-cwd {
-        width: auto;
-        max-width: 40%;
-        color: #c8c8c8;
-        text-align: right;
-        text-overflow: ellipsis;
-    }
-
-    #composer {
+    #composer-shell {
         height: 3;
         margin: 0 2;
-        padding: 0 1;
-        border: round #505058;
-        background: #141414;
+        background: transparent;
     }
 
-    #composer:focus-within { border: round #7aa2f7; }
+    #composer-top, #composer-bottom {
+        height: 1;
+        width: 1fr;
+        color: #505058;
+        background: transparent;
+        text-overflow: clip;
+    }
+
+    #composer-row {
+        height: 1;
+        width: 1fr;
+        background: transparent;
+    }
+
+    #composer-left, #composer-right {
+        width: 2;
+        height: 1;
+        color: #505058;
+        background: transparent;
+    }
+
     #prompt {
         width: 2;
         height: 1;
-        color: #c8c8c8;
+        color: #d8d8d8;
         text-style: bold;
+        background: transparent;
     }
 
     #input {
@@ -229,21 +224,22 @@ class AgentApp(App):
         height: 1;
         padding: 0;
         border: none;
-        background: #141414;
-        color: #e1e1e1;
+        background: transparent;
+        color: #e6e6e6;
     }
     #input:focus { border: none; background-tint: transparent; }
     #input > .input--placeholder { color: #6c6c6c; }
-    #input > .input--cursor { background: #c8c8c8; color: #141414; }
-    #input > .input--selection { background: #363636; color: #e1e1e1; }
+    #input > .input--cursor { background: #d8d8d8; color: #0d0d0d; }
+    #input > .input--selection { background: #363636; color: #e6e6e6; }
 
-    #hints {
+    #status-row {
         height: 1;
         margin: 0 2;
+        background: transparent;
         color: #6c6c6c;
     }
-    #hint-left { width: 1fr; }
-    #hint-right { width: auto; color: #6c6c6c; text-align: right; }
+    #status { width: 1fr; color: #6c6c6c; }
+    #hint { width: auto; color: #6c6c6c; text-align: right; }
     """
 
     def __init__(self, agent: Agent, **kwargs):
@@ -255,32 +251,44 @@ class AgentApp(App):
         self._assistant_buf = []
         self._thinking_buf = []
         self._tool_widget = None
+        self._tool_title_widget = None
         self._tool_content_widget = None
         self._tool_title = ""
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="topbar"):
-            yield Label(str(Path.cwd()), id="workspace", markup=False)
-            yield Label("", id="top-meta", markup=False)
         yield VerticalScroll(id="scroll")
+        with Vertical(id="composer-shell"):
+            yield Static("", id="composer-top", markup=False)
+            with Horizontal(id="composer-row"):
+                yield Label("│ ", id="composer-left", markup=False)
+                yield Label("❯", id="prompt", markup=False)
+                yield Input(id="input", placeholder="Ask anything…", compact=True)
+                yield Label(" │", id="composer-right", markup=False)
+            yield Static("", id="composer-bottom", markup=False)
         with Horizontal(id="status-row"):
             yield Label(id="status")
-            yield Label(Path.cwd().name or str(Path.cwd()), id="status-cwd", markup=False)
-        with Horizontal(id="composer"):
-            yield Label("❯", id="prompt", markup=False)
-            yield Input(id="input", placeholder="输入消息或 /help", compact=True)
-        with Horizontal(id="hints"):
-            yield Label("enter 发送  │  /help 命令", id="hint-left", markup=False)
-            yield Label("", id="hint-right", markup=False)
+            yield Label("/help", id="hint", markup=False)
 
     def on_mount(self):
         self.query_one("#input", Input).focus()
         self._update_status()
+        self.call_after_refresh(self._draw_composer_frame)
         self._add_card(SessionIntro(
             model=str(getattr(self.agent.loop, "model", "—")),
             cwd=str(Path.cwd()),
+            session_id=str(getattr(self.agent.session, "session_id", "—")),
             tool_count=len(getattr(self.agent.loop, "tools", ()) or ()),
         ))
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._draw_composer_frame)
+
+    def _draw_composer_frame(self) -> None:
+        """按当前终端宽度绘制真正的字符边框，而不是 Widget 边框。"""
+        shell = self.query_one("#composer-shell", Vertical)
+        width = max(2, shell.size.width)
+        self.query_one("#composer-top", Static).update("╭" + "─" * (width - 2) + "╮")
+        self.query_one("#composer-bottom", Static).update("╰" + "─" * (width - 2) + "╯")
 
     def _add_card(self, widget):
         async def _m():
@@ -307,16 +315,13 @@ class AgentApp(App):
             status.append(f"{_fmt_count(usage)} tok", style="#6c6c6c")
         status.append(f" · {msgs} msg", style="#6c6c6c")
         self.query_one("#status", Label).update(status)
-        self.query_one("#top-meta", Label).update(
-            f"{_fmt_count(usage)} / {_fmt_count(window)}" if window else f"{_fmt_count(usage)} tokens"
-        )
-        self.query_one("#hint-right", Label).update("输入可 steer" if self._busy else "")
+        self.query_one("#hint", Label).update("enter to steer · /help" if self._busy else "/help")
 
     def _add_user(self, text: str):
         body = Text()
-        body.append("❯ ", style="bold #c8c8c8")
-        body.append(text, style="#e1e1e1")
-        self._add_card(Static(body, classes="user-card"))
+        body.append("❯ ", style="bold #d8d8d8")
+        body.append(text, style="#e6e6e6")
+        self._add_card(Static(body, classes="user-line"))
 
     def _add_notice(self, text: str, tone: str = "muted"):
         classes = "notice" if tone == "muted" else f"notice {tone}"
@@ -335,29 +340,27 @@ class AgentApp(App):
         text = "".join(self._assistant_buf)
         if self._thinking_buf and not text:
             self._assistant_widget.add_class("thinking")
-            self._assistant_widget.update("◇ thinking…")
+            self._assistant_widget.update("✦ thinking…")
         else:
             self._assistant_widget.remove_class("thinking")
-            self._assistant_widget.update(text)
+            self._assistant_widget.update(("● " + text) if text else "")
 
     def _end_assistant(self):
-        self._update_assistant()
         self._assistant_widget = None
 
     def _start_tool(self, name: str, arguments):
         preview = _compact_tool_arguments(arguments)
-        title = f"⚡ {name}" + (f"  {preview}" if preview and preview != "{}" else "")
-        content = Static(Text("running…", style="#bb9af7"), markup=False)
+        title = name + (f"  {preview}" if preview and preview != "{}" else "")
+        title_text = Text("├─ ", style="#505058")
+        title_text.append("✦ ", style="#bb9af7")
+        title_text.append(title, style="#b8b8b8")
+        title_widget = Static(title_text, classes="tool-title", markup=False)
+        content_text = Text("╰─ running…", style="#666666")
+        content = Static(content_text, classes="tool-result", markup=False)
         self._tool_title = title
+        self._tool_title_widget = title_widget
         self._tool_content_widget = content
-        self._tool_widget = Collapsible(
-            content,
-            title=title,
-            collapsed=True,
-            collapsed_symbol="▸",
-            expanded_symbol="▾",
-            classes="tool-card",
-        )
+        self._tool_widget = Vertical(title_widget, content, classes="tool-card")
         self._add_card(self._tool_widget)
 
     def _end_tool(self, content_text, pruned, full_path):
@@ -367,10 +370,25 @@ class AgentApp(App):
         if full_path:
             suffix += f" —— 全文: {full_path}"
         body = _content_text(content_text)[:500] + suffix
+        if self._tool_title_widget is not None:
+            title = Text("├─ ", style="#505058")
+            title.append("✓ ", style="#9ece6a")
+            title.append(self._tool_title, style="#b8b8b8")
+            self._tool_title_widget.update(title)
         if self._tool_content_widget is not None:
-            self._tool_content_widget.update(Text(body or "(empty result)", style="#6c6c6c"))
-        self._tool_widget.title = self._tool_title.replace("⚡", "✓", 1)
+            lines = (body or "(empty result)").replace("\r\n", "\n").splitlines()
+            shown = lines[:4]
+            result = Text()
+            for index, line in enumerate(shown):
+                result.append("╰─ " if index == 0 else "   ", style="#505058")
+                result.append(line, style="#666666")
+                if index < len(shown) - 1:
+                    result.append("\n")
+            if len(lines) > len(shown):
+                result.append("\n   …", style="#505058")
+            self._tool_content_widget.update(result)
         self._tool_widget = None
+        self._tool_title_widget = None
         self._tool_content_widget = None
         self._tool_title = ""
 
@@ -391,14 +409,15 @@ class AgentApp(App):
     def _handle_command(self, text: str):
         if text == "/help":
             self._add_card(Static("\n".join([
-                "/help            命令帮助",
-                "/new             新建会话",
-                "/mode <name>     切换模式（default/plan/code/review）",
-                "/sessions        查看会话列表",
-                "/image <path>    喂图",
-                "/clear           清空当前会话历史",
-                "/compact         手动压缩上下文",
-            ]), markup=True))
+                "Commands",
+                "  /help            命令帮助",
+                "  /new             新建会话",
+                "  /mode <name>     切换模式（default/plan/code/review）",
+                "  /sessions        查看会话列表",
+                "  /image <path>    喂图",
+                "  /clear           清空当前会话历史",
+                "  /compact         手动压缩上下文",
+            ]), classes="command-panel", markup=False))
         elif text == "/new":
             self._new_session()
         elif text.startswith("/mode "):
@@ -407,9 +426,9 @@ class AgentApp(App):
             self._list_sessions()
         elif text == "/clear":
             self.agent.clear_history()
-            self._add_card(Static(">>> 已清空对话历史", markup=True))
+            self._add_notice("◆ 已清空对话历史", "info")
         elif text == "/compact":
-            self._add_card(Static(">>> 手动压缩...", markup=True))
+            self._add_notice("✦ 正在压缩上下文…")
             try:
                 for ev in self.agent.compaction_engine.compact_if_needed(
                     self.agent.session, self.agent.context_window
@@ -417,7 +436,7 @@ class AgentApp(App):
                     self._render_event(ev)
                 self.agent._save()
             except Exception as e:
-                self._add_card(Static(f">>> 压缩失败: {e}", markup=True))
+                self._add_notice(f"压缩失败: {e}", "error")
         elif text.startswith("/image "):
             self._send_image(text[len("/image "):].strip())
         else:
