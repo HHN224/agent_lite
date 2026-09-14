@@ -81,7 +81,7 @@ agent-lite --ui cli
 agent-lite --ui cli --new --name "代码阅读" --workspace .
 ```
 
-启动时会显示会话 ID、存档位置、工作目录和实际命令后端。默认模型字符串为 `deepseek-v4-flash-vision-exp`；这是代码配置值，实际可用性以服务端为准，必要时使用 `--model` 指定账户可用的模型。
+启动时会显示会话 ID、存档位置、工作目录和实际命令后端。默认使用 DeepSeek V4.1 Flash，API 模型标识为 `deepseek-flash`，支持图片输入（见 [DeepSeek 官方说明](https://api-docs.deepseek.com/zh-cn/news/news260910/)）。对话和上下文压缩摘要均使用该模型，也可使用 `--model` 指定其他模型。
 
 ## 界面与会话命令
 
@@ -115,7 +115,7 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 | `--new` | 关闭 | 不恢复最近历史，新建会话 |
 | `--name` | 空 | 新建会话的展示名 |
 | `--mode` | `default` | 新建会话使用的任务模式；恢复会话保留已存提示词 |
-| `--model` | `deepseek-v4-flash-vision-exp` | 模型标识 |
+| `--model` | `deepseek-flash` | 模型标识，默认 DeepSeek V4.1 Flash |
 | `--base-url` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
 | `--permission-policy` | `ask` | `ask` 确认 / `deny` 拒绝 / `auto` 放行危险工具 |
 | `--sandbox` | `auto` | `auto` / `docker` / `wsl` / `host` |

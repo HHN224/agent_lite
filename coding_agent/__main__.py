@@ -150,8 +150,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--model",
-        default="deepseek-v4-flash-vision-exp",
-        help="模型名（默认 deepseek-v4-flash-vision-exp，支持图片输入）",
+        default="deepseek-flash",
+        help="模型名（默认 deepseek-flash，即 DeepSeek V4.1 Flash，支持图片输入）",
     )
     parser.add_argument(
         "--mode",
@@ -174,6 +174,13 @@ def parse_args(argv=None):
         choices=["ask", "deny", "auto"],
         default="ask",
         help="危险工具的权限策略：ask 每次确认 / deny 直接拒绝 / auto 自动放行（默认 ask）",
+    )
+    parser.add_argument(
+        "--bypass",
+        action="store_const",
+        const="auto",
+        dest="permission_policy",
+        help="自动通过所有工具权限请求（等同 --permission-policy auto）",
     )
     parser.add_argument(
         "--context-window",
@@ -256,36 +263,29 @@ def pick_initial_session(repo: SessionRepository, args):
     return repo.create(name=args.name, system_prompt=get_mode(args.mode)), True
 
 
-def main():
-    args = parse_args()
-
-    # 优先加载项目根目录 .env（源码直跑场景），再兜底加载当前目录 .env（全局安装后任意目录启动）
-    load_dotenv(ENV_FILE)
-    load_dotenv()
-
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    if not api_key:
-        sys.exit(
-            "错误：未检测到 DEEPSEEK_API_KEY。\n"
-            "请在项目根目录的 .env 文件中写入 DEEPSEEK_API_KEY=sk-xxxx（可参考 .env.example），\n"
-            '或设置环境变量：$env:DEEPSEEK_API_KEY = "sk-xxxx"'
-        )
-
+def build_agent(args, api_key):
     # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态 + 会话存档
     provider = OpenAIProvider(
         api_key=api_key,
         base_url=args.base_url,
     )
 
-    # 探测沙箱后端（auto 会自动选 docker→wsl→host；强制指定不可用则 fail-closed 报错）
-    try:
-        runner = detect_backend(
+    # TUI postpones sandbox probing until the first shell tool call.
+    def make_runner():
+        return detect_backend(
             sandbox=args.sandbox,
             workspace=args.workspace,
             bash_image=args.bash_image,
         )
-    except Exception as e:
-        sys.exit(f"错误：{e}")
+
+    if args.ui == "tui" and _HAS_TUI:
+        from coding_agent.tui import LazyCommandRunner
+        runner = LazyCommandRunner(make_runner, args.workspace, args.sandbox)
+    else:
+        try:
+            runner = make_runner()
+        except Exception as e:
+            raise RuntimeError(f"错误：{e}") from e
 
     tools = build_tools(args.workspace, bash_image=args.bash_image, runner=runner)
 
@@ -326,6 +326,33 @@ def main():
         compaction_engine=compaction_engine,
     )
 
+    return agent
+
+
+def main():
+    args = parse_args()
+
+    # 优先加载项目根目录 .env（源码直跑场景），再兜底加载当前目录 .env（全局安装后任意目录启动）
+    load_dotenv(ENV_FILE)
+    load_dotenv()
+
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        sys.exit(
+            "错误：未检测到 DEEPSEEK_API_KEY。\n"
+            "请在项目根目录的 .env 文件中写入 DEEPSEEK_API_KEY=sk-xxxx（可参考 .env.example），\n"
+            '或设置环境变量：$env:DEEPSEEK_API_KEY = "sk-xxxx"'
+        )
+
+    # Paint the TUI before SDK setup, session I/O and Docker / WSL probing.
+    if args.ui == "tui" and _HAS_TUI:
+        run_tui(agent_factory=lambda: build_agent(args, api_key), workspace=args.workspace)
+        return
+
+    agent = build_agent(args, api_key)
+    session, repo, loop = agent.session, agent.repo, agent.loop
+    runner = next(tool.runner for tool in loop.tools if tool.name == "bash")
+
     print(f">>> 会话: {session.session_id}（{session.name or '<未命名>'}，{session.message_count} 条消息）")
     print(f">>> 存档: {repo._path(session.session_id)}")
     print(f">>> 工作目录: {args.workspace}")
@@ -337,11 +364,6 @@ def main():
 
     # 当前任务模式（/mode 会更新）；新建会话用 get_mode(current_mode) 作为 system prompt
     current_mode = args.mode
-
-    # TUI（默认界面）：textual 交互，支持运行中 steer / 粘图。
-    if args.ui == "tui" and _HAS_TUI:
-        run_tui(agent)
-        return
 
     if args.ui == "tui" and not _HAS_TUI:
         print(">>> textual 未安装，回退到 CLI。请 pip install textual（或 pip install -e .[tui]）")
