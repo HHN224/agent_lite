@@ -31,7 +31,55 @@ from agent_core.tool_executor import PermissionPolicy
 
 
 if os.name == "nt":
+    from ctypes import byref, wintypes
+    from textual._xterm_parser import XTermParser
+    from textual.drivers import win32
+    from textual.drivers._writer_thread import WriterThread
     from textual.drivers.windows_driver import WindowsDriver
+
+    class _WindowsInputMonitor(win32.EventMonitor):
+        """Keep Escape in synthetic VT replies emitted by Windows Terminal.
+
+        Textual's monitor drops control-modified keys with virtual-key code 0,
+        including the ESC of a cursor-position reply. The remaining [row;colR
+        is then delivered as typed text. Preserve ESC before parsing VT input.
+        """
+
+        def run(self):
+            parser = XTermParser(debug=constants.DEBUG)
+            handle = win32.GetStdHandle(win32.STD_INPUT_HANDLE)
+            records = (win32.INPUT_RECORD * 1024)()
+            count = wintypes.DWORD()
+            try:
+                while not self.exit_event.is_set():
+                    for event in parser.tick():
+                        self.process_event(event)
+                    if win32.wait_for_handles([handle], 100) is None:
+                        continue
+                    if not win32.KERNEL32.ReadConsoleInputW(handle, byref(records), 1024, byref(count)):
+                        raise OSError("ReadConsoleInputW failed")
+                    keys = []
+                    size = None
+                    for record in records[:count.value]:
+                        if record.EventType == 1:
+                            key = record.Event.KeyEvent
+                            char = key.uChar.UnicodeChar
+                            if not key.bKeyDown or char == "\0":
+                                continue
+                            if key.dwControlKeyState and key.wVirtualKeyCode == 0 and char != "\x1b":
+                                continue
+                            keys.append(char * max(1, key.wRepeatCount))
+                        elif record.EventType == 4:
+                            dimensions = record.Event.WindowBufferSizeEvent.dwSize
+                            size = (dimensions.X, dimensions.Y)
+                    if keys:
+                        data = "".join(keys).encode("utf-16", "surrogatepass").decode("utf-16")
+                        for event in parser.feed(data):
+                            self.process_event(event)
+                    if size is not None:
+                        self.on_size_change(*size)
+            except Exception as exc:
+                self.app.log.error("Terminal input failed", exc)
 
     class _WindowsInlineDriver(WindowsDriver):
         """Textual 的 Windows driver，但保留当前终端的 scrollback。"""
@@ -48,9 +96,41 @@ if os.name == "nt":
                 super().write(data)
 
         def start_application_mode(self) -> None:
-            super().start_application_mode()
+            self._restore_console = win32.enable_application_mode()
+            self._writer_thread = WriterThread(self._file)
+            self._writer_thread.start()
+            self._enable_mouse_support()
+            self.write("\x1b[?25l\x1b[?1004h")
+            self._enable_bracketed_paste()
             self.write("\n" * self._app.INLINE_PADDING)
             self.flush()
+            self._event_thread = _WindowsInputMonitor(
+                asyncio.get_running_loop(), self._app, self.exit_event, self.process_message
+            )
+            self._event_thread.start()
+
+        def process_message(self, message):
+            if isinstance(message, events.CursorPosition):
+                self.cursor_origin = (message.x, message.y)
+                return
+            super().process_message(message)
+
+
+class TranscriptScroll(VerticalScroll):
+    """Observe scroll intent before the scroll widget consumes the event."""
+
+    def _on_mouse_scroll_up(self, event):
+        self.app._follow_tail = False
+        super()._on_mouse_scroll_up(event)
+
+    def _on_mouse_scroll_down(self, event):
+        super()._on_mouse_scroll_down(event)
+        self.app._follow_tail = self.is_vertical_scroll_end
+
+    def watch_scroll_y(self, old_value, new_value):
+        super().watch_scroll_y(old_value, new_value)
+        if new_value < old_value:
+            self.app._follow_tail = False
 
 
 def _content_text(content) -> str:
@@ -310,7 +390,7 @@ class AgentApp(App):
         background: transparent;
         color: #6c6c6c;
     }
-    #status { width: 1fr; color: #6c6c6c; }
+    #status { width: 1fr; color: #6c6c6c; overflow: hidden; text-overflow: ellipsis; }
     #hint { width: auto; color: #6c6c6c; text-align: right; }
     """
 
@@ -341,6 +421,11 @@ class AgentApp(App):
         self._assistant_widget = None
         self._assistant_buf = []
         self._thinking_buf = []
+        self._thinking_widget = None
+        self._thinking_tail = ""
+        self._phase = "等待模型"
+        self._round = 0
+        self._started_at = 0.0
         self._tool_widget = None
         self._tool_title_widget = None
         self._tool_content_widget = None
@@ -366,7 +451,7 @@ class AgentApp(App):
         return super()._build_driver(headless, inline, mouse, size)
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="scroll")
+        yield TranscriptScroll(id="scroll")
         with Vertical(id="composer-shell"):
             yield Static("", id="composer-top", markup=False)
             with Horizontal(id="composer-row"):
@@ -385,6 +470,7 @@ class AgentApp(App):
         self.query_one("#input", Input).cursor_blink = False
         self._fit_transcript()
         self.set_interval(1 / 30, self._drain_events)
+        self.set_interval(0.25, self._heartbeat)
         self._update_status()
         self.call_after_refresh(self._draw_composer_frame)
         if self.agent is None:
@@ -469,11 +555,21 @@ class AgentApp(App):
         if entry.role == "user":
             return Static(Text("❯ " + content), classes="user-line")
         if entry.role == "assistant":
+            thinking = "\n".join(
+                block.get("text", "") for block in (entry.content if isinstance(entry.content, list) else [])
+                if isinstance(block, dict) and block.get("type") == "thinking"
+            )
             calls = []
             for call in entry.tool_calls or []:
                 fn = call.get("function", {})
                 calls.append("✦ " + fn.get("name", "tool") + "  " + _compact_tool_arguments(fn.get("arguments", {})))
             body = "\n\n".join(part for part in [content, *calls] if part)
+            if thinking:
+                return Vertical(
+                    Static(Text("✦ 思考\n" + thinking, style="#bb9af7"), classes="assistant-card thinking"),
+                    Static(RichMarkdown(body), classes="assistant-card") if body else Static("", classes="notice"),
+                    classes="tool-card",
+                )
             return Static(RichMarkdown(body or "（无文本回复）"), classes="assistant-card")
         return Static(Text("╰─ " + (content[:1200] or "（空结果）")), classes="tool-card")
 
@@ -539,6 +635,10 @@ class AgentApp(App):
         s = self.agent.session
         model = str(getattr(self.agent.loop, "model", "—"))
         busy = "stopping…" if self._stopping else ("working" if self._busy else "ready")
+        if self._busy and not self._stopping:
+            elapsed = max(0, int(time.monotonic() - self._started_at))
+            spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 4) % 10]
+            busy = f"{spinner} {self._phase} {elapsed}s · {self._round}/{self.agent.loop.max_iterations}轮"
         if self._permission is not None:
             busy = "等待授权 · /allow 或 /deny"
         msgs = s.message_count
@@ -559,6 +659,10 @@ class AgentApp(App):
         self.query_one("#status", Label).update(status)
         self.query_one("#hint", Label).update("Enter 插话 · Esc 停止" if self._busy else "/help · PgUp 历史")
 
+    def _heartbeat(self):
+        if self._busy:
+            self._update_status()
+
     def _add_user(self, text: str):
         body = Text()
         body.append("❯ ", style="bold #d8d8d8")
@@ -571,7 +675,6 @@ class AgentApp(App):
 
     def _start_assistant(self):
         self._assistant_buf = []
-        self._thinking_buf = []
         self._assistant_widget = Static("", markup=False)
         self._assistant_widget.classes = "assistant-card"
         self._add_card(self._assistant_widget)
@@ -580,13 +683,31 @@ class AgentApp(App):
         if self._assistant_widget is None:
             return
         text = "".join(self._assistant_buf)
-        if self._thinking_buf and not text:
-            self._assistant_widget.add_class("thinking")
-            self._assistant_widget.update(Text("✦ thinking…", style="#bb9af7"))
-        else:
-            self._assistant_widget.remove_class("thinking")
-            self._assistant_widget.update(Text(("● " + text) if text else ""))
+        self._assistant_widget.update(Text(("● " + text) if text else ""))
         self._dirty = False
+
+    def _update_thinking(self):
+        if not self._thinking_buf:
+            return
+        remaining = self._thinking_tail + "".join(self._thinking_buf)
+        self._thinking_buf.clear()
+        # Freeze completed chunks, so long reasoning never reparses/repaints
+        # every preceding character for each token.
+        while remaining:
+            if self._thinking_widget is None:
+                self._thinking_widget = Static("", markup=False, classes="assistant-card thinking")
+                self._add_card(self._thinking_widget)
+            chunk, remaining = remaining[:4000], remaining[4000:]
+            self._thinking_widget.update(Text("✦ " + chunk, style="#bb9af7"))
+            self._thinking_tail = chunk
+            if remaining:
+                self._thinking_widget = None
+                self._thinking_tail = ""
+
+    def _end_thinking(self):
+        self._update_thinking()
+        self._thinking_widget = None
+        self._thinking_tail = ""
 
     def _end_assistant(self):
         if self._assistant_widget is not None:
@@ -718,6 +839,8 @@ class AgentApp(App):
 
     def _start_operation(self, function, *args):
         self._busy = True
+        self._started_at = time.monotonic()
+        self._phase = "处理会话操作"
         self._operation_busy = True
         self._update_status()
         async def run():
@@ -826,8 +949,10 @@ class AgentApp(App):
         self._busy = True
         self._stopping = False
         self._follow_tail = True
+        self._started_at = time.monotonic()
+        self._round = 0
+        self._phase = "等待模型"
         self._add_user(text)
-        self._start_assistant()
         self._update_status()
         self._task = asyncio.create_task(self._run_prompt(text, images))
 
@@ -858,6 +983,7 @@ class AgentApp(App):
                 self._after_prompt()
 
     def _after_prompt(self):
+        self._end_thinking()
         self._end_assistant()
         self._busy = False
         stopped = self._stopping
@@ -910,10 +1036,12 @@ class AgentApp(App):
             self._on_event(event)
             if time.monotonic() - start > 0.008:
                 break
+        changed = self._dirty or bool(self._thinking_buf)
+        self._update_thinking()
         if self._dirty:
             self._update_assistant()
-            if self._follow_tail:
-                self.query_one("#scroll", VerticalScroll).scroll_end(animate=False)
+        if changed and self._follow_tail:
+            self.query_one("#scroll", VerticalScroll).scroll_end(animate=False)
 
     def _confirm_tool(self, description):
         if self._shutdown_event.is_set() or self._stopping:
@@ -995,26 +1123,39 @@ class AgentApp(App):
     def _render_event(self, event: AgentEvent):
         t = event.type
         if t == "agent_start":
-            return
+            self._round = 0
         elif t == "turn_start":
-            return
+            self._round += 1
+            self._phase = "等待模型"
         elif t == "message_update":
+            self._end_thinking()
+            self._phase = "正在回复"
             if self._assistant_widget is None:
                 self._start_assistant()
             self._assistant_buf.append(_content_text(event.data["content"]))
             self._dirty = True
         elif t == "thinking_update":
-            if self._assistant_widget is None:
-                self._start_assistant()
+            self._phase = "思考中"
             self._thinking_buf.append(_content_text(event.data["content"]))
-            self._dirty = True
+        elif t == "thinking_end":
+            self._end_thinking()
         elif t == "message_end":
             self._end_assistant()
         elif t == "tool_execution_start":
+            self._end_thinking()
+            self._phase = "工具: " + event.data["name"]
             self._end_assistant()
             self._start_tool(event.data["name"], event.data["arguments"])
         elif t == "tool_execution_end":
             self._end_tool(event.data["content"], event.data.get("pruned"), event.data.get("full_output_path"), event.data.get("is_error", False))
+            self._phase = "等待下一轮"
+        elif t == "agent_end":
+            self._end_thinking()
+            result = event.data.get("text", "") or ""
+            if "已达到最大工具调用轮数" in result:
+                self._add_notice(f"已达到最大工具调用轮数（{self.agent.loop.max_iterations}轮），任务可能尚未完成。输入“继续”接续，或用 --max-iterations 增大轮数。", "warn")
+            elif "已中止" in result and not self._stopping:
+                self._add_notice(result.strip(), "warn")
         elif t == "steer":
             self._add_notice(f"↳ 正在处理插话: {event.data.get('content')}", "info")
         elif t == "permission_request":

@@ -57,7 +57,15 @@ python -m pip install -e ".[tui]"
 
 复制仓库根目录的 `.env.example` 为 `.env`，将其中的 `DEEPSEEK_API_KEY` 值替换为自己的密钥。程序会加载项目根目录的 `.env`，并尝试加载当前目录的环境配置；已设置的环境变量不会被覆盖。
 
-`.env` 和 `sessions/` 已加入 `.gitignore`。切换其他 OpenAI 兼容服务时，当前代码仍从 **`DEEPSEEK_API_KEY`** 读取密钥，服务地址和模型名通过 `--base-url`、`--model` 指定。
+`.env` 和 `sessions/` 已加入 `.gitignore`。默认使用 `DEEPSEEK_API_KEY`；通过 `--provider commandcode` 接入 Command Code 时使用 `CMD_API_KEY`，不需要 DeepSeek 官方密钥。
+
+**Command Code GOAT 套餐：** 在 [Studio](https://commandcode.ai/settings/keys) 创建 API key，将 `CMD_API_KEY=你的密钥` 加到本地 `.env`，然后运行：
+
+```powershell
+python -m coding_agent --provider commandcode --bypass --sandbox wsl
+```
+
+默认端点为 `https://api.commandcode.ai/provider/v1`，模型为 `deepseek/deepseek-v4.1-flash`。官方说明 [GOAT 支持 API 调用并计入套餐额度](https://commandcode.ai/docs/plans/goat#api-support)；模型仍受套餐可用范围限制。本适配器使用 [Chat Completions 协议](https://commandcode.ai/docs/provider)，支持文本、图片、思考流、工具调用和 usage；Claude 的 Anthropic Messages 协议暂未接入。对话和上下文压缩使用同一个 provider，不会回退到 DeepSeek 官方 API。
 
 ### 3. 启动
 
@@ -87,19 +95,25 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 
 | 命令 / 操作 | CLI | TUI |
 | --- | --- | --- |
-| `/new` | 新建会话，沿用当前任务模式 | 新建会话，使用 `default` 模式 |
+| `/new` | 新建会话，沿用当前任务模式 | 同左 |
 | `/clear` | 清空当前历史并保存 | 同左 |
 | `/mode default`（也可选 `plan` / `code` / `review`） | 切换系统提示词 | 同左 |
 | `/sessions` | 列出会话及 ID | 同左 |
+| `/resume 会话ID` / `/older` | 未提供 | 切换会话 / 加载更早记录 |
+| `/bypass` / `/bypass off` | 使用启动参数 `--bypass` | 自动通过工具请求 / 恢复原权限策略 |
+| `PgUp` / `PgDn` / `Ctrl+End` | 使用终端滚动 | 翻页 / 恢复跟随最新输出；滚轮上翻暂停跟随 |
 | `/compact` | 手动生成上下文摘要 | 同左 |
 | `/name 显示名` | 重命名当前会话 | 未提供 |
 | `/delete 会话ID` | 确认后删除非当前会话 | 未提供 |
 | `/help` | 未提供；启动参数见 `--help` | 显示界面命令 |
 | `/image 本地图片路径` | 未提供交互命令 | 读取图片并发送给模型 |
 | 运行中发送补充说明 | 等待本轮结束后输入 | 加入插话队列，在循环检查点交给模型 |
-| `Ctrl+C` | 执行中中止本轮；等待输入时退出 | 使用 Textual 的退出行为 |
+| `Ctrl+C` | 执行中中止本轮；等待输入时退出 | 执行中请求停止；空闲时清除草稿或退出 |
+| `Esc` / `Ctrl+D` | — | 请求停止 / 退出 |
 
 任务模式只改变提示词，**不会改变工具权限**。例如 `plan` 不是强制只读模式；需要拒绝写入和命令执行时，请使用 `--permission-policy deny`。
+
+TUI 显示模型思考文本，并在状态栏标记当前阶段、耗时和调用轮数。默认每次任务最多 100 轮模型调用，达到上限会明确提示；用 `--max-iterations 200` 可调整。Esc 在下一安全检查点停止，无法强制打断已进入的同步网络读取或外部工具。恢复会话时也显示已保存的思考文本。
 
 会话保存于项目根目录的 `sessions/<id>.json`，默认恢复最近更新的会话。`--session` 接受已有 ID（1–64 位字母或数字），不是展示名，且优先于 `--new`；可先用 `/sessions` 查看 ID，再重新启动恢复。
 
@@ -110,14 +124,17 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--ui` | `tui` | `tui` 或 `cli`；缺少 Textual 时回退 CLI |
+| `--provider` | `deepseek` | `deepseek` / `commandcode`（GOAT） |
+| `--max-iterations` | `100` | 每次任务的模型调用轮数上限，必须大于 0 |
 | `--workspace` | 当前目录 | 文件工具的默认根目录和命令工作目录 |
 | `--session` | 空 | 恢复指定会话 ID；也可由进程环境变量 `AGENT_SESSION` 指定 |
 | `--new` | 关闭 | 不恢复最近历史，新建会话 |
 | `--name` | 空 | 新建会话的展示名 |
 | `--mode` | `default` | 新建会话使用的任务模式；恢复会话保留已存提示词 |
-| `--model` | `deepseek-flash` | 模型标识，默认 DeepSeek V4.1 Flash |
-| `--base-url` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
+| `--model` | 随 provider 选择 | DeepSeek: `deepseek-flash`；Command Code: `deepseek/deepseek-v4.1-flash` |
+| `--base-url` | 随 provider 选择 | 可覆盖 OpenAI 兼容接口地址 |
 | `--permission-policy` | `ask` | `ask` 确认 / `deny` 拒绝 / `auto` 放行危险工具 |
+| `--bypass` | 关闭 | 等同 `--permission-policy auto` |
 | `--sandbox` | `auto` | `auto` / `docker` / `wsl` / `host` |
 | `--bash-image` | `python:3.12-slim` | Docker 后端所用镜像 |
 | `--context-window` | `128000` | 上下文计量窗口；设为 `0` 关闭自动上下文检查 |

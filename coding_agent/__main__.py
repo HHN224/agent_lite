@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
 
-from ai import OpenAIProvider
+from ai import CommandCodeProvider, OpenAIProvider
 from agent_core import (
     Agent,
     AgentEvent,
@@ -127,6 +127,8 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Agent Lite 交互式 REPL")
+    parser.add_argument("--provider", choices=["deepseek", "commandcode"], default="deepseek", help="模型服务（commandcode 支持 GOAT 套餐，使用 CMD_API_KEY）")
+    parser.add_argument("--max-iterations", type=int, default=100, help="每次任务的模型调用轮数上限（默认 100）")
     parser.add_argument(
         "--session",
         default=os.environ.get("AGENT_SESSION", ""),
@@ -150,8 +152,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--model",
-        default="deepseek-flash",
-        help="模型名（默认 deepseek-flash，即 DeepSeek V4.1 Flash，支持图片输入）",
+        default=None,
+        help="模型名（随 provider 默认选择 DeepSeek V4.1 Flash）",
     )
     parser.add_argument(
         "--mode",
@@ -166,8 +168,8 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--base-url",
-        default="https://api.deepseek.com",
-        help="OpenAI 兼容 API 的 base_url（默认 DeepSeek）",
+        default=None,
+        help="覆盖所选 provider 的 API 地址",
     )
     parser.add_argument(
         "--permission-policy",
@@ -218,6 +220,12 @@ def parse_args(argv=None):
         help="bash 命令的沙箱后端：auto 自动探测（docker→wsl→host）/ host 宿主直跑 / wsl WSL2 / docker Docker（默认 auto）",
     )
     args = parser.parse_args(argv)
+    if args.max_iterations < 1:
+        parser.error("--max-iterations 必须大于 0")
+    if args.model is None:
+        args.model = CommandCodeProvider.DEFAULT_MODEL if args.provider == "commandcode" else "deepseek-flash"
+    if args.base_url is None:
+        args.base_url = CommandCodeProvider.DEFAULT_BASE_URL if args.provider == "commandcode" else "https://api.deepseek.com"
 
     if args.session and not SESSION_ID_RE.match(args.session):
         parser.error("会话 id 只能是字母/数字，长度 1-64")
@@ -265,7 +273,8 @@ def pick_initial_session(repo: SessionRepository, args):
 
 def build_agent(args, api_key):
     # 自底向上组装：ai 层 Provider → agent_core 循环 → Agent 对话状态 + 会话存档
-    provider = OpenAIProvider(
+    provider_class = CommandCodeProvider if args.provider == "commandcode" else OpenAIProvider
+    provider = provider_class(
         api_key=api_key,
         base_url=args.base_url,
     )
@@ -293,6 +302,7 @@ def build_agent(args, api_key):
         provider=provider,
         model=args.model,
         tools=tools,
+        max_iterations=args.max_iterations,
         permission_policy=args.permission_policy,
         confirm=make_confirm(),
     )
@@ -336,12 +346,12 @@ def main():
     load_dotenv(ENV_FILE)
     load_dotenv()
 
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    key_name = "CMD_API_KEY" if args.provider == "commandcode" else "DEEPSEEK_API_KEY"
+    api_key = os.getenv(key_name)
     if not api_key:
         sys.exit(
-            "错误：未检测到 DEEPSEEK_API_KEY。\n"
-            "请在项目根目录的 .env 文件中写入 DEEPSEEK_API_KEY=sk-xxxx（可参考 .env.example），\n"
-            '或设置环境变量：$env:DEEPSEEK_API_KEY = "sk-xxxx"'
+            f"错误：未检测到 {key_name}。\n"
+            f"请在项目根目录 .env 中设置 {key_name}（参考 .env.example）。"
         )
 
     # Paint the TUI before SDK setup, session I/O and Docker / WSL probing.

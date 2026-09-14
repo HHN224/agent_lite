@@ -40,8 +40,17 @@ def windows_to_wsl(path) -> str:
 
 
 def _decode_bytes(data) -> str:
-    """按 UTF-8 容错解码字节；None（历史 text=True 解码线程死亡的产物）也用 b"" 兜底。"""
-    return (data or b"").decode("utf-8", errors="replace")
+    """Decode WSL launcher diagnostics separately from UTF-8 shell output."""
+    data = data or b""
+    diagnostics = []
+    # wsl.exe may prepend a UTF-16LE warning to the Linux process's UTF-8
+    # stderr. Decoding the entire pipe with either codec corrupts one half.
+    while data.startswith(b"w\x00s\x00l\x00:\x00"):
+        end = data.find(b"\n\x00")
+        length = len(data) if end < 0 else end + 2
+        diagnostics.append(data[:length].decode("utf-16-le", errors="replace"))
+        data = data[length:]
+    return "".join(diagnostics) + data.decode("utf-8", errors="replace")
 
 
 def _compose_result(proc) -> ToolResult:

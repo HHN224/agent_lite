@@ -84,6 +84,9 @@ class OpenAIProvider(LLMProvider):
     ) -> Iterator[StreamEvent]:
         # 流式协议下 tool_calls 按 index 分片到达，先累积、流结束后再产出完整事件
         pending: dict[int, dict[str, str]] = {}
+        self.last_usage = None
+        response = None
+        finish_reason = None
 
         try:
             response = self.client.chat.completions.create(
@@ -105,6 +108,8 @@ class OpenAIProvider(LLMProvider):
                     }
                 if not chunk.choices:
                     continue
+                if chunk.choices[0].finish_reason is not None:
+                    finish_reason = chunk.choices[0].finish_reason
                 delta = chunk.choices[0].delta
                 if delta is None:
                     continue
@@ -130,6 +135,13 @@ class OpenAIProvider(LLMProvider):
             self.last_usage = usage
         except OpenAIError as e:
             raise ProviderError(f"模型 API 错误: {e}") from e
+        finally:
+            if response is not None:
+                response.close()
+
+        if finish_reason in ("length", "content_filter"):
+            reason = "达到单次输出长度上限" if finish_reason == "length" else "被服务端内容过滤终止"
+            raise ProviderError(f"模型输出未完成：{reason}（finish_reason={finish_reason}），请调整请求或继续任务。")
 
         for index in sorted(pending):
             acc = pending[index]

@@ -7,6 +7,14 @@ HostRunner 的 cwd、DockerRunner argv 含隔离参数、命令失败回填格�
 
 import pytest
 
+
+def test_wsl_utf16_diagnostic_and_utf8_command_error_are_both_readable():
+    from coding_agent.sandbox import _decode_bytes
+    diagnostic = "wsl: 检测到 localhost 代理配置\r\n"
+    command_error = "sh: command not found\n"
+    raw = diagnostic.encode("utf-16-le") + command_error.encode("utf-8")
+    assert _decode_bytes(raw) == diagnostic + command_error
+
 from coding_agent.sandbox import (
     DockerRunner,
     HostRunner,
