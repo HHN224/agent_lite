@@ -205,7 +205,9 @@ class Agent:
         self.loop.get_steering_messages = self._dequeue_steer
 
         recorded = prior - 1
-        session.runtime_status = {"reason": "running", "started_at": time.time(), "rounds": 0}
+        session.runtime_status = {"reason": "running", "started_at": time.time(), "rounds": 0,
+                                  "provider": type(self.loop.provider).__name__, "model": self.loop.model}
+        checkpoint_at = time.monotonic()
         try:
             # Save the input before contacting the service; checkpoint completed
             # turns so an interrupted process does not lose a long task's work.
@@ -220,6 +222,13 @@ class Agent:
                 except StopIteration as end:
                     final_text = end.value
                     break
+                session.runtime_status.update(phase=event.type, last_event_at=time.time())
+                if event.type == "turn_start":
+                    session.runtime_status.update(thinking_characters=0, tool_argument_characters=0)
+                elif event.type == "thinking_update":
+                    session.runtime_status["thinking_characters"] += len(event.data.get("content", ""))
+                elif event.type == "tool_call_progress":
+                    session.runtime_status["tool_argument_characters"] = event.data["characters"]
                 if event.type in ("response_incomplete", "retry", "error"):
                     session.runtime_status["last_error"] = dict(event.data)
                 if event.type == "turn_end":
@@ -227,6 +236,13 @@ class Agent:
                     recorded = len(payload)
                     session.runtime_status.update(self.loop.outcome)
                     self._save()
+                    checkpoint_at = time.monotonic()
+                elif time.monotonic() - checkpoint_at >= 5:
+                    # Long reasoning/tool-argument streams don't end a turn.
+                    # Retain their latest progress even if the process is closed.
+                    session.runtime_status.update(self.loop.outcome)
+                    self._save()
+                    checkpoint_at = time.monotonic()
                 yield event
             session.runtime_status.update(self.loop.outcome)
         finally:

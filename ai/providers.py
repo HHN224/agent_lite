@@ -55,7 +55,15 @@ class ToolCall:
     arguments: dict
 
 
-StreamEvent = Union[TextDelta, ThinkingDelta, ToolCall]
+@dataclass
+class ToolCallProgress:
+    """An incomplete call: progress only, never executable arguments."""
+
+    name: str
+    characters: int
+
+
+StreamEvent = Union[TextDelta, ThinkingDelta, ToolCall, ToolCallProgress]
 
 
 class LLMProvider(ABC):
@@ -69,7 +77,7 @@ class LLMProvider(ABC):
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
-        """以流式方式请求模型，依次产出 TextDelta / ThinkingDelta / ToolCall 事件。"""
+        """产出文本、推理、工具参数进度和完整工具调用事件。"""
         raise NotImplementedError
 
 
@@ -125,7 +133,19 @@ class OpenAIProvider(LLMProvider):
                     continue
 
                 # thinking / reasoning 增量（DeepSeek 等）
-                thinking = getattr(delta, "reasoning_content", None) or getattr(delta, "thinking", None)
+                thinking = (getattr(delta, "reasoning_content", None)
+                            or getattr(delta, "thinking", None)
+                            or getattr(delta, "reasoning", None))
+                if not thinking:
+                    # Some GOAT routes only expose structured reasoning. Do not
+                    # duplicate it when the plain-text field is also present,
+                    # and never display encrypted/signature blocks.
+                    details = getattr(delta, "reasoning_details", None) or []
+                    thinking = "".join(
+                        part.get("text", "") for part in details
+                        if isinstance(part, dict) and part.get("type") == "reasoning.text"
+                        and isinstance(part.get("text"), str)
+                    )
                 if thinking:
                     yield ThinkingDelta(thinking)
 
@@ -140,6 +160,10 @@ class OpenAIProvider(LLMProvider):
                         acc["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         acc["args"] += tc.function.arguments
+                    # Yield while arguments are assembling: the caller can
+                    # update progress and observe abort before a huge file's
+                    # JSON has finished streaming. No partial call may execute.
+                    yield ToolCallProgress(acc["name"], len(acc["args"]))
 
             # 流成功结束：把最近一次真实 usage 记录为锚点
             self.last_usage = usage

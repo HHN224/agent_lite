@@ -25,6 +25,7 @@ from ai import TextDelta
 
 from .events import AgentEvent
 from .context_manager import TokenMeter
+from .content import content_to_llm
 
 
 # --------------------------------------------------------------------------- #
@@ -72,7 +73,8 @@ def make_summarizer(provider, model: str, max_tokens: int = 2000):
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         msgs.append({"role": "user", "content": instruction})
-        msgs.extend(region_messages)
+        msgs.extend({**message, "content": content_to_llm(message.get("content"))}
+                    for message in region_messages)
         parts: list[str] = []
         for event in provider.stream(msgs, [], model):
             if isinstance(event, TextDelta):

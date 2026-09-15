@@ -1,7 +1,7 @@
 import json
 import threading
 
-from ai import ProviderError, TextDelta, ThinkingDelta, ToolCall
+from ai import ProviderError, TextDelta, ThinkingDelta, ToolCall, ToolCallProgress
 
 from .content import (
     content_length,
@@ -175,15 +175,21 @@ class AgentLoop:
         tool_calls: list[ToolCall] = []
         message_started = False
         thinking_started = False
+        steering = []
 
         # 送入 provider 前，把 messages 里每个 content 过滤掉 thinking 块等非法变体。
         # （运行中累积的 payload 可能含 [thinking, text] 结构块，而 DeepSeek/OpenAI 不认 thinking。）
         llm_messages = self._llm_messages(messages)
         if getattr(self, "_recovery_hint", ""):
             llm_messages.append({"role": "user", "content": "[Runtime recovery] " + self._recovery_hint})
+        stream = None
         try:
-            for event in self.provider.stream(llm_messages, self.tools, self.model):
+            stream = self.provider.stream(llm_messages, self.tools, self.model)
+            for event in stream:
                 if self._aborted:
+                    break
+                steering = self._poll_steering()
+                if steering:
                     break
                 if isinstance(event, ThinkingDelta):
                     if not thinking_started:
@@ -199,7 +205,16 @@ class AgentLoop:
                     text_parts.append(event.content)
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
-            if not self._aborted and not tool_calls and not "".join(text_parts).strip():
+                elif isinstance(event, ToolCallProgress):
+                    yield AgentEvent("tool_call_progress", {"name": event.name, "characters": event.characters})
+                # Consumers may request abort while handling the yielded event.
+                # Don't start another blocking socket read after that request.
+                if self._aborted:
+                    break
+                steering = self._poll_steering()
+                if steering:
+                    break
+            if not self._aborted and not steering and not tool_calls and not "".join(text_parts).strip():
                 raise ProviderError("模型返回空回复，任务尚未完成。", retryable=True, code="empty_response")
         except ProviderError as e:
             # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
@@ -211,11 +226,26 @@ class AgentLoop:
             yield AgentEvent("response_incomplete", {"message": str(e), "code": e.code})
             yield AgentEvent("turn_end")
             return StepResult(finished=True, text=f"(模型服务出错：{e})", error=e)
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
 
         if thinking_started:
             yield AgentEvent("thinking_end")
         if message_started:
             yield AgentEvent("message_end")
+
+        if steering:
+            # Nothing from this incomplete response has executed yet. Discard
+            # its calls, close the stream, and let the new instruction take
+            # effect without waiting for minutes of reasoning to finish.
+            messages.extend(steering)
+            yield AgentEvent("response_interrupted", {"reason": "steering"})
+            for message in steering:
+                yield AgentEvent("steer", {"content": message.get("content")})
+            yield AgentEvent("turn_end")
+            return StepResult(finished=False)
 
         # 用户中止：在模型回复后安全退出
         if self._aborted:

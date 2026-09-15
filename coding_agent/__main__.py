@@ -309,6 +309,11 @@ def build_agent(args, api_key):
 
     repo = SessionRepository(SESSIONS_DIR)
     session, is_new = pick_initial_session(repo, args)
+    if not is_new:
+        # Re-estimate the next payload after reopening. Older releases counted
+        # display-only reasoning as input tokens and persisted inflated caches.
+        session.usage = 0
+        session.new_usage = 0
     if is_new:
         repo.save(session)  # 新建的立即落盘
 

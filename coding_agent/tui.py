@@ -933,6 +933,8 @@ class AgentApp(App):
         if session is None:
             self._add_notice(f"找不到会话: {session_id}", "error")
             return
+        session.usage = 0
+        session.new_usage = 0
         await self._select_session(session)
 
     async def _clear_session(self):
@@ -1191,6 +1193,9 @@ class AgentApp(App):
             self._thinking_buf.append(_content_text(event.data["content"]))
         elif t == "thinking_end":
             self._end_thinking()
+        elif t == "tool_call_progress":
+            self._end_thinking()
+            self._phase = f"正在生成 {event.data['name'] or '工具'} 参数 · {event.data['characters']} 字符"
         elif t == "message_end":
             self._end_assistant()
         elif t == "tool_execution_start":
@@ -1226,11 +1231,16 @@ class AgentApp(App):
             self._add_notice(f"模型出错: {event.data.get('message')}", "error")
         elif t == "response_incomplete":
             self._add_notice("本次模型响应未完成，以上片段不代表任务完成。", "warn")
+        elif t == "response_interrupted":
+            self._add_notice("已暂停本次未完成响应，正在根据插话重新请求。", "info")
         elif t == "retry":
             self._phase = "等待重试"
             self._add_notice(f"连接或响应异常：{event.data.get('message')}\n自动重试 {event.data['attempt']}/{event.data['max_retries']} · Esc 可停止", "warn")
         elif t == "context_check":
             self._update_status()
+        elif t == "compaction_start":
+            self._phase = "正在压缩上下文"
+            self._add_notice("正在整理较早的对话记录…", "info")
         elif t == "compaction_end":
             d = event.data
             if d.get("success"):

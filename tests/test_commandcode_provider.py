@@ -5,7 +5,7 @@ import httpx
 import pytest
 from openai import OpenAI
 
-from ai import CommandCodeProvider, ProviderError, TextDelta, ThinkingDelta, Tool, ToolCall
+from ai import CommandCodeProvider, ProviderError, TextDelta, ThinkingDelta, Tool, ToolCall, ToolCallProgress
 
 
 def make_provider(handler):
@@ -44,7 +44,7 @@ def test_goat_stream_uses_official_endpoint_and_preserves_events():
     try:
         messages = [{"role": "user", "content": [{"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}]
         events = list(provider.stream(messages, [Tool("read", "Read a file")], provider.DEFAULT_MODEL))
-        assert events == [ThinkingDelta("inspect"), TextDelta("answer"), ToolCall("t1", "read", {"path": "a.py"})]
+        assert [e for e in events if not isinstance(e, ToolCallProgress)] == [ThinkingDelta("inspect"), TextDelta("answer"), ToolCall("t1", "read", {"path": "a.py"})]
         request = requests[0]
         assert str(request.url) == "https://api.commandcode.ai/provider/v1/chat/completions"
         assert request.headers["Authorization"] == "Bearer offline-test-key"
