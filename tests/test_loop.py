@@ -163,7 +163,7 @@ def test_provider_error_finishes_run():
     loop, _ = make_loop([ProviderError("模型 API 错误: 500")])
     events, _ = run_all(loop)
 
-    assert event_types(events) == ["turn_start", "error", "turn_end"]
+    assert event_types(events) == ["turn_start", "response_incomplete", "turn_end", "error"]
     assert loop.state == AgentState.ERROR
 
 

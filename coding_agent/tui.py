@@ -31,11 +31,42 @@ from agent_core.tool_executor import PermissionPolicy
 
 
 if os.name == "nt":
-    from ctypes import byref, wintypes
+    from ctypes import Structure, byref, wintypes
     from textual._xterm_parser import XTermParser
     from textual.drivers import win32
     from textual.drivers._writer_thread import WriterThread
     from textual.drivers.windows_driver import WindowsDriver
+
+    class _ConsoleBufferInfo(Structure):
+        _fields_ = [("size", wintypes._COORD), ("cursor", wintypes._COORD),
+                    ("attributes", wintypes.WORD), ("window", wintypes.SMALL_RECT),
+                    ("maximum", wintypes._COORD)]
+
+    class _ConsoleOutput:
+        """Resolve inline cursor queries in the output thread, never over stdin.
+
+        Flush before sampling so the native cursor corresponds to exactly this
+        frame. Keeping this in WriterThread preserves ordering without blocking
+        the UI or guessing the origin from a later cursor position.
+        """
+
+        def __init__(self, file, capture_origin):
+            self.file = file
+            self.capture_origin = capture_origin
+
+        def write(self, text):
+            parts = text.split("\x1b[6n")
+            for index, part in enumerate(parts):
+                if index:
+                    self.file.flush()
+                    self.capture_origin()
+                self.file.write(part)
+
+        def flush(self):
+            self.file.flush()
+
+        def fileno(self):
+            return self.file.fileno()
 
     class _WindowsInputMonitor(win32.EventMonitor):
         """Keep Escape in synthetic VT replies emitted by Windows Terminal.
@@ -97,7 +128,7 @@ if os.name == "nt":
 
         def start_application_mode(self) -> None:
             self._restore_console = win32.enable_application_mode()
-            self._writer_thread = WriterThread(self._file)
+            self._writer_thread = WriterThread(_ConsoleOutput(self._file, self._capture_origin))
             self._writer_thread.start()
             self._enable_mouse_support()
             self.write("\x1b[?25l\x1b[?1004h")
@@ -108,6 +139,13 @@ if os.name == "nt":
                 asyncio.get_running_loop(), self._app, self.exit_event, self.process_message
             )
             self._event_thread.start()
+
+        def _capture_origin(self):
+            info = _ConsoleBufferInfo()
+            handle = win32.GetStdHandle(win32.STD_OUTPUT_HANDLE)
+            if win32.KERNEL32.GetConsoleScreenBufferInfo(handle, byref(info)):
+                self.cursor_origin = (info.cursor.X - info.window.Left,
+                                      info.cursor.Y - info.window.Top)
 
         def process_message(self, message):
             if isinstance(message, events.CursorPosition):
@@ -195,7 +233,13 @@ class LazyCommandRunner:
         return self._runner.mode if self._runner is not None else f"{self._mode}（待检测）"
 
     def describe(self):
-        return self._runner.describe() if self._runner is not None else "首次执行命令前检测沙箱"
+        if self._runner is not None:
+            return self._runner.describe()
+        if self._mode in ("wsl", "docker"):
+            from .sandbox import DockerRunner, WslRunner
+            runner_type = WslRunner if self._mode == "wsl" else DockerRunner
+            return runner_type(self.workspace).describe()
+        return "首次执行命令前检测沙箱；auto 模式优先隔离环境，不保证宿主依赖或网络可用。"
 
     def run(self, command, timeout=None):
         with self._lock:
@@ -544,6 +588,14 @@ class AgentApp(App):
             self._add_card(Static(Text(f"还有 {self._history_start} 条较早记录，/older 加载"), classes="notice info", id="history-marker"))
         for entry in self._history[self._history_start:]:
             self._add_card(self._history_card(entry))
+        status = getattr(self.agent.session, "runtime_status", {})
+        reason = status.get("reason")
+        if reason == "error":
+            self._add_notice(f"上次任务出错 · {status.get('code', 'unknown')} · {status.get('message', '')}", "error")
+        elif reason == "running":
+            self._add_notice("上次运行未正常结束，已恢复最近保存的工具轮次。", "warn")
+        elif reason in ("aborted", "max_iterations"):
+            self._add_notice("上次任务已中止" if reason == "aborted" else "上次任务达到工具轮数上限，尚未确认完成。", "warn")
         self._follow_tail = True
         await self._flush_cards()
         self._update_status()
@@ -1172,6 +1224,11 @@ class AgentApp(App):
             self._update_status()
         elif t == "error":
             self._add_notice(f"模型出错: {event.data.get('message')}", "error")
+        elif t == "response_incomplete":
+            self._add_notice("本次模型响应未完成，以上片段不代表任务完成。", "warn")
+        elif t == "retry":
+            self._phase = "等待重试"
+            self._add_notice(f"连接或响应异常：{event.data.get('message')}\n自动重试 {event.data['attempt']}/{event.data['max_retries']} · Esc 可停止", "warn")
         elif t == "context_check":
             self._update_status()
         elif t == "compaction_end":

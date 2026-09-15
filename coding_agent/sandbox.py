@@ -183,7 +183,9 @@ class WslRunner(CommandRunner):
     def describe(self) -> str:
         return (
             "WSL2 + Bubblewrap（免 Docker daemon）：无网络、系统只读，"
-            "仅工作目录映射为可写的 /workspace"
+            "仅工作目录映射为可写的 /workspace（也是命令的当前目录）。"
+            "宿主 /mnt、/home、/root 不可见；/tmp 等临时目录在每次命令结束后丢弃。"
+            "不能访问宿主浏览器或靠下载补齐依赖；需要跨命令保留的文件放在工作目录。"
         )
 
 

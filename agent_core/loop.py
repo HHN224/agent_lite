@@ -1,4 +1,5 @@
 import json
+import threading
 
 from ai import ProviderError, TextDelta, ThinkingDelta, ToolCall
 
@@ -17,9 +18,10 @@ from .truncate import ToolOutputTruncator, TruncationResult
 class StepResult:
     """单步 step() 的返回值：标记这一轮是否结束，并携带最终回复（若已结束）。"""
 
-    def __init__(self, finished: bool, text: str = ""):
+    def __init__(self, finished: bool, text: str = "", error: ProviderError | None = None):
         self.finished = finished
         self.text = text
+        self.error = error
 
 
 class AgentLoop:
@@ -49,6 +51,8 @@ class AgentLoop:
         truncator: ToolOutputTruncator | None = None,
         session_id: str | None = None,
         get_steering_messages=None,
+        max_retries: int = 2,
+        retry_delay: float = 1.0,
     ):
         self.provider = provider
         self.model = model
@@ -67,10 +71,15 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.state = AgentState.IDLE
         self._aborted = False
+        self._abort_event = threading.Event()
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.outcome = {}
 
     def abort(self):
         """请求中止当前运行；在下个安全检查点（轮间 / 流式 token 间 / 工具间）安全退出。"""
         self._aborted = True
+        self._abort_event.set()
 
     def run(self, messages: list):
         """生成器：反复 step() 直到某轮 finished，return 最终回复字符串。
@@ -79,8 +88,12 @@ class AgentLoop:
         所有事件由 step() 产出，这里用 yield from 透传给消费者。
         """
         self._aborted = False
-        for _ in range(self.max_iterations):
+        self._abort_event.clear()
+        self.outcome = {"reason": "running", "rounds": 0}
+        self._recovery_hint = ""
+        for round_index in range(self.max_iterations):
             if self._aborted:
+                self.outcome["reason"] = "aborted"
                 self.state = AgentState.FINISHED
                 return "\n(已中止)"
             # 运行中注入 steer 消息（在每轮之前，作为新的 user 指令追加，让模型转向）
@@ -89,11 +102,33 @@ class AgentLoop:
                 messages.extend(steering)
                 for msg in steering:
                     yield AgentEvent("steer", {"content": msg.get("content")})
-            result = yield from self.step(messages)
+            self.outcome["rounds"] = round_index + 1
+            for attempt in range(self.max_retries + 1):
+                result = yield from self.step(messages)
+                if not result.error or not result.error.retryable or attempt == self.max_retries or self._aborted:
+                    break
+                error = result.error
+                yield AgentEvent("retry", {"attempt": attempt + 1, "max_retries": self.max_retries,
+                                          "message": str(error), "code": error.code})
+                # Feedback is local to the failed request; don't invent user
+                # messages in stored history or replay any completed tools.
+                self._recovery_hint = error.recovery_hint
+                if self._abort_event.wait(self.retry_delay * (2 ** attempt)):
+                    break
+            self._recovery_hint = ""
+            if self._aborted:
+                self.outcome["reason"] = "aborted"
+                self.state = AgentState.FINISHED
+                return "\n(已中止)"
             if result.finished:
+                self.outcome["reason"] = "error" if result.error else "completed"
+                if result.error:
+                    self.outcome.update(message=str(result.error), code=result.error.code)
+                    yield AgentEvent("error", {"message": str(result.error), "code": result.error.code})
                 return result.text
 
         self.state = AgentState.FINISHED
+        self.outcome["reason"] = "max_iterations"
         return "\n(已达到最大工具调用轮数，停止循环)"
 
     def _poll_steering(self) -> list[dict]:
@@ -144,6 +179,8 @@ class AgentLoop:
         # 送入 provider 前，把 messages 里每个 content 过滤掉 thinking 块等非法变体。
         # （运行中累积的 payload 可能含 [thinking, text] 结构块，而 DeepSeek/OpenAI 不认 thinking。）
         llm_messages = self._llm_messages(messages)
+        if getattr(self, "_recovery_hint", ""):
+            llm_messages.append({"role": "user", "content": "[Runtime recovery] " + self._recovery_hint})
         try:
             for event in self.provider.stream(llm_messages, self.tools, self.model):
                 if self._aborted:
@@ -162,12 +199,18 @@ class AgentLoop:
                     text_parts.append(event.content)
                 elif isinstance(event, ToolCall):
                     tool_calls.append(event)
+            if not self._aborted and not tool_calls and not "".join(text_parts).strip():
+                raise ProviderError("模型返回空回复，任务尚未完成。", retryable=True, code="empty_response")
         except ProviderError as e:
             # 模型服务故障：结束本轮而不是让整个 REPL 崩溃
             self.state = AgentState.ERROR
-            yield AgentEvent("error", {"message": str(e)})
+            if thinking_started:
+                yield AgentEvent("thinking_end")
+            if message_started:
+                yield AgentEvent("message_end")
+            yield AgentEvent("response_incomplete", {"message": str(e), "code": e.code})
             yield AgentEvent("turn_end")
-            return StepResult(finished=True, text=f"(模型服务出错：{e})")
+            return StepResult(finished=True, text=f"(模型服务出错：{e})", error=e)
 
         if thinking_started:
             yield AgentEvent("thinking_end")
@@ -223,7 +266,11 @@ class AgentLoop:
         self.state = AgentState.CALLING_TOOL
         for call in tool_calls:
             if self._aborted:
-                break
+                # Keep the protocol valid for the next prompt after Esc. Every
+                # recorded call must have a result, including unexecuted calls.
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": "Tool execution cancelled by the user; this call did not run."})
+                continue
             yield AgentEvent("tool_execution_start", {"name": call.name, "arguments": call.arguments})
             result = self.executor.execute(call)
             # Phase 2：工具结果做 truncate_* 截断 + 可选全文写盘（只改 content，tool_call_id 配对不变）

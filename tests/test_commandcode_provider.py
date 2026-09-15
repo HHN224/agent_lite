@@ -15,7 +15,8 @@ def make_provider(handler):
     )
     with patch("ai.providers.OpenAI", return_value=client) as sdk:
         provider = CommandCodeProvider("offline-test-key")
-        sdk.assert_called_once_with(api_key="offline-test-key", base_url=provider.DEFAULT_BASE_URL, max_retries=2)
+        sdk.assert_called_once_with(api_key="offline-test-key", base_url=provider.DEFAULT_BASE_URL,
+                                    max_retries=0, timeout=httpx.Timeout(60.0, connect=10.0))
     return provider
 
 

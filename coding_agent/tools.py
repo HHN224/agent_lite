@@ -177,6 +177,17 @@ class BashTool(AgentTool):
     def describe_call(self, arguments: dict) -> str:
         return f"执行命令: {arguments.get('command')}（沙箱后端: {self.runner.mode}）"
 
+    def to_schema(self) -> dict:
+        schema = super().to_schema()
+        schema["function"]["description"] += (
+            "\nExecution environment: " + self.runner.describe() +
+            "\nUse workspace-relative paths with read/write/edit. Check required runtimes once; "
+            "Node, npm, pip and browsers are not guaranteed to exist. If unavailable, "
+            "use available tools or report the specific missing capability. Do not repeatedly "
+            "search host directories or retry downloads when the sandbox has no network."
+        )
+        return schema
+
     def execute(self, command: str, timeout: int | None = None) -> ToolResult:
         return self.runner.run(command, timeout=timeout)
 
