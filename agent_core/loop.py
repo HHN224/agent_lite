@@ -45,7 +45,6 @@ class AgentLoop:
         provider,
         model,
         tools,
-        max_iterations: int = 10,
         permission_policy: str = "ask",
         confirm=None,
         truncator: ToolOutputTruncator | None = None,
@@ -68,7 +67,6 @@ class AgentLoop:
         self.session_id = session_id
         # 可选：运行中注入的 steer 消息回调（返回 list[dict]，None 表示不支持 steering）
         self.get_steering_messages = get_steering_messages
-        self.max_iterations = max_iterations
         self.state = AgentState.IDLE
         self._aborted = False
         self._abort_event = threading.Event()
@@ -91,7 +89,7 @@ class AgentLoop:
         self._abort_event.clear()
         self.outcome = {"reason": "running", "rounds": 0}
         self._recovery_hint = ""
-        for round_index in range(self.max_iterations):
+        while True:
             if self._aborted:
                 self.outcome["reason"] = "aborted"
                 self.state = AgentState.FINISHED
@@ -102,7 +100,7 @@ class AgentLoop:
                 messages.extend(steering)
                 for msg in steering:
                     yield AgentEvent("steer", {"content": msg.get("content")})
-            self.outcome["rounds"] = round_index + 1
+            self.outcome["rounds"] += 1
             for attempt in range(self.max_retries + 1):
                 result = yield from self.step(messages)
                 if not result.error or not result.error.retryable or attempt == self.max_retries or self._aborted:
@@ -126,10 +124,6 @@ class AgentLoop:
                     self.outcome.update(message=str(result.error), code=result.error.code)
                     yield AgentEvent("error", {"message": str(result.error), "code": result.error.code})
                 return result.text
-
-        self.state = AgentState.FINISHED
-        self.outcome["reason"] = "max_iterations"
-        return "\n(已达到最大工具调用轮数，停止循环)"
 
     def _poll_steering(self) -> list[dict]:
         """在轮间查询是否有 steer 消息。返回消息 dict 列表；无则空列表。"""

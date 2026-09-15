@@ -37,9 +37,15 @@ async def validate(options):
     workspace = base / "workspace"
     workspace.mkdir(parents=True, exist_ok=bool(options.resume_dir))
     cli.SESSIONS_DIR = base / "sessions"
-    args = cli.parse_args(["--provider", "commandcode", "--workspace", str(workspace),
+    args = cli.parse_args(["--workspace", str(workspace),
                            "--sandbox", "wsl", "--bypass"] + ([] if options.resume_dir else ["--new"]))
     agent = cli.build_agent(args, key)
+    if options.history_file:
+        from agent_core import Session
+        snapshot = Session.from_dict(json.loads(Path(options.history_file).read_text(encoding="utf-8")))
+        snapshot.session_id = agent.session.session_id
+        snapshot.usage = snapshot.new_usage = 0
+        agent.session = snapshot
     if options.scenario == "recovery":
         create = agent.loop.provider.client.chat.completions.create
         injected = False
@@ -85,6 +91,22 @@ async def validate(options):
               '再用 edit 工具添加中文用途注释，重新执行确认。完成后回复结果。')
     if options.scenario in ("scene", "cancel", "interrupt"):
         prompt = SCENE_PROMPT
+    if options.scenario == "web":
+        prompt = ('做一个好看的待办事项网页，单个 index.html，不依赖网络资源。'
+                  '支持输入任务、添加、勾选完成、删除，刷新后保留数据。'
+                  '使用语义化输入框和按钮，实际生成文件并检查后交付。')
+    if options.scenario == "image":
+        # Make an image with stdlib only; the model must read it through the
+        # actual tool and make another API request before finishing the task.
+        import struct
+        import zlib
+        def chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 32, 32, 8, 2, 0, 0, 0))
+        png += chunk(b"IDAT", zlib.compress((b"\0" + b"\xff\0\0" * 32) * 32)) + chunk(b"IEND", b"")
+        (workspace / "sample.png").write_bytes(png)
+        prompt = ('用 read 工具查看 sample.png，识别图片的主要颜色。创建 nested/results/color.json，'
+                  '字段 color 使用英文小写颜色名称。实际用 Python 读取 JSON 验证格式。完成后回复。')
     if options.resume_dir:
         prompt = '继续完成之前的雨夜便利店场景任务。已有分块代码请优先组装为可运行的 HTML 并验证，避免重新规划整个实现。完成后说明文件路径。'
     if options.prompt_file:
@@ -155,6 +177,10 @@ async def validate(options):
                 assert report["outcome"]["reason"] == "completed", report["outcome"]
                 if options.scenario in ("smoke", "steer", "recovery"):
                     assert json.loads((workspace / "result.json").read_text(encoding="utf-8"))["total"] == 12.5
+                if options.scenario == "image":
+                    assert json.loads((workspace / "nested/results/color.json").read_text(encoding="utf-8"))["color"] == "red"
+                if options.scenario == "web":
+                    assert (workspace / "index.html").stat().st_size > 500
                 if options.scenario in ("steer", "interrupt"):
                     assert (workspace / "marker.txt").read_text(encoding="utf-8").strip() == "STEERING_OK"
                 if options.scenario == "interrupt":
@@ -183,8 +209,9 @@ async def validate(options):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", choices=["smoke", "steer", "scene", "cancel", "interrupt", "recovery", "resume"], default="smoke")
+    parser.add_argument("--scenario", choices=["smoke", "steer", "scene", "cancel", "interrupt", "recovery", "resume", "image", "web"], default="smoke")
     parser.add_argument("--resume-dir")
+    parser.add_argument("--history-file", help="Replay an archive copy in the isolated test session")
     parser.add_argument("--prompt-file")
     parser.add_argument("--timeout", type=int, default=1800)
     options = parser.parse_args()

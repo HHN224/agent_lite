@@ -225,6 +225,9 @@ class Agent:
                 session.runtime_status.update(phase=event.type, last_event_at=time.time())
                 if event.type == "turn_start":
                     session.runtime_status.update(thinking_characters=0, tool_argument_characters=0)
+                    # The next usage anchor includes all earlier tool rounds.
+                    # Only this request's output remains outside that anchor.
+                    prior = len(payload)
                 elif event.type == "thinking_update":
                     session.runtime_status["thinking_characters"] += len(event.data.get("content", ""))
                 elif event.type == "tool_call_progress":
@@ -244,6 +247,22 @@ class Agent:
                     self._save()
                     checkpoint_at = time.monotonic()
                 yield event
+                if (event.type == "turn_end" and self.loop.state == AgentState.CALLING_TOOL
+                        and not self.loop._aborted and self.context_manager is not None
+                        and self.context_window and self.compaction_engine is not None):
+                    # This is a safe boundary: every tool call has a result,
+                    # and all new messages were checkpointed above. Check long
+                    # tasks here too, without waiting for another user prompt.
+                    session.usage = 0
+                    session.new_usage = 0
+                    check = self._context_check_event()
+                    if check is not None and check[1].data["needs_compaction"]:
+                        yield check[1]
+                        for cev in self.compaction_engine.compact_if_needed(session, self.context_window):
+                            yield cev
+                        payload[:] = session.build_llm_payload()
+                        prior = recorded = len(payload)
+                        self._save()
             session.runtime_status.update(self.loop.outcome)
         finally:
             # 本轮 loop 追加到 payload 尾部的消息 = 输出侧新增（assistant 回复 / 工具结果）

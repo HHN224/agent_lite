@@ -53,8 +53,18 @@ if os.name == "nt":
         def __init__(self, file, capture_origin):
             self.file = file
             self.capture_origin = capture_origin
+            self._pending = ""
 
         def write(self, text):
+            text = self._pending + text
+            self._pending = ""
+            # WriterThread may split a query across writes/flushes. Retain only
+            # a possible query prefix; never send an incomplete query to stdin.
+            for length in (3, 2, 1):
+                if text.endswith("\x1b[6n"[:length]):
+                    self._pending = text[-length:]
+                    text = text[:-length]
+                    break
             parts = text.split("\x1b[6n")
             for index, part in enumerate(parts):
                 if index:
@@ -68,6 +78,75 @@ if os.name == "nt":
         def fileno(self):
             return self.file.fileno()
 
+    class _WindowsTerminalParser:
+        """Frame VT replies before Textual can time them out into typed keys.
+
+        A lone Escape still has the normal key timeout. An established CSI/OSC
+        sequence is protocol data across reads, not a sequence of draft keys.
+        Bracketed paste is forwarded verbatim, including control-like text.
+        """
+
+        def __init__(self, **kwargs):
+            self._parser = XTermParser(**kwargs)
+            self._pending = ""
+            self._escape_at = 0.0
+
+        def tick(self):
+            if self._pending == "\x1b" and time.monotonic() - self._escape_at >= constants.ESCAPE_DELAY:
+                self._pending = ""
+                yield events.Key("escape", "\x1b")
+            yield from self._parser.tick()
+
+        def feed(self, data):
+            self._pending += data
+            while self._pending:
+                text = self._pending
+                if not text.startswith("\x1b"):
+                    end = text.find("\x1b")
+                    end = len(text) if end < 0 else end
+                    self._pending = text[end:]
+                    yield from self._parser.feed(text[:end])
+                    continue
+                if len(text) == 1:
+                    self._escape_at = time.monotonic()
+                    return
+                if text.startswith("\x1b[200~"):
+                    end = text.find("\x1b[201~", 6)
+                    if end < 0:
+                        return
+                    end += 6
+                    self._pending = text[end:]
+                    yield events.Paste(text[6:end - 6].replace("\0", ""))
+                    continue
+                if text.startswith("\x1b["):
+                    end = next((i + 1 for i in range(2, len(text)) if "@" <= text[i] <= "~"), None)
+                    if end is None:
+                        return
+                    sequence = text[:end]
+                    self._pending = text[end:]
+                    # Device attributes, status, window reports and keyboard
+                    # capability replies are not keyboard input. CPR, mouse,
+                    # mode reports and actual key sequences go to Textual.
+                    if sequence[-1] in "cnt" or (sequence[2:3] in (">", "?") and sequence.endswith("u")):
+                        continue
+                    yield from self._parser.feed(sequence)
+                    continue
+                if text.startswith("\x1b]"):
+                    ends = [i + length for marker, length in (("\x07", 1), ("\x1b\\", 2))
+                            if (i := text.find(marker, 2)) >= 0]
+                    if not ends:
+                        return
+                    self._pending = text[min(ends):]
+                    continue
+                if text.startswith("\x1bO"):
+                    if len(text) < 3:
+                        return
+                    self._pending = text[3:]
+                    yield from self._parser.feed(text[:3])
+                    continue
+                self._pending = text[2:]
+                yield from self._parser.feed(text[:2])
+
     class _WindowsInputMonitor(win32.EventMonitor):
         """Keep Escape in synthetic VT replies emitted by Windows Terminal.
 
@@ -77,7 +156,7 @@ if os.name == "nt":
         """
 
         def run(self):
-            parser = XTermParser(debug=constants.DEBUG)
+            parser = _WindowsTerminalParser(debug=constants.DEBUG)
             handle = win32.GetStdHandle(win32.STD_INPUT_HANDLE)
             records = (win32.INPUT_RECORD * 1024)()
             count = wintypes.DWORD()
@@ -690,7 +769,7 @@ class AgentApp(App):
         if self._busy and not self._stopping:
             elapsed = max(0, int(time.monotonic() - self._started_at))
             spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 4) % 10]
-            busy = f"{spinner} {self._phase} {elapsed}s · {self._round}/{self.agent.loop.max_iterations}轮"
+            busy = f"{spinner} {self._phase} {elapsed}s · 第{self._round}轮"
         if self._permission is not None:
             busy = "等待授权 · /allow 或 /deny"
         msgs = s.message_count
@@ -1209,9 +1288,7 @@ class AgentApp(App):
         elif t == "agent_end":
             self._end_thinking()
             result = event.data.get("text", "") or ""
-            if "已达到最大工具调用轮数" in result:
-                self._add_notice(f"已达到最大工具调用轮数（{self.agent.loop.max_iterations}轮），任务可能尚未完成。输入“继续”接续，或用 --max-iterations 增大轮数。", "warn")
-            elif "已中止" in result and not self._stopping:
+            if "已中止" in result and not self._stopping:
                 self._add_notice(result.strip(), "warn")
         elif t == "steer":
             self._add_notice(f"↳ 正在处理插话: {event.data.get('content')}", "info")

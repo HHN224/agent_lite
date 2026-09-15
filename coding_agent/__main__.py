@@ -127,8 +127,7 @@ SESSION_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Agent Lite 交互式 REPL")
-    parser.add_argument("--provider", choices=["deepseek", "commandcode"], default="deepseek", help="模型服务（commandcode 支持 GOAT 套餐，使用 CMD_API_KEY）")
-    parser.add_argument("--max-iterations", type=int, default=100, help="每次任务的模型调用轮数上限（默认 100）")
+    parser.add_argument("--provider", choices=["deepseek", "commandcode"], default="commandcode", help="模型服务（默认 commandcode，使用 GOAT 套餐 CMD_API_KEY）")
     parser.add_argument(
         "--session",
         default=os.environ.get("AGENT_SESSION", ""),
@@ -220,8 +219,6 @@ def parse_args(argv=None):
         help="bash 命令的沙箱后端：auto 自动探测（docker→wsl→host）/ host 宿主直跑 / wsl WSL2 / docker Docker（默认 auto）",
     )
     args = parser.parse_args(argv)
-    if args.max_iterations < 1:
-        parser.error("--max-iterations 必须大于 0")
     if args.model is None:
         args.model = CommandCodeProvider.DEFAULT_MODEL if args.provider == "commandcode" else "deepseek-flash"
     if args.base_url is None:
@@ -302,7 +299,6 @@ def build_agent(args, api_key):
         provider=provider,
         model=args.model,
         tools=tools,
-        max_iterations=args.max_iterations,
         permission_policy=args.permission_policy,
         confirm=make_confirm(),
     )

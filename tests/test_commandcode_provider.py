@@ -99,7 +99,6 @@ def test_commandcode_startup_uses_cmd_key_and_longer_tool_budget(monkeypatch, tm
     agent = cli.build_agent(args, "goat-key")
     assert agent.loop.provider is provider
     assert credentials == [{"api_key": "goat-key", "base_url": CommandCodeProvider.DEFAULT_BASE_URL}]
-    assert agent.loop.max_iterations == 100
     output = list(agent.prompt("do the task"))
     assert output[-1].data["text"] == "finished"
     assert len(provider.calls) == 12
@@ -107,7 +106,7 @@ def test_commandcode_startup_uses_cmd_key_and_longer_tool_budget(monkeypatch, tm
 
 def test_main_selects_commandcode_key_without_deepseek_key(monkeypatch, tmp_path):
     from coding_agent import __main__ as cli
-    args = cli.parse_args(["--provider", "commandcode", "--workspace", str(tmp_path)])
+    args = cli.parse_args(["--workspace", str(tmp_path)])
     received = []
     monkeypatch.setattr(cli, "parse_args", lambda: args)
     monkeypatch.setattr(cli, "load_dotenv", lambda *a: None)

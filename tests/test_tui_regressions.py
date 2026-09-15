@@ -97,7 +97,7 @@ def test_main_launches_tui_before_building_agent(monkeypatch, tmp_path):
     launches = []
     monkeypatch.setattr(cli, "parse_args", lambda: args)
     monkeypatch.setattr(cli, "load_dotenv", lambda *a: None)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test")
+    monkeypatch.setenv("CMD_API_KEY", "offline-test")
     monkeypatch.setattr(cli, "_HAS_TUI", True)
     monkeypatch.setattr(cli, "build_agent", lambda *a: (_ for _ in ()).throw(AssertionError("eager init")))
     monkeypatch.setattr(cli, "run_tui", lambda **kwargs: launches.append(kwargs))

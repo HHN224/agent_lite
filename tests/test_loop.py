@@ -68,13 +68,12 @@ class DangerousTool(AgentTool):
         return ToolResult(content=f"risky:{text}")
 
 
-def make_loop(script, tools=None, max_iterations=10, **kwargs):
+def make_loop(script, tools=None, **kwargs):
     provider = FauxProvider(script)
     loop = AgentLoop(
         provider=provider,
         model="faux-model",
         tools=tools or [],
-        max_iterations=max_iterations,
         **kwargs,
     )
     return loop, provider
@@ -167,13 +166,13 @@ def test_provider_error_finishes_run():
     assert loop.state == AgentState.ERROR
 
 
-def test_max_iterations_cap():
-    # 模型永远调工具，靠 max_iterations 终止循环
-    script = [[ToolCall(id="t1", name="echo", arguments={"text": "x"})]] * 10
-    loop, _ = make_loop(script, tools=[EchoTool()], max_iterations=2)
-    events, _ = run_all(loop)
-
-    assert event_types(events).count("turn_start") == 2
+def test_unlimited_loop_can_be_stopped():
+    script = [[ToolCall(id="t1", name="echo", arguments={"text": "x"})]] * 200
+    loop, _ = make_loop(script, tools=[EchoTool()])
+    for event in loop.run([]):
+        if event.type == "turn_end" and loop.outcome["rounds"] == 125:
+            loop.abort()
+    assert loop.outcome == {"reason": "aborted", "rounds": 125}
     assert loop.state == AgentState.FINISHED
 
 

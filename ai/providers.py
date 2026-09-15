@@ -97,6 +97,38 @@ class OpenAIProvider(LLMProvider):
         # 最近一次调用的真实 usage（anchor），供上下文计量锚定；None 表示尚未拿到
         self.last_usage: dict | None = None
 
+    @staticmethod
+    def _chat_messages(messages: list[dict]) -> list[dict]:
+        """Chat Completions tool results are text; images belong in user content.
+
+        Keep the whole tool-result batch adjacent to its calls before attaching
+        images. Normalize at the wire boundary so old sessions recover too,
+        without rewriting their stored messages or losing image data.
+        """
+        result = []
+        attachments = []
+        for message in messages:
+            if message.get("role") != "tool" and attachments:
+                result.append({"role": "user", "content": attachments})
+                attachments = []
+            content = message.get("content")
+            if message.get("role") == "tool" and isinstance(content, list):
+                texts = []
+                for block in content:
+                    if block.get("type") == "image_url":
+                        attachments.extend([
+                            {"type": "text", "text": f"Image returned by tool call {message.get('tool_call_id', '')}:"},
+                            block,
+                        ])
+                        texts.append("[Image attached after the tool results.]")
+                    elif block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+                message = {**message, "content": "\n".join(texts)}
+            result.append(message)
+        if attachments:
+            result.append({"role": "user", "content": attachments})
+        return result
+
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
@@ -109,7 +141,7 @@ class OpenAIProvider(LLMProvider):
         try:
             response = self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=self._chat_messages(messages),
                 tools=[t.to_schema() for t in tools],
                 stream=True,
                 stream_options={"include_usage": True},
