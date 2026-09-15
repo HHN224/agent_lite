@@ -39,7 +39,7 @@ def test_tui_sends_message_and_resets_busy():
                 if isinstance(w, Markdown):
                     parts.append(str(getattr(w, "_markdown", "")))
                 elif isinstance(w, Static):
-                    parts.append(str(w.render()))
+                    parts.append(str(getattr(w.content, "markup", w.render())))
             joined = "".join(parts)
             assert "问题一" in joined
             assert "回复1" in joined

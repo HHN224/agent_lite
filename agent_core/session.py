@@ -131,6 +131,7 @@ class Session:
         token_count: int = 0,
         usage: int = 0,
         new_usage: int = 0,
+        runtime_status: dict | None = None,
     ):
         self.session_id = session_id
         self.name = name
@@ -146,6 +147,8 @@ class Session:
         #   new_usage  = 上次合并后、新增内容的估算 token（过程变量，每轮归零）
         self.usage = usage
         self.new_usage = new_usage
+        # Diagnostic metadata only; never inserted into the model conversation.
+        self.runtime_status = dict(runtime_status or {})
         self._token_estimate = None  # 由 SessionManager 注入：Callable[[SessionEntry], int]
 
     # ------------------------------------------------------------------ #
@@ -375,6 +378,7 @@ class Session:
             "token_count": self.token_count,
             "usage": self.usage,
             "new_usage": self.new_usage,
+            "runtime_status": self.runtime_status,
             "head_id": self.head_id,
             "next_id": self.next_id,
             "entries": [e.to_dict() for e in self.entries.values()],
@@ -398,6 +402,7 @@ class Session:
             token_count=d.get("token_count", 0),
             usage=d.get("usage", 0),
             new_usage=d.get("new_usage", 0),
+            runtime_status=d.get("runtime_status"),
         )
 
 

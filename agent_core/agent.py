@@ -1,3 +1,5 @@
+import time
+
 from .content import image_block, text_block
 from .events import AgentEvent
 from .states import AgentState
@@ -137,6 +139,19 @@ class Agent:
         self.session.new_usage = sum(meter.estimate_message(m) for m in messages)
 
     def prompt(self, user_input: str, images: list[dict] | None = None):
+        """Run a prompt and retain failure diagnostics, including preparation errors."""
+        started_at = time.time()
+        try:
+            yield from self._prompt(user_input, images)
+        except Exception as exc:
+            self.loop.state = AgentState.ERROR
+            self.session.runtime_status.update(reason="error", code=type(exc).__name__,
+                                               message=str(exc), started_at=started_at,
+                                               ended_at=time.time())
+            self._save()
+            raise
+
+    def _prompt(self, user_input: str, images: list[dict] | None = None):
         """追加一条用户消息并驱动循环，生成器 yield AgentEvent，结束后自动存档。
 
         images 可选：传入结构块列表（如 image_block(...)），则本轮 user 消息的
@@ -189,9 +204,31 @@ class Agent:
         # 让 loop 在轮间查询 agent 的 steer 队列（运行中插话）
         self.loop.get_steering_messages = self._dequeue_steer
 
-        yield AgentEvent("agent_start")
+        recorded = prior - 1
+        session.runtime_status = {"reason": "running", "started_at": time.time(), "rounds": 0}
         try:
-            final_text = yield from self.loop.run(payload)
+            # Save the input before contacting the service; checkpoint completed
+            # turns so an interrupted process does not lose a long task's work.
+            session.record_turn(payload[recorded:])
+            recorded = len(payload)
+            self._save()
+            yield AgentEvent("agent_start")
+            stream = self.loop.run(payload)
+            while True:
+                try:
+                    event = next(stream)
+                except StopIteration as end:
+                    final_text = end.value
+                    break
+                if event.type in ("response_incomplete", "retry", "error"):
+                    session.runtime_status["last_error"] = dict(event.data)
+                if event.type == "turn_end":
+                    session.record_turn(payload[recorded:])
+                    recorded = len(payload)
+                    session.runtime_status.update(self.loop.outcome)
+                    self._save()
+                yield event
+            session.runtime_status.update(self.loop.outcome)
         finally:
             # 本轮 loop 追加到 payload 尾部的消息 = 输出侧新增（assistant 回复 / 工具结果）
             produced = payload[prior:]
@@ -207,9 +244,10 @@ class Agent:
             # new_usage 重置为输出侧新增（避免与已校准进 usage 的输入重复计数）
             self._set_new_usage(produced)
             # record_turn 会把本轮新消息追加进历史（含 user 输入），并 touch + bump token_count
-            session.record_turn(payload[prior - 1:])
+            session.record_turn(payload[recorded:])
+            session.runtime_status["ended_at"] = time.time()
             self._save()
-        yield AgentEvent("agent_end", {"text": final_text})
+        yield AgentEvent("agent_end", {"text": final_text, **self.loop.outcome})
 
         # 处理 follow-up 队列：跑完自动接力执行后置指令
         while self.follow_up_queue:
