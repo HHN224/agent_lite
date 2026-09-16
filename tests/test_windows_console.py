@@ -36,17 +36,21 @@ async def run():
     driver.start_application_mode()
     try:
         for _ in range(100):
-            driver.write("\x1b[2J\x1b[H\x1b[3;5H\x1b[6n\x1b[9;12H")
+            driver.write("\x1b[2J\x1b[H\x1b[3;5H\x1b[")
+            driver.write("6n\x1b[9;12H")
         driver._writer_thread.stop()
-        records = (win32.INPUT_RECORD * 5)()
-        for index, char in enumerate("draft"):
-            record = records[index]
-            record.EventType = 1
-            record.Event.KeyEvent.bKeyDown = 1
-            record.Event.KeyEvent.wRepeatCount = 1
-            record.Event.KeyEvent.uChar.UnicodeChar = char
-        written = wintypes.DWORD()
-        assert k.WriteConsoleInputW(wintypes.HANDLE(input_handle), byref(records), 5, byref(written))
+        # Real console records, fragmented across parser timeout boundaries.
+        for piece in ["\x1b[>", "5u", "\x1b[?1;2c", "\x1b]10;", "rgb:ffff/ffff/ffff\x1b\\", "draft"]:
+            records = (win32.INPUT_RECORD * len(piece))()
+            for index, char in enumerate(piece):
+                record = records[index]
+                record.EventType = 1
+                record.Event.KeyEvent.bKeyDown = 1
+                record.Event.KeyEvent.wRepeatCount = 1
+                record.Event.KeyEvent.uChar.UnicodeChar = char
+            written = wintypes.DWORD()
+            assert k.WriteConsoleInputW(wintypes.HANDLE(input_handle), byref(records), len(piece), byref(written))
+            await asyncio.sleep(0.15)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             if len([e for e in received if isinstance(e, events.Key)]) >= 5:

@@ -7,6 +7,7 @@ from .providers import (
     TextDelta,
     ThinkingDelta,
     ToolCall,
+    ToolCallProgress,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "TextDelta",
     "ThinkingDelta",
     "ToolCall",
+    "ToolCallProgress",
 ]

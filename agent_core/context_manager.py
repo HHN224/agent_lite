@@ -24,7 +24,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from .content import content_length
+from .content import IMAGE_CHAR_EQUIVALENT, content_to_llm, content_to_text
 
 
 # --------------------------------------------------------------------------- #
@@ -41,11 +41,12 @@ def _estimate_message(message: dict, estimate_text) -> int:
     """估算一条发给模型的消息 dict 的 token 数：content + tool_calls + 结构开销。
 
     content 可能是纯字符串，也可能是结构块列表（text/image_url/tool_result/thinking）。
-    对列表用 content_length（图片按固定当量）；对字符串用 charset 估算。
+    按实际发送的内容估算文本 token，排除展示用 thinking；图片按固定当量。
     """
-    content = message.get("content")
+    content = content_to_llm(message.get("content"))
     if isinstance(content, list):
-        total = content_length(content)
+        total = estimate_text(content_to_text(content))
+        total += sum(IMAGE_CHAR_EQUIVALENT // 4 for block in content if block.get("type") == "image_url")
     else:
         total = estimate_text(content or "")
     if message.get("tool_calls"):

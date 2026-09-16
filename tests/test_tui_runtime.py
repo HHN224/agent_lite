@@ -53,14 +53,16 @@ def test_thinking_is_visible_and_survives_answer_and_history_reload():
     asyncio.run(run())
 
 
-def test_tool_round_limit_is_explained_in_transcript():
+def test_running_status_shows_round_without_limit():
     async def run():
         app = tui.AgentApp(make_agent(None))
         async with app.run_test() as pilot:
             await app._task
-            app._render_event(AgentEvent("agent_end", {"text": "\n(已达到最大工具调用轮数，停止循环)"}))
+            app._busy = True
+            app._round = 125
+            app._update_status()
             await pilot.pause()
-            assert "最大工具调用轮数" in visible_text(app)
+            assert "第125轮" in visible_text(app)
     asyncio.run(run())
 
 

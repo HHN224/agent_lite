@@ -55,7 +55,15 @@ class ToolCall:
     arguments: dict
 
 
-StreamEvent = Union[TextDelta, ThinkingDelta, ToolCall]
+@dataclass
+class ToolCallProgress:
+    """An incomplete call: progress only, never executable arguments."""
+
+    name: str
+    characters: int
+
+
+StreamEvent = Union[TextDelta, ThinkingDelta, ToolCall, ToolCallProgress]
 
 
 class LLMProvider(ABC):
@@ -69,7 +77,7 @@ class LLMProvider(ABC):
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
-        """以流式方式请求模型，依次产出 TextDelta / ThinkingDelta / ToolCall 事件。"""
+        """产出文本、推理、工具参数进度和完整工具调用事件。"""
         raise NotImplementedError
 
 
@@ -89,6 +97,38 @@ class OpenAIProvider(LLMProvider):
         # 最近一次调用的真实 usage（anchor），供上下文计量锚定；None 表示尚未拿到
         self.last_usage: dict | None = None
 
+    @staticmethod
+    def _chat_messages(messages: list[dict]) -> list[dict]:
+        """Chat Completions tool results are text; images belong in user content.
+
+        Keep the whole tool-result batch adjacent to its calls before attaching
+        images. Normalize at the wire boundary so old sessions recover too,
+        without rewriting their stored messages or losing image data.
+        """
+        result = []
+        attachments = []
+        for message in messages:
+            if message.get("role") != "tool" and attachments:
+                result.append({"role": "user", "content": attachments})
+                attachments = []
+            content = message.get("content")
+            if message.get("role") == "tool" and isinstance(content, list):
+                texts = []
+                for block in content:
+                    if block.get("type") == "image_url":
+                        attachments.extend([
+                            {"type": "text", "text": f"Image returned by tool call {message.get('tool_call_id', '')}:"},
+                            block,
+                        ])
+                        texts.append("[Image attached after the tool results.]")
+                    elif block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+                message = {**message, "content": "\n".join(texts)}
+            result.append(message)
+        if attachments:
+            result.append({"role": "user", "content": attachments})
+        return result
+
     def stream(
         self, messages: list[dict], tools: list[Tool], model: str
     ) -> Iterator[StreamEvent]:
@@ -101,7 +141,7 @@ class OpenAIProvider(LLMProvider):
         try:
             response = self.client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=self._chat_messages(messages),
                 tools=[t.to_schema() for t in tools],
                 stream=True,
                 stream_options={"include_usage": True},
@@ -125,7 +165,19 @@ class OpenAIProvider(LLMProvider):
                     continue
 
                 # thinking / reasoning 增量（DeepSeek 等）
-                thinking = getattr(delta, "reasoning_content", None) or getattr(delta, "thinking", None)
+                thinking = (getattr(delta, "reasoning_content", None)
+                            or getattr(delta, "thinking", None)
+                            or getattr(delta, "reasoning", None))
+                if not thinking:
+                    # Some GOAT routes only expose structured reasoning. Do not
+                    # duplicate it when the plain-text field is also present,
+                    # and never display encrypted/signature blocks.
+                    details = getattr(delta, "reasoning_details", None) or []
+                    thinking = "".join(
+                        part.get("text", "") for part in details
+                        if isinstance(part, dict) and part.get("type") == "reasoning.text"
+                        and isinstance(part.get("text"), str)
+                    )
                 if thinking:
                     yield ThinkingDelta(thinking)
 
@@ -140,6 +192,10 @@ class OpenAIProvider(LLMProvider):
                         acc["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
                         acc["args"] += tc.function.arguments
+                    # Yield while arguments are assembling: the caller can
+                    # update progress and observe abort before a huge file's
+                    # JSON has finished streaming. No partial call may execute.
+                    yield ToolCallProgress(acc["name"], len(acc["args"]))
 
             # 流成功结束：把最近一次真实 usage 记录为锚点
             self.last_usage = usage

@@ -55,14 +55,14 @@ python -m pip install -e ".[tui]"
 
 ### 2. 配置模型密钥
 
-复制仓库根目录的 `.env.example` 为 `.env`，将其中的 `DEEPSEEK_API_KEY` 值替换为自己的密钥。程序会加载项目根目录的 `.env`，并尝试加载当前目录的环境配置；已设置的环境变量不会被覆盖。
+复制仓库根目录的 `.env.example` 为 `.env`，填写 `CMD_API_KEY`。程序会加载项目根目录的 `.env`，并尝试加载当前目录的环境配置；已设置的环境变量不会被覆盖。
 
-`.env` 和 `sessions/` 已加入 `.gitignore`。默认使用 `DEEPSEEK_API_KEY`；通过 `--provider commandcode` 接入 Command Code 时使用 `CMD_API_KEY`，不需要 DeepSeek 官方密钥。
+`.env` 和 `sessions/` 已加入 `.gitignore`。默认使用 Command Code 和 `CMD_API_KEY`，不需要 DeepSeek 官方密钥。使用 `--provider deepseek` 时读取 `DEEPSEEK_API_KEY`。
 
 **Command Code GOAT 套餐：** 在 [Studio](https://commandcode.ai/settings/keys) 创建 API key，将 `CMD_API_KEY=你的密钥` 加到本地 `.env`，然后运行：
 
 ```powershell
-python -m coding_agent --provider commandcode --bypass --sandbox wsl
+agent-lite --bypass --sandbox wsl
 ```
 
 默认端点为 `https://api.commandcode.ai/provider/v1`，模型为 `deepseek/deepseek-v4.1-flash`。官方说明 [GOAT 支持 API 调用并计入套餐额度](https://commandcode.ai/docs/plans/goat#api-support)；模型仍受套餐可用范围限制。本适配器使用 [Chat Completions 协议](https://commandcode.ai/docs/provider)，支持文本、图片、思考流、工具调用和 usage；Claude 的 Anthropic Messages 协议暂未接入。对话和上下文压缩使用同一个 provider，不会回退到 DeepSeek 官方 API。
@@ -89,7 +89,7 @@ agent-lite --ui cli
 agent-lite --ui cli --new --name "代码阅读" --workspace .
 ```
 
-启动时会显示会话 ID、存档位置、工作目录和实际命令后端。默认使用 DeepSeek V4.1 Flash，API 模型标识为 `deepseek-flash`，支持图片输入（见 [DeepSeek 官方说明](https://api-docs.deepseek.com/zh-cn/news/news260910/)）。对话和上下文压缩摘要均使用该模型，也可使用 `--model` 指定其他模型。
+启动时会显示会话 ID、存档位置、工作目录和实际命令后端。默认通过 Command Code 使用 `deepseek/deepseek-v4.1-flash`。对话和上下文压缩摘要使用同一 provider 和模型，也可使用 `--model` 指定其他模型。
 
 ## 界面与会话命令
 
@@ -113,7 +113,9 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 
 任务模式只改变提示词，**不会改变工具权限**。例如 `plan` 不是强制只读模式；需要拒绝写入和命令执行时，请使用 `--permission-policy deny`。
 
-TUI 显示模型思考文本，并在状态栏标记当前阶段、耗时和调用轮数。默认每次任务最多 100 轮模型调用，达到上限会明确提示；用 `--max-iterations 200` 可调整。Esc 在下一安全检查点停止，无法强制打断已进入的同步网络读取或外部工具。恢复会话时也显示已保存的思考文本。
+TUI 显示模型思考文本，并在状态栏标记当前阶段、耗时和调用轮数。任务没有最大轮数限制；完成、用户停止或不可恢复错误时结束。自动上下文压缩也会在工具轮次之间检查。Esc 在下一安全检查点停止，无法强制打断已进入的同步网络读取或外部工具。恢复会话时也显示已保存的思考文本。
+
+Windows 输入解析会区分终端能力回复与用户按键，并处理跨批次到达的控制序列。shell 工具为非交互命令，标准输入关闭，Windows 子进程不共享 TUI 控制台。`write` 自动创建工作目录内缺失的父目录。图片工具结果在发送 API 时转换成配套的用户图片消息，保留工具调用配对和原始会话存档。
 
 会话保存于项目根目录的 `sessions/<id>.json`，默认恢复最近更新的会话。`--session` 接受已有 ID（1–64 位字母或数字），不是展示名，且优先于 `--new`；可先用 `/sessions` 查看 ID，再重新启动恢复。
 
@@ -124,8 +126,7 @@ TUI 显示模型思考文本，并在状态栏标记当前阶段、耗时和调�
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--ui` | `tui` | `tui` 或 `cli`；缺少 Textual 时回退 CLI |
-| `--provider` | `deepseek` | `deepseek` / `commandcode`（GOAT） |
-| `--max-iterations` | `100` | 每次任务的模型调用轮数上限，必须大于 0 |
+| `--provider` | `commandcode` | `commandcode`（GOAT）/ `deepseek` |
 | `--workspace` | 当前目录 | 文件工具的默认根目录和命令工作目录 |
 | `--session` | 空 | 恢复指定会话 ID；也可由进程环境变量 `AGENT_SESSION` 指定 |
 | `--new` | 关闭 | 不恢复最近历史，新建会话 |

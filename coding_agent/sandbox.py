@@ -12,6 +12,7 @@ CommandRunner 是接缝抽象：把「跑一条命令」与具体后端解耦。
 BashTool 注入一个 runner；runner 自己决定怎么隔离（以及是否隔离）。
 """
 
+import os
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -19,6 +20,13 @@ from pathlib import Path
 from agent_core import ToolResult
 
 DEFAULT_BASH_IMAGE = "python:3.12-slim"
+
+
+def _run_command(*args, **kwargs):
+    """Unattended tools must not read draft keys or share the TUI console."""
+    return subprocess.run(*args, stdin=subprocess.DEVNULL,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                          **kwargs)
 
 
 class SandboxUnavailableError(Exception):
@@ -124,7 +132,7 @@ class HostRunner(CommandRunner):
 
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
         t = self.timeout if timeout is None else timeout
-        proc = subprocess.run(
+        proc = _run_command(
             command,
             cwd=self.workspace,
             capture_output=True,
@@ -173,7 +181,7 @@ class WslRunner(CommandRunner):
             "--chdir", "/workspace",
             "sh", "-lc", command,
         ]
-        proc = subprocess.run(
+        proc = _run_command(
             args,
             capture_output=True,
             timeout=t,
@@ -218,7 +226,7 @@ class DockerRunner(CommandRunner):
             self.image,
             "sh", "-lc", command,
         ]
-        proc = subprocess.run(
+        proc = _run_command(
             args,
             capture_output=True,
             timeout=t,
@@ -235,7 +243,7 @@ class DockerRunner(CommandRunner):
 def _docker_available(timeout: int = 5) -> bool:
     """Docker daemon 是否可用（`docker version` 的 Server 段需要 daemon 响应）。"""
     try:
-        proc = subprocess.run(
+        proc = _run_command(
             ["docker", "version", "--format", "{{.Server.Version}}"],
             capture_output=True,
             timeout=timeout,
@@ -248,7 +256,7 @@ def _docker_available(timeout: int = 5) -> bool:
 def _wsl_available(timeout: int = 10) -> bool:
     """默认 WSL 发行版是否可用且已经安装 Bubblewrap。"""
     try:
-        proc = subprocess.run(
+        proc = _run_command(
             ["wsl", "-e", "sh", "-lc", "command -v bwrap >/dev/null 2>&1"],
             capture_output=True,
             timeout=timeout,

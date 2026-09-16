@@ -103,7 +103,7 @@ class WriteTool(AgentTool):
 
         super().__init__(
             name="write",
-            description="Write content to a text file",
+            description="Write content to a text file, creating missing parent directories",
             parameters={
                 "type": "object",
                 "properties": {
@@ -125,6 +125,7 @@ class WriteTool(AgentTool):
 
     def execute(self, path: str, content: str) -> ToolResult:
         file = safe_path(self.workspace, path)
+        file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text(content, encoding="utf-8")
         return ToolResult(content=f"Successfully wrote to {path}")
 
