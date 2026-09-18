@@ -326,6 +326,29 @@ def test_resume_and_older_keep_history_order_and_new_session_separate(tmp_path):
     asyncio.run(run())
 
 
+def test_session_switch_keeps_tool_output_spill_inside_the_workspace(tmp_path):
+    """切会话后重新接线 truncator：写盘位置必须仍与文件工具的 workspace 一致。"""
+    from pathlib import Path
+    from agent_core import SessionRepository
+    from coding_agent.tools import ReadTool
+
+    async def run():
+        agent = make_agent(None)
+        agent.loop.tools = [ReadTool(tmp_path)]
+        agent.repo = SessionRepository(tmp_path / "sessions")
+        app = AgentApp(agent, workspace=str(tmp_path))
+        async with app.run_test() as pilot:
+            app._handle_command("/new")
+            await asyncio.wait_for(app._task, 3)
+            await pilot.pause()
+            store = agent.loop.truncator.store
+            assert store is not None
+            assert Path(store.base_dir).resolve().is_relative_to(tmp_path.resolve())
+            assert store.workspace == tmp_path.resolve()
+            assert agent.loop.session_id == agent.session.session_id
+    asyncio.run(run())
+
+
 def test_long_reply_keeps_composer_inside_terminal():
     class Provider:
         def stream(self, *args):

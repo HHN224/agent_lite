@@ -1003,6 +1003,18 @@ class AgentApp(App):
         await asyncio.to_thread(repo.save, session)
         await self._select_session(session)
 
+    def _agent_workspace(self) -> Path:
+        """工作目录的单一真相源：优先用文件工具实际持有的 workspace。
+
+        写盘位置必须与 read 的 safe_path 边界完全一致（同一个 workspace），
+        否则模型又会拿到一个自己打不开的路径。工具就绪前退回启动时的工作目录。
+        """
+        for tool in getattr(self.agent.loop, "tools", None) or []:
+            workspace = getattr(tool, "workspace", None)
+            if workspace is not None:
+                return Path(workspace).resolve()
+        return Path(self._workspace).resolve()
+
     async def _select_session(self, session):
         from agent_core import ToolOutputTruncator, ToolResultStore, workspace_state_dir
         self.agent.session = session
@@ -1010,10 +1022,9 @@ class AgentApp(App):
         self.agent.loop.session_id = session.session_id
         # 工具全文写盘必须落在工作目录内（read 的 safe_path 只认工作目录内的路径），
         # 否则模型拿到的「全文路径」是一张它打不开的空头支票。
+        workspace = self._agent_workspace()
         self.agent.loop.truncator = ToolOutputTruncator(
-            store=ToolResultStore(
-                workspace_state_dir(self.workspace), workspace=self.workspace
-            )
+            store=ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
         )
         await self._show_session()
 
