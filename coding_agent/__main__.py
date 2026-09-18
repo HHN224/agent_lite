@@ -284,6 +284,8 @@ def build_agent(args, api_key):
             sandbox=args.sandbox,
             workspace=args.workspace,
             bash_image=args.bash_image,
+            # 会话存档（含全部对话与工具输出）也掩蔽掉：它通常就在工作区内
+            mask=[SESSIONS_DIR],
         )
 
     if args.ui == "tui" and _HAS_TUI:

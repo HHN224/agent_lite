@@ -156,6 +156,111 @@ def test_docker_runner_failure_backfilled_with_exit_code(tmp_path, monkeypatch):
     assert "exit code 5" in result.content
 
 
+# ---------- 秘密掩蔽（内核级，不依赖用户点 yes）----------
+
+def _workspace_with_secrets(tmp_path):
+    (tmp_path / ".env").write_text("CMD_API_KEY=secret\n", encoding="utf-8")
+    (tmp_path / "cert.pem").write_text("-----BEGIN KEY-----\n", encoding="utf-8")
+    (tmp_path / "app.py").write_text("print(1)\n", encoding="utf-8")
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "abc.json").write_text("{}", encoding="utf-8")
+    (tmp_path / ".ssh").mkdir()
+    return tmp_path
+
+
+def _capture_run(monkeypatch):
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+
+        class P:
+            returncode = 0
+            stdout = b"ok"
+            stderr = b""
+
+        return P()
+    monkeypatch.setattr("coding_agent.sandbox.subprocess.run", fake_run)
+    return captured
+
+
+def _has_ro_null(args, dest: str) -> bool:
+    """存在 `--ro-bind /dev/null <dest>`（把文件掩蔽成空内容）。"""
+    return any(args[i] == "--ro-bind" and args[i + 1] == "/dev/null" and args[i + 2] == dest
+               for i in range(len(args) - 2))
+
+
+def _has_tmpfs(args, dest: str) -> bool:
+    """存在 `--tmpfs <dest>`（把目录掩蔽成空目录）。"""
+    return any(args[i] == "--tmpfs" and args[i + 1] == dest for i in range(len(args) - 1))
+
+
+def test_wsl_runner_masks_secrets_and_session_archive(tmp_path, monkeypatch):
+    workspace = _workspace_with_secrets(tmp_path)
+    captured = _capture_run(monkeypatch)
+    runner = WslRunner(workspace, mask=[workspace / "sessions"])
+    runner.run("cat .env")
+
+    args = captured["args"]
+    # 文件：/dev/null 覆盖（读到空内容）
+    assert _has_ro_null(args, "/workspace/.env")
+    assert _has_ro_null(args, "/workspace/cert.pem")
+    # 目录：空 tmpfs（看到空目录，写入不落盘）
+    assert _has_tmpfs(args, "/workspace/sessions")
+    assert _has_tmpfs(args, "/workspace/.ssh")
+    # 普通源码不受影响
+    assert not _has_ro_null(args, "/workspace/app.py")
+    # 依赖目录进 PYTHONPATH（受控取件的落地点）
+    assert "/workspace/.agent-lite/deps/python" in args
+
+
+def test_wsl_masking_can_be_disabled_by_absence(tmp_path, monkeypatch):
+    """没有敏感文件时不应凭空多出掩蔽参数。"""
+    (tmp_path / "app.py").write_text("x", encoding="utf-8")
+    captured = _capture_run(monkeypatch)
+    WslRunner(tmp_path).run("ls")
+    args = captured["args"]
+    assert "/dev/null" not in args
+    assert args.count("--tmpfs") == 5  # 只有 /mnt /home /root /run /tmp 五个基础 tmpfs
+
+
+def test_mask_ignores_paths_outside_the_workspace(tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    captured = _capture_run(monkeypatch)
+    WslRunner(workspace, mask=[outside]).run("ls")
+    assert "/dev/null" not in captured["args"]
+
+
+def test_docker_runner_masks_secrets(tmp_path, monkeypatch):
+    workspace = _workspace_with_secrets(tmp_path)
+    captured = _capture_run(monkeypatch)
+    DockerRunner(workspace, mask=[workspace / "sessions"]).run("cat .env")
+
+    args = captured["args"]
+    assert "type=bind,source=/dev/null,target=/workspace/.env,readonly" in args
+    assert _has_tmpfs(args, "/workspace/sessions")
+    assert "PYTHONPATH=/workspace/.agent-lite/deps/python" in args
+
+
+def test_host_runner_is_honest_about_not_masking(tmp_path):
+    runner = HostRunner(tmp_path)
+    assert runner.masks_secrets is False
+    assert "掩蔽在本档**不生效**" in runner.describe()
+
+
+def test_detect_backend_passes_mask_through(tmp_path, monkeypatch):
+    workspace = _workspace_with_secrets(tmp_path)
+    monkeypatch.setattr("coding_agent.sandbox._wsl_available", lambda: True)
+    monkeypatch.setattr("coding_agent.sandbox._docker_available", lambda: False)
+    runner = detect_backend("auto", workspace=workspace, mask=[workspace / "sessions"])
+    assert isinstance(runner, WslRunner)
+    assert ("sessions", "dir") in runner.masked_entries()
+    assert (".env", "file") in runner.masked_entries()
+
+
 # ---------- detect_backend 探测顺序 ----------
 
 def test_detect_backend_prefers_docker_when_available(monkeypatch):
