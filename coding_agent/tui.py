@@ -1348,6 +1348,14 @@ class AgentApp(App):
             self._add_notice("正在整理较早的对话记录…", "info")
         elif t == "compaction_skip":
             self._add_notice(f"跳过压缩：{event.data.get('reason') or '没有可折叠的内容'}", "warn")
+        elif t == "compaction_paused":
+            d = event.data
+            if d.get("disabled"):
+                self._add_notice(
+                    f"⚠ 压缩已停手：{d.get('reason')}\n"
+                    "任务不受影响，只是上下文会继续增长；需要时可用 /compact 手动再试。", "warn")
+            else:
+                self._add_notice(f"压缩暂时跳过：{d.get('reason')}", "warn")
         elif t == "compaction_end":
             d = event.data
             if d.get("success"):

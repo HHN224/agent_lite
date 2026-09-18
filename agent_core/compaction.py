@@ -277,9 +277,16 @@ def make_summarizer(
 class CompactionEngine:
     """真正的压缩动作：选切点 + 保留尾部 + 独立摘要 + 落地 compaction。
 
-    summarizer   可注入的摘要函数：callable(region_messages, system_prompt) -> str
+    summarizer   可注入的摘要函数：callable(region_messages) -> str
     retain_ratio 保留尾部的窗口占比（默认 0.16，DSH）
     meter        用于估算切点 token 的量计器（复用 TokenMeter）
+
+    失败退避（真实事故的直接教训，见 sessions/3dcba68b1cfb）：
+    压缩失败时计量**必须保留**（否则该压的不再压），但这会带来一个新问题 ——
+    needs_compaction 一直为真，于是每个工具轮次都再发一次摘要请求。实测一次任务里
+    摘要调用被重试了 7 次，而每次最长要等 60s 超时，用户看到的就是「任务被卡住」。
+    所以失败之后必须有退避：上下文再增长若干条消息前不重试；连续失败到上限就**彻底停手**
+    —— 压不动就别压了，绝不能让压缩把主任务拖死。
     """
 
     def __init__(
@@ -288,11 +295,71 @@ class CompactionEngine:
         retain_ratio: float = 0.16,
         min_keep_entries: int = 2,
         meter: TokenMeter | None = None,
+        failure_backoff_messages: int = 20,
+        max_consecutive_failures: int = 3,
+        fallback: str = "digest",
     ):
         self.summarizer = summarizer
         self.retain_ratio = retain_ratio
         self.min_keep_entries = min_keep_entries
         self.meter = meter or TokenMeter()
+        self.failure_backoff_messages = failure_backoff_messages
+        self.max_consecutive_failures = max_consecutive_failures
+        self.fallback = fallback  # "digest"：模型摘要彻底失败后机械兜底；"none"：只拒绝
+        self._reset_failure_state()
+
+    # --- 失败退避状态 ---
+    def _reset_failure_state(self):
+        self._consecutive_failures = 0
+        self._last_failure_reason = ""
+        self._retry_after_messages = 0
+        self._disabled_reason = ""
+        self._pause_announced = False
+        self._session_id = None
+
+    def _sync_session(self, session):
+        """换会话就重置退避状态：上一个会话的连续失败不该污染新会话。"""
+        if getattr(session, "session_id", None) != self._session_id:
+            self._reset_failure_state()
+            self._session_id = getattr(session, "session_id", None)
+
+    def paused_reason(self, session) -> str:
+        """现在是否处于「压不动，先别试」的状态；返回原因，空串表示可以尝试。"""
+        self._sync_session(session)
+        if self._disabled_reason:
+            return self._disabled_reason
+        if self._consecutive_failures and session.message_count < self._retry_after_messages:
+            remaining = self._retry_after_messages - session.message_count
+            return (f"上次压缩失败（{self._last_failure_reason}），"
+                    f"退避中：再增长约 {remaining} 条消息后重试")
+        return ""
+
+    def _note_failure(self, session, reason: str):
+        self._consecutive_failures += 1
+        self._last_failure_reason = reason
+        self._retry_after_messages = session.message_count + self.failure_backoff_messages
+        self._pause_announced = False  # 新的退避窗口，允许再播报一次
+        if self._consecutive_failures >= self.max_consecutive_failures:
+            self._disabled_reason = (
+                f"压缩连续失败 {self._consecutive_failures} 次（最后原因：{reason}），"
+                "已停止自动压缩"
+            )
+        session.runtime_status["compaction"] = {
+            "consecutive_failures": self._consecutive_failures,
+            "last_failure": reason,
+            "retry_after_messages": self._retry_after_messages,
+            "disabled": bool(self._disabled_reason),
+        }
+
+    def _note_success(self, session):
+        self._consecutive_failures = 0
+        self._last_failure_reason = ""
+        self._retry_after_messages = 0
+        self._disabled_reason = ""
+        self._pause_announced = False
+        session.runtime_status["compaction"] = {
+            "consecutive_failures": 0, "last_failure": "", "disabled": False,
+        }
 
     # --- 切点：工具配对平衡 + 保留尾部 ---
     def find_cut(self, session, context_window: int) -> tuple[int, str] | None:
@@ -415,10 +482,25 @@ class CompactionEngine:
     def compact_if_needed(self, session, context_window: int):
         """若到阈值则压缩，yield 事件，return CompactionResult；否则 return None。
 
-        这是生成器：把「正在压缩 / 压缩完成（含失败原因）」以事件形式发射给消费者，
+        这是生成器：把「正在压缩 / 压缩完成（含失败原因）/ 退避中」以事件形式发射给消费者，
         压缩动作本身由 compact_now 同步完成（MVP 不流式播报摘要）。
         失败时 result.success=False 且 reason 会随事件带给 UI，绝不静默。
+
+        退避：上次失败后、上下文还没长够之前不重试（否则每个工具轮次都发一次摘要请求，
+        任务会被拖死）；连续失败到上限后彻底停手。退避只在**状态刚变化时**播报一次，
+        避免每个轮次刷一条重复提示。
         """
+        paused = self.paused_reason(session)
+        if paused:
+            if not self._pause_announced:
+                self._pause_announced = True
+                yield AgentEvent("compaction_paused", {
+                    "reason": paused,
+                    "consecutive_failures": self._consecutive_failures,
+                    "disabled": bool(self._disabled_reason),
+                })
+            return None
+
         cut = self.find_cut(session, context_window)
         if cut is None:
             yield AgentEvent("compaction_skip", {
@@ -426,8 +508,13 @@ class CompactionEngine:
                           "or no safe tool-pairing boundary",
             })
             return None
+
         yield AgentEvent("compaction_start", {"compacted_count": cut[0]})
         result = self.compact_now(session, context_window, cut=cut)
+        if result.success:
+            self._note_success(session)
+        else:
+            self._note_failure(session, result.reason or "unknown")
         yield AgentEvent("compaction_end", {
             "success": result.success,
             "reason": result.reason,
@@ -435,5 +522,7 @@ class CompactionEngine:
             "folded_messages": result.folded_messages,
             "summary_chars": result.summary_chars,
             "first_kept_entry_id": result.first_kept_entry_id,
+            "consecutive_failures": self._consecutive_failures,
+            "disabled": bool(self._disabled_reason),
         })
         return result

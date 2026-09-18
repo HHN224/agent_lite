@@ -368,6 +368,10 @@ def test_tui_reports_compaction_failure_and_skip():
                 "compacted_count": 0, "folded_messages": 0, "summary_chars": 0,
             }))
             app._put_event(AgentEvent("compaction_skip", {"reason": "nothing to fold"}))
+            app._put_event(AgentEvent("compaction_paused", {
+                "reason": "压缩连续失败 3 次（最后原因：Request timed out.），已停止自动压缩",
+                "consecutive_failures": 3, "disabled": True,
+            }))
             app._put_event(AgentEvent("compaction_end", {
                 "success": True, "reason": "", "compacted_count": 12,
                 "folded_messages": 12, "summary_chars": 900, "first_kept_entry_id": "e9",
@@ -378,6 +382,8 @@ def test_tui_reports_compaction_failure_and_skip():
             text = notice_text(app)
             assert "压缩未生效" in text and "too short" in text
             assert "跳过压缩" in text and "nothing to fold" in text
+            # 压缩彻底失败时要有明确的停手提示，而不是每轮刷屏
+            assert "压缩已停手" in text and "Request timed out." in text
             assert "压缩完成，折叠 12 条消息" in text
     asyncio.run(run())
 

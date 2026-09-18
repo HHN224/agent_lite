@@ -17,9 +17,10 @@ from agent_core.compaction import (
     render_transcript,
     validate_summary,
 )
-from ai import TextDelta, ToolCall
+from ai import ProviderError, TextDelta, ToolCall
 
 from faux_provider import FauxProvider
+from test_loop import EchoTool
 
 
 # 校验要求摘要不能过短（Step C），所以假的「合法摘要」必须够长且像摘要
@@ -366,6 +367,135 @@ def make_agent(script, session_kw=None, context_window=100000, threshold=0.8, en
         compaction_engine=engine,
     )
     return agent, provider
+
+
+def test_engine_backs_off_then_stops_after_repeated_failures():
+    """连续失败到上限后彻底停手；退避期内的重复触发不再调用摘要器。"""
+    calls = []
+
+    def failing(region):
+        calls.append(1)
+        raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=2)
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    # 第一次：尝试并失败
+    list(engine.compact_if_needed(s, context_window=2000))
+    assert len(calls) == 1
+    # 紧接着再来：退避中，不该再调用摘要器
+    events = list(engine.compact_if_needed(s, context_window=2000))
+    assert len(calls) == 1
+    assert events[0].type == "compaction_paused"
+    assert "退避中" in events[0].data["reason"]
+    # 同一退避窗口只播报一次，不刷屏
+    assert list(engine.compact_if_needed(s, context_window=2000)) == []
+
+    # 上下文长够了 -> 再试一次（第二次失败）-> 达到上限后彻底停手
+    for i in range(10):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+    list(engine.compact_if_needed(s, context_window=2000))
+    assert len(calls) == 2
+
+    for i in range(50):     # 就算上下文大幅增长也不再尝试
+        s.append_message("user", f"又来了{i}" + "w" * 400)
+    events = list(engine.compact_if_needed(s, context_window=2000))
+    assert len(calls) == 2, "达到失败上限后不应再调用摘要器"
+    assert events and events[0].data["disabled"] is True
+    assert s.runtime_status["compaction"]["disabled"] is True
+
+
+def test_successful_compaction_clears_the_failure_state():
+    calls = []
+    failing = {"on": True}
+
+    def flaky(region):
+        calls.append(1)
+        if failing["on"]:
+            raise ProviderError("模型 API 错误: 503", retryable=True, code="http_503")
+        return GOOD_SUMMARY
+
+    engine = CompactionEngine(summarizer=flaky, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=3)
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))
+    assert engine.paused_reason(s)          # 失败后进入退避
+    for i in range(10):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+
+    failing["on"] = False
+    result = list(engine.compact_if_needed(s, context_window=2000))[-1]
+    assert result.data["success"] is True
+    assert engine.paused_reason(s) == ""    # 成功后清空
+    assert s.runtime_status["compaction"]["consecutive_failures"] == 0
+
+
+def test_failure_state_does_not_leak_across_sessions():
+    def failing(region):
+        raise ProviderError("boom", retryable=True, code="http_503")
+
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16)
+    a = Session(session_id="a", system_prompt="sys")
+    for i in range(40):
+        a.append_message("user", "x" * 400)
+    list(engine.compact_if_needed(a, context_window=2000))
+    assert engine.paused_reason(a)
+
+    b = Session(session_id="b", system_prompt="sys")
+    for i in range(40):
+        b.append_message("user", "y" * 400)
+    assert engine.paused_reason(b) == "", "换会话必须重置退避状态"
+
+
+def test_agent_does_not_retry_a_failing_compaction_forever():
+    """回归：压缩一直失败时不能每轮都重试（真实事故：任务被卡死）。
+
+    现场（sessions/3dcba68b1cfb）：328 条消息、0 条 compaction 落盘、last_error=APITimeoutError、
+    reason=aborted。压缩失败后计量被保留 → needs_compaction 一直为真 → 每个工具轮次都再发一次
+    摘要请求（每次最多 60s 超时），任务看起来就是卡住了。
+    """
+    calls = []
+
+    def failing_summarizer(region):
+        calls.append(len(region))
+        raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+
+    engine = CompactionEngine(summarizer=failing_summarizer, retain_ratio=0.16)
+    script = [[ToolCall(f"t{i}", "echo", {})] for i in range(6)] + [[TextDelta("done")]]
+    agent, provider = make_agent(
+        script,
+        session_kw={"usage": 6000, "new_usage": 0},
+        context_window=2000,
+        threshold=0.8,
+        engine=engine,
+    )
+    # 真实现场是一个 3.5MB 的长会话：payload 本身就把启发式估算顶到阈值之上，
+    # 于是「任务中途的安全边界」每一轮都会再判定一次 needs_compaction
+    s = Session(session_id="abc", name="t", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"第{i}轮需求" + "x" * 400)
+        s.append_message("assistant", f"第{i}轮实现" + "y" * 400)
+    s.usage = 6000
+    s.new_usage = 0
+    agent.session = s
+    agent.loop.tools = [EchoTool()]
+    agent.loop.executor.tool_map = {"echo": EchoTool()}
+
+    events = list(agent.prompt("please continue"))
+    ends = [e for e in events if e.type == "compaction_end"]
+
+    assert ends, "至少应该尝试过一次压缩"
+    assert all(e.data["success"] is False for e in ends)
+    # 关键：失败之后要有退避，而不是每个工具轮次都再试一次
+    assert len(calls) <= 2, f"摘要调用被重试了 {len(calls)} 次：失败没有退避，任务会被拖死"
 
 
 def test_agent_auto_compacts_on_threshold():

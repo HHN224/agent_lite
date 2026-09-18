@@ -113,9 +113,17 @@ def cli_listener(event: AgentEvent):
             folded = d.get("folded_messages", d["compacted_count"])
             safe_print(f">>> 压缩完成：已折叠 {folded} 条消息，保留从 {d['first_kept_entry_id']} 起")
         else:
-            safe_print(f">>> 压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}")
+            failures = d.get("consecutive_failures", 1)
+            safe_print(f">>> 压缩未生效（连续第 {failures} 次），已保留原文继续：{d.get('reason') or '未知原因'}")
     elif event.type == "compaction_skip":
         safe_print(f">>> 跳过压缩：{event.data['reason']}")
+    elif event.type == "compaction_paused":
+        d = event.data
+        if d.get("disabled"):
+            safe_print(f">>> 压缩已停手（任务不受影响）：{d.get('reason')}")
+            safe_print(">>> 需要时可用 /compact 手动再试一次")
+        else:
+            safe_print(f">>> 压缩暂时跳过：{d.get('reason')}")
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
