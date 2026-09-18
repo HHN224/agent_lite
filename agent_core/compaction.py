@@ -185,8 +185,15 @@ def _render_message(message: dict) -> str:
     return "\n".join(lines)
 
 
-def render_transcript(messages: list[dict], max_chars: int | None = None) -> str:
-    """把被遮区间渲染成一段引用文本；超预算时保留头尾、省略中段（按消息切，不切半条）。"""
+def render_transcript(
+    messages: list[dict], max_chars: int | None = DEFAULT_TRANSCRIPT_CHARS
+) -> str:
+    """把被遮区间渲染成一段引用文本；超预算时保留头尾、省略中段（按消息切，不切半条）。
+
+    max_chars 默认就是预算（而不是无限）：真实存档里出现过 40 万字符的被遮区间，
+    忘了传预算的调用方会直接把整段历史塞进一次请求。
+    显式传 None 表示「不限长度」。
+    """
     blocks = [_render_message(m) for m in messages]
     blocks = [b for b in blocks if b.strip()]
     if max_chars is None or sum(len(b) for b in blocks) <= max_chars:
