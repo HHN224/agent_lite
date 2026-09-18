@@ -397,6 +397,47 @@ def fetch_url(
 
 
 def clear_deps(workspace: Path) -> None:
-    """/deps-clear：删掉取件产物，回到干净状态（可逆性）。"""
+    """/deps clear：删掉取件产物，回到干净状态（可逆性）。"""
     for directory in (wheelhouse_dir(workspace), deps_python_dir(workspace)):
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def deps_summary(workspace: Path, tail: int = 8) -> str:
+    """/deps：把「取过什么」摊开给用户看（透明性靠可查，而不是靠逐条确认）。"""
+    workspace = Path(workspace)
+    python_dir = deps_python_dir(workspace)
+    modules = sorted(
+        p.name for p in python_dir.glob("*")
+        if p.is_dir() or p.suffix == ".py"
+    ) if python_dir.is_dir() else []
+    wheels = sorted(p.name for p in wheelhouse_dir(workspace).glob("*.whl"))
+    total = sum(p.stat().st_size for p in python_dir.rglob("*") if p.is_file()) \
+        if python_dir.is_dir() else 0
+    downloads = sorted(p.name for p in downloads_dir(workspace).glob("*")) \
+        if downloads_dir(workspace).is_dir() else []
+
+    lines = [
+        f"依赖目录: {python_dir}",
+        f"  已安装模块 {len(modules)} 个，占用 {total // 1024} KB"
+        + (f": {', '.join(modules[:12])}" + (" …" if len(modules) > 12 else "") if modules else ""),
+        f"  本地 wheel 缓存: {len(wheels)} 个",
+        f"已取文件: {len(downloads)} 个"
+        + (f" ({', '.join(downloads[:6])})" if downloads else ""),
+        f"白名单域名: {', '.join(allowed_hosts())}",
+    ]
+
+    log = audit_log_path(workspace)
+    if log.is_file():
+        recent = log.read_text(encoding="utf-8").strip().splitlines()[-tail:]
+        lines.append(f"审计日志(最近 {len(recent)} 条): {log}")
+        for line in recent:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            target = record.get("packages") or record.get("url") or record.get("detail") or ""
+            mark = "OK " if record.get("ok") else "拒绝"
+            lines.append(f"  [{mark}] {record.get('kind', '?')}: {target}")
+    else:
+        lines.append("审计日志: 还没有任何取件记录")
+    return "\n".join(lines)

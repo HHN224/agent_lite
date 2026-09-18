@@ -235,6 +235,29 @@ def test_file_tools_advertise_the_real_workspace_root(tmp_path):
         assert "/workspace" not in description, name
 
 
+def test_bash_schema_tells_the_model_it_is_offline_and_how_to_get_deps(tmp_path):
+    """模型必须知道沙箱没网、并且知道正确的取件入口 —— 否则它会一直 curl / pip install 试。"""
+    from coding_agent.sandbox import WslRunner
+    from coding_agent.tools import BashTool
+
+    description = BashTool(tmp_path, WslRunner(tmp_path)).to_schema()["function"]["description"]
+    assert "无网络出网" in description
+    assert "install 工具" in description and "fetch 工具" in description
+    assert "不要反复尝试 curl/pip install" in description
+
+
+def test_install_and_fetch_descriptions_list_the_allowlist(tmp_path):
+    from coding_agent.fetch import allowed_hosts
+    from coding_agent.tools import build_tools
+
+    tools = {t.name: t for t in build_tools(tmp_path, allowed_hosts=["example.com"])}
+    for name in ("install", "fetch"):
+        description = tools[name].to_schema()["function"]["description"]
+        assert "example.com" in description
+        for host in allowed_hosts(["example.com"]):
+            assert host in description, (name, host)
+
+
 def test_resumed_session_displays_last_failure():
     from test_tui_regressions import visible_text
     async def run():

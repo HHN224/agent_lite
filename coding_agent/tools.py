@@ -621,14 +621,16 @@ class InstallTool(AgentTool):
         self.workspace = workspace.resolve()
         self.allowed_hosts = tuple(allowed_hosts or ())
         self.run_command = run_command
+        hosts = fetch_mod.allowed_hosts(list(self.allowed_hosts))
         super().__init__(
             name="install",
             description=(
                 "Install Python packages into the offline workspace so later shell commands can "
-                "import them. Downloads wheels on the host (registry allowlist, wheels only, "
-                "no package code is executed during download) and unpacks them into "
-                ".agent-lite/deps/python, which is already on PYTHONPATH inside the sandbox. "
-                "Use this instead of 'pip install' inside bash — the sandbox itself has no network."
+                "import them. Downloads wheels on the host (wheels only, no package code is "
+                "executed during download) and unpacks them into .agent-lite/deps/python, which is "
+                "already on PYTHONPATH inside the sandbox. Use this instead of 'pip install' "
+                "inside bash — the sandbox itself has no network and no pip. "
+                "Allowed fetch hosts: " + ", ".join(hosts) + "."
             ),
             parameters={
                 "type": "object",
@@ -692,13 +694,14 @@ class FetchTool(AgentTool):
     def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None):
         self.workspace = workspace.resolve()
         self.allowed_hosts = tuple(allowed_hosts or ())
+        hosts = fetch_mod.allowed_hosts(list(self.allowed_hosts))
         super().__init__(
             name="fetch",
             description=(
                 "Download one http(s) URL into .agent-lite/downloads/ inside the workspace, then "
-                "read it with the read tool. Only allowlisted hosts are reachable, private and "
-                "link-local addresses are refused, redirects are re-checked, and every request is "
-                "logged. Nothing downloaded is executed."
+                "read it with the read tool. Only these hosts are reachable: " + ", ".join(hosts) +
+                ". Private and link-local addresses are refused, redirects are re-checked, and "
+                "every request is logged. Nothing downloaded is executed."
             ),
             parameters={
                 "type": "object",

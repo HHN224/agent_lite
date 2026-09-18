@@ -327,7 +327,11 @@ class LazyCommandRunner:
             from .sandbox import DockerRunner, WslRunner
             runner_type = WslRunner if self._mode == "wsl" else DockerRunner
             return runner_type(self.workspace).describe()
-        return "首次执行命令前检测沙箱；auto 模式优先隔离环境，不保证宿主依赖或网络可用。"
+        return (
+            "首次执行命令前检测沙箱；auto 模式优先隔离环境。"
+            "沙箱本身**没有网络出网能力**：装库请用 install 工具（域名白名单 + 审计），"
+            "取网页/文件请用 fetch 工具，不要反复尝试 curl / pip install。"
+        )
 
     def run(self, command, timeout=None):
         with self._lock:

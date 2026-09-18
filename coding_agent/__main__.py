@@ -116,7 +116,6 @@ def cli_listener(event: AgentEvent):
             safe_print(f">>> 压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}")
     elif event.type == "compaction_skip":
         safe_print(f">>> 跳过压缩：{event.data['reason']}")
-
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -403,6 +402,7 @@ def main():
     print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}，保留 {args.compact_retain:.0%}）")
     print(f">>> 模式: {args.mode}（/mode 切换，可选: {', '.join(mode_names())}）")
     print(f">>> 输入 /sessions 查看 / 重命名 / 删除会话")
+    print(f">>> 输入 /deps 查看受控取件的依赖与审计日志")
 
     # 当前任务模式（/mode 会更新）；新建会话用 get_mode(current_mode) 作为 system prompt
     current_mode = args.mode
@@ -447,6 +447,10 @@ def main():
 
         if user_input.strip().startswith("/sessions"):
             _cmd_sessions(repo, agent)
+            continue
+
+        if user_input.strip().startswith("/deps"):
+            _cmd_deps(args.workspace, user_input.strip())
             continue
 
         if user_input.strip().startswith("/name"):
@@ -496,6 +500,19 @@ def _cmd_sessions(repo: SessionRepository, agent):
     for m in metas:
         mark = " *" if m.session_id == agent.session_id else ""
         print(f"   {m.session_id}  {m.name or '<未命名>':<16}  {m.message_count} 条消息  {m.updated_at:.0f}{mark}")
+
+
+def _cmd_deps(workspace, raw: str):
+    """/deps 查看受控取件的产物与审计；/deps clear 清空（可逆）。"""
+    from coding_agent import fetch as fetch_mod
+
+    parts = raw.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip() in ("clear", "clean"):
+        fetch_mod.clear_deps(workspace)
+        print(">>> 已清空 .agent-lite/deps（wheel 缓存与解包产物）")
+        return
+    safe_print(fetch_mod.deps_summary(workspace))
+    print(">>> 用法: /deps 查看 | /deps clear 清空依赖")
 
 
 def _cmd_name(repo: SessionRepository, agent, raw: str):

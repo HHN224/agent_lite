@@ -271,3 +271,43 @@ def test_audit_log_is_append_only(tmp_path):
     append_audit(tmp_path, {"kind": "y", "ok": False})
     lines = audit_log_path(tmp_path).read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 2 and json.loads(lines[0])["kind"] == "x"
+
+
+# --------------------------------------------------------------------------- #
+# /deps 透明性：把「取过什么」摊开给用户看
+# --------------------------------------------------------------------------- #
+def test_deps_summary_reports_modules_and_audit(tmp_path):
+    wheelhouse_dir(tmp_path).mkdir(parents=True)
+    (wheelhouse_dir(tmp_path) / "demo-1.0-py3-none-any.whl").write_bytes(b"PK")
+    python_dir = deps_python_dir(tmp_path)
+    (python_dir / "demo").mkdir(parents=True)
+    (python_dir / "demo" / "__init__.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / ".agent-lite" / "downloads").mkdir(parents=True)
+    (tmp_path / ".agent-lite" / "downloads" / "doc.txt").write_text("hi", encoding="utf-8")
+    append_audit(tmp_path, {"kind": "pip-download", "ok": True, "packages": ["demo==1.0"]})
+    append_audit(tmp_path, {"kind": "url-fetch", "ok": False, "url": "https://evil/x"})
+
+    summary = fetch_mod.deps_summary(tmp_path)
+    assert "demo" in summary
+    assert "本地 wheel 缓存: 1 个" in summary
+    assert "doc.txt" in summary
+    assert "[OK ] pip-download: ['demo==1.0']" in summary
+    assert "[拒绝] url-fetch: https://evil/x" in summary
+    assert "pypi.org" in summary          # 白名单也摊开给用户看
+
+
+def test_deps_summary_on_empty_workspace_is_honest(tmp_path):
+    summary = fetch_mod.deps_summary(tmp_path)
+    assert "已安装模块 0 个" in summary
+    assert "还没有任何取件记录" in summary
+
+
+def test_clear_deps_removes_artifacts(tmp_path):
+    wheelhouse_dir(tmp_path).mkdir(parents=True)
+    (wheelhouse_dir(tmp_path) / "a.whl").write_bytes(b"PK")
+    deps_python_dir(tmp_path).mkdir(parents=True)
+    (deps_python_dir(tmp_path) / "a.py").write_text("x", encoding="utf-8")
+
+    fetch_mod.clear_deps(tmp_path)
+    assert not deps_python_dir(tmp_path).exists()
+    assert not wheelhouse_dir(tmp_path).exists()
