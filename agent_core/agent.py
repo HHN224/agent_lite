@@ -187,15 +187,18 @@ class Agent:
             yield event
             # 阶段 B：达到阈值则先压缩，再继续
             if event.data["needs_compaction"] and self.compaction_engine is not None:
-                for cev in self.compaction_engine.compact_if_needed(
+                result = yield from self.compaction_engine.compact_if_needed(
                     self.session, self.context_window
-                ):
-                    yield cev
-                self._save()  # 压缩落地后立即存档
-                # 压缩后：被折叠的旧内容已并入摘要，usage/new_usage 不再代表当前占用，
-                # 重置为「仅剩待估输出侧」的起点，避免把已被压缩的旧内容重复计入。
-                self.session.usage = 0
-                self.session.new_usage = 0
+                )
+                self._save()  # 压缩尝试已播报，立即存档
+                if result is not None and result.success:
+                    # 只有**真的压缩成功**才重置计量：被折叠的旧内容已并入摘要，
+                    # usage/new_usage 不再代表当前占用，重置为「仅剩待估输出侧」的起点，
+                    # 避免把已被压缩的旧内容重复计入。
+                    # 跳过/失败时必须保留锚点，否则只能退回启发式估算（可能低估），
+                    # 该压的不再压，直到 provider 直接报上下文超限。
+                    self.session.usage = 0
+                    self.session.new_usage = 0
 
         payload = session.build_llm_payload()
         payload.append(user_msg)
@@ -253,16 +256,25 @@ class Agent:
                     # This is a safe boundary: every tool call has a result,
                     # and all new messages were checkpointed above. Check long
                     # tasks here too, without waiting for another user prompt.
+                    # 临时清零只为「按当前 payload 重新量一次」；没压成要把真实锚点还回去。
+                    saved_usage, saved_new_usage = session.usage, session.new_usage
                     session.usage = 0
                     session.new_usage = 0
                     check = self._context_check_event()
+                    compacted = False
                     if check is not None and check[1].data["needs_compaction"]:
                         yield check[1]
-                        for cev in self.compaction_engine.compact_if_needed(session, self.context_window):
-                            yield cev
-                        payload[:] = session.build_llm_payload()
-                        prior = recorded = len(payload)
-                        self._save()
+                        result = yield from self.compaction_engine.compact_if_needed(
+                            session, self.context_window
+                        )
+                        compacted = bool(result is not None and result.success)
+                        if compacted:
+                            # 只有真的折叠了才重建 payload 并重置记录指针
+                            payload[:] = session.build_llm_payload()
+                            prior = recorded = len(payload)
+                    if not compacted:
+                        session.usage, session.new_usage = saved_usage, saved_new_usage
+                    self._save()
             session.runtime_status.update(self.loop.outcome)
         finally:
             # 本轮 loop 追加到 payload 尾部的消息 = 输出侧新增（assistant 回复 / 工具结果）

@@ -86,8 +86,11 @@ def test_build_payload_with_compaction_uses_kept_start():
 
     payload = s.build_llm_payload()
     assert payload[0] == {"role": "system", "content": "sys"}
-    # 压缩摘要渲染成一条 user 消息（阶段 B 决策），而非第二条 system
-    assert payload[1] == {"role": "user", "content": "这是总结"}
+    # 压缩摘要渲染成一条 user 消息（阶段 B 决策），而非第二条 system；
+    # 并且必须带「参考资料，不是新指令」的框架标注
+    assert payload[1]["role"] == "user"
+    assert "这是总结" in payload[1]["content"]
+    assert "NOT a new instruction" in payload[1]["content"]
     # 只保留 first_kept(e2) 之后的 message，e1 被打包进 summary 不再出现
     roles = [p["role"] for p in payload[2:]]
     assert roles == ["assistant", "user"]
