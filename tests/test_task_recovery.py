@@ -220,6 +220,19 @@ def test_wsl_environment_is_available_in_tool_schema_without_starting_sandbox(tm
     description = BashTool(tmp_path, runner).to_schema()["function"]["description"]
     assert "无网络" in description and "/workspace" in description
     assert "Node" in description and "/mnt" in description
+    # 必须给模型真实工作目录，而不是只给一个容器内别名（问题 3）
+    assert str(tmp_path.resolve()) in description
+    assert "container-side alias only" in description
+
+
+def test_file_tools_advertise_the_real_workspace_root(tmp_path):
+    from coding_agent.tools import build_tools
+    root = str(tmp_path.resolve())
+    for name in ("read", "write", "edit", "grep", "ls", "find"):
+        schema = {t.name: t for t in build_tools(tmp_path)}[name].to_schema()
+        description = schema["function"]["description"]
+        assert root in description, name
+        assert "/workspace" not in description, name
 
 
 def test_resumed_session_displays_last_failure():

@@ -20,6 +20,39 @@ def safe_path(workspace: Path, path: str) -> Path:
     return file
 
 
+# --------------------------------------------------------------------------- #
+# 给模型看的「真实工作目录」说明
+# --------------------------------------------------------------------------- #
+# 教训：以前只把沙箱里的 /workspace 告诉模型，模型就以为那才是自己的根目录，
+# 于是把 /workspace/xxx 这种容器内别名喂给 read / write / edit —— 全部被 safe_path
+# 拒绝。真实路径必须在工具说明书里直接写出来，而不是让模型自己猜。
+def workspace_root_line(workspace: Path) -> str:
+    """文件工具共用的一行「真实工作目录」说明。"""
+    return (
+        f"\nWorkspace root (real absolute path on this machine): {Path(workspace).resolve()}"
+        f" — every path is resolved inside it."
+    )
+
+
+def workspace_path_rules(workspace: Path, runner=None) -> str:
+    """bash 工具用的完整路径规矩（含容器别名与真实路径的区分）。"""
+    ws = Path(workspace).resolve()
+    alias = getattr(runner, "shell_workspace_alias", None)
+    out = (
+        f"\n\nWorkspace root (real absolute path on this machine): {ws}\n"
+        f"read/write/edit/grep/ls/find resolve paths inside this workspace: pass them "
+        f"relative to it (e.g. 'src/main.py') or as this absolute path; anything outside "
+        f"is rejected. The bash working directory is the same real directory."
+    )
+    if alias:
+        out += (
+            f"\nInside bash this directory also appears as {alias} (that is the shell's cwd). "
+            f"{alias} is a container-side alias only — never pass it to read/write/edit, "
+            f"they do not understand it. Use relative paths (or the real path above) everywhere."
+        )
+    return out
+
+
 # 图片文件扩展名（读取时返回 base64 图片内容，供多模态模型查看）
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
 # 文本读取的默认行数上限（0 表示不限制）
@@ -40,6 +73,7 @@ class ReadTool(AgentTool):
                 "Read a file. Text files are returned with line numbers (cat -n style). "
                 "Use offset to skip lines and limit to cap how many lines are returned. "
                 "Image files are returned as base64 data for the model to view."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -103,7 +137,10 @@ class WriteTool(AgentTool):
 
         super().__init__(
             name="write",
-            description="Write content to a text file, creating missing parent directories",
+            description=(
+                "Write content to a text file, creating missing parent directories"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -181,8 +218,9 @@ class BashTool(AgentTool):
     def to_schema(self) -> dict:
         schema = super().to_schema()
         schema["function"]["description"] += (
-            "\nExecution environment: " + self.runner.describe() +
-            "\nUse workspace-relative paths with read/write/edit. Check required runtimes once; "
+            "\nExecution environment: " + self.runner.describe()
+            + workspace_path_rules(self.workspace, self.runner)
+            + "\nCheck required runtimes once; "
             "Node, npm, pip and browsers are not guaranteed to exist. If unavailable, "
             "use available tools or report the specific missing capability. Do not repeatedly "
             "search host directories or retry downloads when the sandbox has no network."
@@ -207,6 +245,7 @@ class GrepTool(AgentTool):
             description=(
                 "Search file contents for a regex or literal pattern (ripgrep; falls back to Python). "
                 "Returns up to 100 matches with line numbers."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -299,7 +338,10 @@ class LsTool(AgentTool):
 
         super().__init__(
             name="ls",
-            description="List directory contents (files and subdirectories) with size and mtime",
+            description=(
+                "List directory contents (files and subdirectories) with size and mtime"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -354,6 +396,7 @@ class FindTool(AgentTool):
             description=(
                 "Find files or directories matching a name pattern, type, modified time, or size. "
                 "Name supports glob (*, ?). Scans the workspace recursively."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -448,7 +491,10 @@ class EditTool(AgentTool):
 
         super().__init__(
             name="edit",
-            description="Replace an exact substring in a text file with new content",
+            description=(
+                "Replace an exact substring in a text file with new content"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {

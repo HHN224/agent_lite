@@ -311,6 +311,15 @@ class LazyCommandRunner:
     def mode(self):
         return self._runner.mode if self._runner is not None else f"{self._mode}（待检测）"
 
+    @property
+    def shell_workspace_alias(self):
+        """探测前也要如实回答容器别名（不确定时返回 None，绝不给模型假路径）。"""
+        if self._runner is not None:
+            return getattr(self._runner, "shell_workspace_alias", None)
+        if self._mode in ("wsl", "docker"):
+            return "/workspace"
+        return None
+
     def describe(self):
         if self._runner is not None:
             return self._runner.describe()

@@ -101,6 +101,10 @@ class CommandRunner(ABC):
     """
 
     mode = "abstract"  # 后端标识，供 BashTool / CLI 展示与描述
+    # 容器内的工作目录别名（host 档为 None）。
+    # 关键：这个别名只对 bash 生效；read / write / edit 认的是宿主真实工作目录，
+    # 把别名喂给它们只会被 safe_path 拒绝，所以要说清楚而不是让模型自己猜。
+    shell_workspace_alias: str | None = None
 
     def __init__(self, workspace, timeout: int = 60):
         self.workspace = Path(workspace).resolve()
@@ -143,8 +147,8 @@ class HostRunner(CommandRunner):
 
     def describe(self) -> str:
         return (
-            "宿主直跑（无内核文件系统隔离），真实边界依赖权限门 + safe_path；"
-            "bash 命令请用 WSL/Docker 档以获取真正的隔离"
+            f"宿主直跑（无内核文件系统隔离），cwd = 工作目录 {self.workspace}；"
+            "真实边界依赖权限门 + safe_path；bash 命令请用 WSL/Docker 档以获取真正的隔离"
         )
 
 
@@ -157,6 +161,7 @@ class WslRunner(CommandRunner):
     """
 
     mode = "wsl"
+    shell_workspace_alias = "/workspace"
 
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
         t = self.timeout if timeout is None else timeout
@@ -191,7 +196,8 @@ class WslRunner(CommandRunner):
     def describe(self) -> str:
         return (
             "WSL2 + Bubblewrap（免 Docker daemon）：无网络、系统只读，"
-            "仅工作目录映射为可写的 /workspace（也是命令的当前目录）。"
+            f"仅工作目录（宿主真实路径 {self.workspace}）映射为可写的 /workspace"
+            "（也是命令的当前目录）。"
             "宿主 /mnt、/home、/root 不可见；/tmp 等临时目录在每次命令结束后丢弃。"
             "不能访问宿主浏览器或靠下载补齐依赖；需要跨命令保留的文件放在工作目录。"
         )
@@ -205,6 +211,7 @@ class DockerRunner(CommandRunner):
     """
 
     mode = "docker"
+    shell_workspace_alias = "/workspace"
 
     def __init__(self, workspace, image: str = DEFAULT_BASH_IMAGE, timeout: int = 60):
         super().__init__(workspace, timeout)
@@ -236,7 +243,7 @@ class DockerRunner(CommandRunner):
     def describe(self) -> str:
         return (
             f"Docker 沙箱（无网络/只读根/资源限额），镜像 {self.image}；"
-            "工作目录通过 bind mount 暴露为 /workspace"
+            f"工作目录（宿主真实路径 {self.workspace}）通过 bind mount 暴露为 /workspace"
         )
 
 
