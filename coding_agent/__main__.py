@@ -221,8 +221,13 @@ def parse_args(argv=None):
         help=(
             "扩展受控取件的域名白名单（可重复），例如 --allow-host example.com。"
             "默认只放行 pypi / npm / github 等取依赖必需的注册表；"
-            "install 与 fetch 工具受此白名单约束，沙箱本身始终没有网络出网能力"
+            "install / fetch / render_page 三个工具受此白名单约束，沙箱本身始终没有网络出网能力"
         ),
+    )
+    parser.add_argument(
+        "--no-browser-image",
+        action="store_true",
+        help="render_page 不把截图附加给模型（只给路径），用于模型不支持图片输入时",
     )
     parser.add_argument(
         "--sandbox",
@@ -313,6 +318,10 @@ def build_agent(args, api_key):
         runner=runner,
         allowed_hosts=args.allow_host,
     )
+    if args.no_browser_image:
+        for tool in tools:
+            if tool.name == "render_page":
+                tool.attach_image = False
 
     loop = AgentLoop(
         provider=provider,

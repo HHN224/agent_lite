@@ -6,6 +6,7 @@ from pathlib import Path
 from agent_core import AgentTool, ToolResult
 from agent_core.content import image_block
 
+from . import browser as browser_mod
 from . import fetch as fetch_mod
 from .sandbox import CommandRunner, DockerRunner, DEFAULT_BASH_IMAGE
 
@@ -730,6 +731,84 @@ class FetchTool(AgentTool):
         ))
 
 
+class RenderPageTool(AgentTool):
+    """在真实浏览器里跑一遍工作区内的页面（本机 Edge/Chrome，headless）。
+
+    这是「前端/可视化任务」的验证闭环：没有它，agent 只能静态推理，错误要由人开浏览器
+    抄回来（真实 session 里为此往返了 3 轮）。它把运行时错误、被拦请求、首屏信息、
+    交互是否改变画面都变成文本；截图落盘给路径，小图才会附加给模型。
+
+    与 install / fetch 同一路线：在沙箱外由我们的代码执行（沙箱是每条命令一次性的，
+    起不了常驻 dev server，WSL 里也没有浏览器）。
+    """
+
+    argument_types = {"path": str}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None, attach_image: bool = True):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        self.attach_image = attach_image
+        super().__init__(
+            name="render_page",
+            description=(
+                "Open a local HTML page in a real headless browser (your installed Edge/Chrome) "
+                "and report what actually happened: uncaught JS errors, console errors (including "
+                "WebGL/shader compile failures), blocked external requests, page title, canvas "
+                "sizes, visible text, and whether the page changed after simulated interaction. "
+                "Use this after writing front-end code instead of guessing whether it works — "
+                "static reasoning cannot catch runtime errors. Pages are served over "
+                "http://127.0.0.1 so ES modules and fetch() work; secrets (.env, sessions/) are "
+                "never served. Screenshots are saved under .agent-lite/browser/ and a small one is "
+                "attached when possible."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Page path inside the workspace, e.g. 'index.html'"},
+                    "wait_ms": {"type": "integer", "description": "Extra wait after load before inspecting (default 2500)"},
+                    "actions": {
+                        "type": "array",
+                        "description": (
+                            "Optional interactions to prove the page responds, e.g. "
+                            "[{\"type\":\"drag\",\"from\":[600,400],\"to\":[760,430]},"
+                            "{\"type\":\"wheel\",\"dy\":-250}]"
+                        ),
+                        "items": {"type": "object"},
+                    },
+                    "screenshot": {"type": "boolean", "description": "Save screenshots (default true)"},
+                },
+                "required": ["path"],
+            },
+            timeout=200,
+            dangerous=False,
+        )
+
+    def execute(self, path: str, wait_ms: int = 2500, actions=None, screenshot: bool = True) -> ToolResult:
+        try:
+            report = browser_mod.render_page(
+                self.workspace, path,
+                wait_ms=wait_ms, actions=actions,
+                allowed_hosts=list(self.allowed_hosts), screenshot=screenshot,
+            )
+        except browser_mod.BrowserError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+
+        text = browser_mod.format_report(report)
+        if report.get("fatal"):
+            return ToolResult(content=text, is_error=True)
+
+        content: list[dict] = [{"type": "text", "text": text}]
+        if self.attach_image:
+            image = browser_mod.attach_small_screenshot(self.workspace, report)
+            if image:
+                content.append(image)
+            else:
+                text += "\n（截图体积偏大或未生成，未附加图片；要看画面请打开上面的路径）"
+        # 页面报错算「任务失败信号」，但不阻断工具：模型需要看到报告继续修
+        return ToolResult(content=content if len(content) > 1 else text,
+                          is_error=bool(report.get("errors")))
+
+
 def build_tools(
     workspace: Path,
     bash_image: str = DEFAULT_BASH_IMAGE,
@@ -752,4 +831,5 @@ def build_tools(
         FindTool(workspace),
         InstallTool(workspace, allowed_hosts=allowed_hosts),
         FetchTool(workspace, allowed_hosts=allowed_hosts),
+        RenderPageTool(workspace, allowed_hosts=allowed_hosts),
     ]

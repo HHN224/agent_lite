@@ -85,7 +85,8 @@ def test_bash_tool_marks_dangerous(tmp_path):
 
 def test_build_tools_has_expected_defaults(tmp_path):
     names = sorted(t.name for t in build_tools(tmp_path))
-    assert names == ["bash", "edit", "fetch", "find", "grep", "install", "ls", "read", "write"]
+    assert names == ["bash", "edit", "fetch", "find", "grep", "install", "ls", "read",
+                     "render_page", "write"]
 
 
 def test_describe_call_default_uses_repr(tmp_path):
@@ -413,10 +414,68 @@ def test_fetch_tool_reports_saved_path(tmp_path, monkeypatch):
 def test_build_tools_includes_controlled_fetch_tools(tmp_path):
     from coding_agent.tools import build_tools
     tools = {t.name: t for t in build_tools(tmp_path, allowed_hosts=["example.com"])}
-    assert "install" in tools and "fetch" in tools
+    assert "install" in tools and "fetch" in tools and "render_page" in tools
     assert tools["fetch"].allowed_hosts == ("example.com",)
     # 机制保证安全 -> 不需要用户逐条确认
     assert tools["install"].dangerous is False and tools["fetch"].dangerous is False
+    assert tools["render_page"].dangerous is False
+
+
+def test_render_page_tool_reports_errors_and_saves_screenshot(tmp_path, monkeypatch):
+    """render_page 工具：把浏览器报告转成工具结果；页面报错时标记 is_error 但仍给报告。"""
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    fake_report = {
+        "ok": False, "fatal": None, "channel": "msedge", "load_ms": 321,
+        "errors": ["console.error: SHADER: ERROR: 0:130: 'a' : vector field selection out of range"],
+        "warnings": [], "blocked": [], "contacted": [],
+        "page": {"title": "scene", "text": "hello", "canvases": [{"width": 1200, "height": 850}]},
+        "screenshots": {}, "changed": None, "page_file": "index.html",
+    }
+    monkeypatch.setattr(browser_mod, "render_page", lambda *a, **k: dict(fake_report))
+
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert result.is_error is True                       # 页面报错 = 任务失败信号
+    assert "vector field selection out of range" in result.content
+
+
+def test_render_page_tool_handles_unavailable_runner(tmp_path, monkeypatch):
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    def boom(*a, **k):
+        raise browser_mod.BrowserError("没找到 node")
+
+    monkeypatch.setattr(browser_mod, "render_page", boom)
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert result.is_error and "没找到 node" in result.content
+
+
+def test_render_page_tool_attaches_small_screenshot_only(tmp_path, monkeypatch):
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    shot = tmp_path / ".agent-lite" / "browser" / "s.jpg"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"\xff\xd8\xff" + b"x" * 2048)
+    report = {
+        "ok": True, "fatal": None, "channel": "msedge", "load_ms": 10, "errors": [],
+        "warnings": [], "blocked": [], "contacted": [],
+        "page": {"title": "t", "text": "", "canvases": []},
+        "screenshots": {"small": str(shot)}, "changed": True, "page_file": "index.html",
+    }
+    monkeypatch.setattr(browser_mod, "render_page", lambda *a, **k: dict(report))
+
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert isinstance(result.content, list)
+    assert result.content[0]["type"] == "text"
+    assert result.content[1]["type"] == "image_url"
+    assert result.is_error is False
+
+    # 关掉图片附加时只回文本
+    plain = RenderPageTool(tmp_path, attach_image=False).execute(path="index.html")
+    assert isinstance(plain.content, str)
 
 
 def test_grep_literal_finds_match(tmp_path):
