@@ -995,13 +995,17 @@ class AgentApp(App):
         await self._select_session(session)
 
     async def _select_session(self, session):
-        from agent_core import ToolOutputTruncator, ToolResultStore
+        from agent_core import ToolOutputTruncator, ToolResultStore, workspace_state_dir
         self.agent.session = session
         self.agent.clear_queues()
         self.agent.loop.session_id = session.session_id
-        if self.agent.repo is not None:
-            folder = self.agent.repo._path(session.session_id).parent / session.session_id
-            self.agent.loop.truncator = ToolOutputTruncator(store=ToolResultStore(folder))
+        # 工具全文写盘必须落在工作目录内（read 的 safe_path 只认工作目录内的路径），
+        # 否则模型拿到的「全文路径」是一张它打不开的空头支票。
+        self.agent.loop.truncator = ToolOutputTruncator(
+            store=ToolResultStore(
+                workspace_state_dir(self.workspace), workspace=self.workspace
+            )
+        )
         await self._show_session()
 
     async def _resume_session(self, session_id):

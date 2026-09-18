@@ -9,6 +9,7 @@ from agent_core import (
     ToolResult,
     ToolOutputTruncator,
     ToolResultStore,
+    workspace_state_dir,
     truncate_head,
     truncate_tail,
     truncate_head_tail,
@@ -117,11 +118,43 @@ def test_truncator_writes_full_output_when_store_provided(tmp_path):
     assert r.truncated is True
     assert r.full_output_path is not None
     assert "full output saved to" in r.content
-    # 全文写盘到 <tmp>/tool-results/call_123.txt
+    # 全文写盘到 <base>/tool-results/<session>/call_123.txt
     from pathlib import Path
     saved = Path(r.full_output_path)
     assert saved.exists()
     assert saved.read_text(encoding="utf-8") == "A" * 500
+    assert saved == (tmp_path / "tool-results" / "sess1" / "call_123.txt").resolve()
+
+
+def test_store_writes_inside_the_workspace(tmp_path):
+    """工具全文必须落在工作目录内，否则模型手里的 read 永远打不开它。"""
+    from pathlib import Path
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
+    path = Path(store.write("sess1", "call_123", "hello"))
+
+    assert path.is_file()
+    assert path.is_relative_to(workspace)  # 关键：在工作目录内
+    assert store.relative(path) == ".agent-lite/tool-results/sess1/call_123.txt"
+    assert (workspace / ".agent-lite" / ".gitignore").exists()
+
+
+def test_read_tool_can_read_the_spilled_tool_output(tmp_path):
+    """End-to-end：模型用 read 真的能打开写盘的工具输出（问题 1 的验收条件）。"""
+    from coding_agent.tools import build_tools
+
+    store = ToolResultStore(workspace_state_dir(tmp_path), workspace=tmp_path)
+    path = store.write("sess1", "t1", "alpha\nbeta\ngamma")
+    relative = store.relative(path)
+
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    result = tools["read"].execute(path=relative)
+    assert not result.is_error
+    assert "alpha" in result.content and "gamma" in result.content
+    # 绝对路径写法也必须可用（模型可能直接照抄提示里的绝对路径）
+    assert not tools["read"].execute(path=path).is_error
 
 
 def test_truncator_does_not_write_when_no_store():
@@ -240,8 +273,8 @@ def test_loop_writes_full_output_and_preserves_pairing(tmp_path):
     assert tool_msg["tool_call_id"] == "t1"
     assert "full output saved to" in tool_msg["content"]
 
-    # 全文写盘到 <tmp>/tool-results/t1.txt
-    saved = tmp_path / "tool-results" / "t1.txt"
+    # 全文写盘到 <tmp>/tool-results/sess1/t1.txt
+    saved = tmp_path / "tool-results" / "sess1" / "t1.txt"
     assert saved.exists()
     assert saved.read_text(encoding="utf-8") == "X" * 500
 

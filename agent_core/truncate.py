@@ -24,6 +24,33 @@ TOOL_TRUNCATE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"
 
 
 # --------------------------------------------------------------------------- #
+# 工具全文写盘位置：必须在工作目录内
+# --------------------------------------------------------------------------- #
+# 关键约束：read / write / edit 的 safe_path 只允许**工作目录内**的路径。
+# 若把全文写到工作目录之外（例如项目根的 sessions/<id>/），模型无论如何都读不回
+# 自己刚才的工具输出——它拿到一个路径，却没有任何工具能打开它。
+# 因此统一写在 <workspace>/.agent-lite/tool-results/<session_id>/ 下：
+#   · 位于工作目录内，read（含 offset/limit）可以正常分页读取；
+#   · 单独一个隐藏文件夹，不污染用户的项目文件。
+WORKSPACE_STATE_DIRNAME = ".agent-lite"
+TOOL_RESULTS_DIRNAME = "tool-results"
+
+
+def workspace_state_dir(workspace) -> Path:
+    """工作目录内的 Agent 状态目录：``<workspace>/.agent-lite``。
+
+    作为 ToolResultStore 的 base_dir 使用（全文写盘的根）。
+    """
+    return Path(workspace).resolve() / WORKSPACE_STATE_DIRNAME
+
+
+def _safe_segment(value: str, max_len: int = 64) -> str:
+    """把一段字符串收敛成安全的路径片段（防越界，保留字母数字与 -_）。"""
+    safe = "".join(c for c in str(value) if c.isalnum() or c in "-_")[:max_len]
+    return safe or "unknown"
+
+
+# --------------------------------------------------------------------------- #
 # truncate_* 基础函数（都只改 content，返回新的字符串）
 # --------------------------------------------------------------------------- #
 def truncate_head(text: str, max_chars: int, marker: str | None = None) -> str:
@@ -195,20 +222,50 @@ class ToolOutputTruncator:
 class ToolResultStore:
     """把超长工具结果原文写盘，模型只见 preview + 路径。
 
-    base_dir 为 **session 粒度**目录（如 sessions/<session_id>）；
-    写盘路径为 base_dir/tool-results/<tool_call_id>.txt。
+    base_dir 为写盘根，应取 ``workspace_state_dir(workspace)``（即
+    ``<workspace>/.agent-lite``）——**必须位于模型的工作目录内**，否则模型手里的
+    read 工具（safe_path 限制在工作目录内）永远打不开这个路径。
+
+    每条结果的落盘位置：
+        <base_dir>/tool-results/<session_id>/<tool_call_id>.txt
+    没有 session_id 时退化为 <base_dir>/tool-results/<tool_call_id>.txt。
+
+    workspace 可选：提供时额外给出「相对工作目录」的路径写法，便于模型直接喂给 read。
     """
 
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, workspace: Path | None = None):
         self.base_dir = Path(base_dir)
+        self.workspace = Path(workspace).resolve() if workspace is not None else None
 
-    def _dir(self) -> Path:
-        return self.base_dir / "tool-results"
+    def _dir(self, session_id: str | None = None) -> Path:
+        d = self.base_dir / TOOL_RESULTS_DIRNAME
+        if session_id:
+            d = d / _safe_segment(session_id)
+        return d
+
+    def _ensure_dir(self, d: Path) -> Path:
+        d.mkdir(parents=True, exist_ok=True)
+        # 写盘根自带 .gitignore，避免这些中间产物被用户的项目版本控制收进去
+        root = self.base_dir / ".gitignore"
+        if not root.exists():
+            try:
+                root.write_text("*\n", encoding="utf-8")
+            except OSError:
+                pass
+        return d
 
     def write(self, session_id: str, tool_call_id: str, content: str) -> str:
-        d = self._dir()
-        d.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(c for c in tool_call_id if c.isalnum() or c in "-_")[:80] or "unknown"
-        path = d / f"{safe_name}.txt"
+        """全文写盘，返回绝对路径（模型可直接用 read 读取）。"""
+        d = self._ensure_dir(self._dir(session_id))
+        path = d / f"{_safe_segment(tool_call_id, 80)}.txt"
         path.write_text(content, encoding="utf-8")
-        return str(path)
+        return str(path.resolve())
+
+    def relative(self, path: str | Path) -> str | None:
+        """把写盘路径折算成「相对工作目录」的写法；不在工作目录内或未知工作目录时为 None。"""
+        if self.workspace is None:
+            return None
+        try:
+            return Path(path).resolve().relative_to(self.workspace).as_posix()
+        except ValueError:
+            return None

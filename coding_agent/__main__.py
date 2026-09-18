@@ -22,6 +22,7 @@ from agent_core import (
     ToolOutputTruncator,
     ToolResultStore,
     make_summarizer,
+    workspace_state_dir,
 )
 from coding_agent.modes import get_mode, mode_names
 from coding_agent.sandbox import detect_backend
@@ -313,10 +314,13 @@ def build_agent(args, api_key):
     if is_new:
         repo.save(session)  # 新建的立即落盘
 
-    # Phase 2：工具输出管理 —— 按 session 粒度写盘，模型见 preview + 路径
+    # Phase 2：工具输出管理 —— 全文写进**工作目录内**的 .agent-lite/，模型见 preview + 路径。
+    # 写在工作目录之外时 read 的 safe_path 会拒绝，模型就永远读不回自己的工具输出。
     loop.session_id = session.session_id
     loop.truncator = ToolOutputTruncator(
-        store=ToolResultStore(SESSIONS_DIR / session.session_id),
+        store=ToolResultStore(
+            workspace_state_dir(args.workspace), workspace=args.workspace
+        ),
     )
 
     # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
