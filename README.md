@@ -18,6 +18,7 @@ Agent Lite 是一个受 pi-agent 启发的学习与实验项目。它通过 Open
 - **两种终端界面**：行式 CLI，以及基于 Textual 的 TUI，后者提供 Markdown 消息卡片、可折叠工具结果和运行中插话。
 - **会话持久化**：自动保存、恢复最近会话、按 ID 恢复，以及新建、命名、列出和删除会话。
 - **上下文管理**：结合 API 输入 token 用量与新增内容估算，在阈值处生成摘要并保留近期原文；超长工具输出截断后保存全文。
+- **受控取件**：沙箱不联网，装依赖与取文件走域名白名单通道，不执行被下载代码，全程审计。
 - **任务模式与图片输入**：提供 `default` / `plan` / `code` / `review` 系统提示词；TUI 可通过 `/image` 发送本地图片，是否可识别取决于所选模型。
 - **可替换命令后端**：Docker、WSL、宿主机执行，以及自动探测。
 
@@ -103,6 +104,7 @@ agent-lite --ui cli --new --name "代码阅读" --workspace .
 | `/bypass` / `/bypass off` | 使用启动参数 `--bypass` | 自动通过工具请求 / 恢复原权限策略 |
 | `PgUp` / `PgDn` / `Ctrl+End` | 使用终端滚动 | 翻页 / 恢复跟随最新输出；滚轮上翻暂停跟随 |
 | `/compact` | 手动生成上下文摘要 | 同左 |
+| `/deps` / `/deps clear` | 查看受控取件的依赖与审计日志 / 清空依赖 | 未提供 |
 | `/name 显示名` | 重命名当前会话 | 未提供 |
 | `/delete 会话ID` | 确认后删除非当前会话 | 未提供 |
 | `/help` | 未提供；启动参数见 `--help` | 显示界面命令 |
@@ -138,6 +140,7 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | `--bypass` | 关闭 | 等同 `--permission-policy auto` |
 | `--sandbox` | `auto` | `auto` / `docker` / `wsl` / `host` |
 | `--bash-image` | `python:3.12-slim` | Docker 后端所用镜像 |
+| `--allow-host` | 空（可重复） | 扩展受控取件的域名白名单，例如 `--allow-host example.com`；不改沙箱本身（沙箱始终无网络出网） |
 | `--context-window` | `128000` | 上下文计量窗口；设为 `0` 关闭自动上下文检查 |
 | `--compact-threshold` | `0.8` | 自动压缩触发占比 |
 | `--compact-retain` | `0.16` | 压缩时尾部原文的目标预算，占窗口的比例 |
@@ -154,8 +157,31 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | `grep` | 搜索文件内容，支持正则、字面量和文件过滤 |
 | `ls` | 列出目录内容 |
 | `find` | 按名称及其他条件查找文件或目录 |
+| `install` | 受控取件：把 Python 依赖下到工作区并解包到 `.agent-lite/deps/python`（已在沙箱 `PYTHONPATH` 上） |
+| `fetch` | 受控取件：把白名单域名下的一个 http(s) URL 下到 `.agent-lite/downloads/` |
 
 `write`、`edit`、`bash` 标记为危险工具，受权限策略控制。默认 `ask` 使用终端 `y/N` 确认；当前 TUI 也沿用该确认函数，尚无专用审批弹窗，需要逐次确认时建议使用 CLI。
+
+`install` 与 `fetch` **不是**危险工具，也不需要逐条确认：它们的安全性由机制保证，而不是由用户在弹窗上点 yes（审批疲劳下的 yes 等于没有确认）。
+
+## 联网策略：沙箱不联网，取件走受控通道
+
+沙箱（WSL / Docker 档）**始终没有网络出网能力**，这不是省事，而是刻意选择：
+
+- 工作区里通常躺着密钥与会话存档，任何一条出网路径都可能被注入的指令用来带走它们；而逐条确认挡不住这个。
+- 沙箱里没有 pip/npm，`/tmp`、`/home` 又是每条命令丢弃的 tmpfs：**就算开了网，也装不上、装上留不住**。所以「用不了某个库」的病根是「取件 + 落地」两件事，不是网络一件事。
+
+于是取件被收敛成两个**在沙箱外执行、不执行被下载代码**的窄通道：
+
+1. **机制强制**：域名白名单（默认 pypi / files.pythonhosted / registry.npmjs / github 等，`--allow-host` 可扩展）；解析后校验 IP，拒绝私网、回环、链路本地地址（阻断 SSRF 与内网横向）；重定向每一跳都重新校验；响应与依赖总量都有上限。
+2. **不执行代码**：`pip download --only-binary=:all:` 只取 wheel（绝不下 sdist，sdist 的 `setup.py` 会被执行），并做 Linux x86_64 跨平台下载（Windows 侧装 win_amd64 wheel 到 WSL 是白下）；wheel 就是 zip，解包即可用，所以**沙箱里没有 pip 也能装**。
+3. **归档防护**：解包时挡 zip-slip 与软链接，跳过 `.data/`；并拒绝会让顶层模块遮蔽 Python 标准库的 wheel —— `PYTHONPATH` 优先于标准库，一个 `json.py` 就能顶替标准模块。
+4. **落地位置固定**：`.agent-lite/deps/python`（已 gitignore），沙箱命令自动带上 `PYTHONPATH=/workspace/.agent-lite/deps/python`，跨命令持久。
+5. **事后可查**：每次取件 append-only 写进 `.agent-lite/network.log`，`/deps` 可随时查看依赖、体积、白名单与最近记录，`/deps clear` 一键回到干净状态。
+
+同时，沙箱内**内核级掩蔽**敏感内容：`.env`、`*.pem`、`*.key`、`id_rsa`、`.netrc`、`.npmrc` 等文件用 `/dev/null` 覆盖（实测读取为 `Permission denied`），`.ssh`、`.aws`、`.gnupg`、`secrets` 以及 agent 自己的 `sessions/` 目录用空 tmpfs 覆盖。这一层与网络策略互补：即便将来某条路径漏了，能被带走的私有数据也少了一大半。**host 档没有内核隔离能力，掩蔽不生效**，启动时会如实打印。
+
+诚实边界：pip 自身的下载目标由其配置（`pip.conf` / 镜像）决定，白名单的强制作用在 `fetch` 工具与内网阻断上；`install` 会把 pip 实际使用的索引（`Looking in indexes`）写进结果，方便核对。私网阻断与请求之间仍有 TOCTOU 窗口，不是完整的 DNS rebinding 防御。若将来确实需要「沙箱内任意程序真联网 + 域名级强制白名单」，那需要 Docker 代理 sidecar，或 WSL 内 netns + veth + iptables 的一次性 root 安装 —— 成本明显更高，暂不做。
 
 `read` 的单次字符预算（默认 6000）低于工具输出的截断阈值（默认 8192），所以「只读到一部分」由 `read` 自己带着行号区间说清楚，而不会被上层从字符中间一刀切掉、毁掉行号结构。写盘的工具全文（`.agent-lite/tool-results/<会话 id>/`）就是普通文本文件，`read` 配 `offset` / `limit` 可分段读完。
 
@@ -165,9 +191,11 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | --- | --- |
 | `docker` | 一次性容器，禁用网络、只读根文件系统、512 MB 内存和 100 进程限额；工作目录可写挂载到 `/workspace`，`/tmp` 可写 |
 | `wsl` | 在默认 WSL 发行版中通过 Bubblewrap 执行；无网络、系统只读，仅工作目录可写 |
-| `host` | 在宿主机通过 `shell=True` 执行；仅设置工作目录，没有文件系统或网络隔离，也不保证使用 Bash |
+| `host` | 在宿主机通过 `shell=True` 执行；仅设置工作目录，没有文件系统或网络隔离，也不保证使用 Bash；**密钥掩蔽在此档不生效** |
 
 工具说明书里给模型的是**宿主真实工作目录的绝对路径**，而不是容器内的 `/workspace`：后者只是 bash 侧的别名，`read` / `write` / `edit` 并不认识它，直接写 `/workspace/...` 会被 `safe_path` 拒绝。bash 的描述里会同时点明两者的关系（真实路径 + 仅限 bash 的容器别名），避免模型把别名当成自己的工作目录。
+
+WSL / Docker 档还会在挂载层掩蔽敏感内容（见「联网策略」一节）：`.env` 等文件读作 `Permission denied`，`sessions/` 等目录呈现为空目录；被掩蔽路径是**故意**的，工具说明书里也这么告诉模型，避免它把 `Permission denied` 误当成故障去绕。
 
 使用 Docker 前启动 Docker 服务并准备镜像：
 
@@ -242,7 +270,7 @@ agent_lite/
 └── requirements.txt
 ```
 
-运行后产生的 `sessions/` 与工作目录内的 `.agent-lite/` 都不纳入版本控制。
+运行后产生的 `sessions/` 与工作目录内的 `.agent-lite/` 都不纳入版本控制。`.agent-lite/` 下分别是：`tool-results/`（被截断工具输出的全文）、`deps/`（受控取件装好的依赖与 wheel 缓存，即沙箱 `PYTHONPATH` 指向处）、`downloads/`（`fetch` 取回的文件）、`network.log`（取件审计）。
 
 ```mermaid
 flowchart TD
