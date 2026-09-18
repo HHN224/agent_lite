@@ -191,7 +191,63 @@ def test_summarizer_request_shape_puts_instruction_last_and_uses_compressor_pers
     # 采样参数真的传给了 provider，且无工具
     assert call["tools"] == []
     assert call["temperature"] == 0.0
-    assert call["max_tokens"] == 1234
+    # 关键：API 的输出上限 != 提示词里的摘要目标长度。
+    # 这个路由会先烧几千 token 的 reasoning，上限给小了正文一个字都写不出来
+    # （实测 4/4 次 finish_reason=length 失败，提到 8000 才成功）。
+    assert call["max_tokens"] == 6000, "API 输出上限必须给 reasoning 留空间"
+    assert "around 1234 tokens" in msgs[-1]["content"], "提示词里仍然是目标长度 1234"
+
+
+def test_summarizer_output_budget_scales_and_can_be_overridden():
+    from agent_core.compaction import make_summarizer
+
+    provider = FauxProvider([[TextDelta(GOOD_SUMMARY)]])
+    make_summarizer(provider, "m", max_tokens=4000)([{"role": "user", "content": "x"}])
+    assert provider.calls[0]["max_tokens"] == 16000          # 4000 * 4
+
+    provider2 = FauxProvider([[TextDelta(GOOD_SUMMARY)]])
+    make_summarizer(provider2, "m", max_tokens=4000, output_tokens=9999)(
+        [{"role": "user", "content": "x"}])
+    assert provider2.calls[0]["max_tokens"] == 9999
+
+
+def test_summarizer_keeps_a_truncated_summary_instead_of_discarding_it():
+    """finish_reason=length：正文已经流出来了，截断的摘要也比没有强。"""
+    from ai import ProviderError
+    from agent_core.compaction import make_summarizer
+
+    class TruncatingProvider:
+        def __init__(self):
+            self.calls = []
+
+        def stream(self, messages, tools, model, **options):
+            self.calls.append({"messages": messages, **options})
+
+            def events():
+                yield TextDelta(GOOD_SUMMARY)
+                raise ProviderError("模型输出未完成：达到单次输出长度上限（finish_reason=length）。",
+                                    retryable=True, code="length")
+            return events()
+
+    provider = TruncatingProvider()
+    out = make_summarizer(provider, "m")([{"role": "user", "content": "x"}])
+    assert out == GOOD_SUMMARY, "被截断的正文应该保留下来交给校验"
+
+
+def test_summarizer_still_raises_when_truncated_without_any_text():
+    from ai import ProviderError
+    from agent_core.compaction import make_summarizer
+
+    class EmptyTruncatingProvider:
+        def stream(self, messages, tools, model, **options):
+            def events():
+                if False:
+                    yield TextDelta("")
+                raise ProviderError("length", retryable=True, code="length")
+            return events()
+
+    with pytest.raises(ProviderError):
+        make_summarizer(EmptyTruncatingProvider(), "m")([{"role": "user", "content": "x"}])
 
 
 def test_summarizer_request_contains_no_tool_call_shaped_messages():

@@ -214,7 +214,11 @@ def parse_args(argv=None):
         "--compact-max-tokens",
         type=int,
         default=2000,
-        help="压缩摘要的最大 token 数（默认 2000）",
+        help=(
+            "摘要的目标长度（提示词里的数字，默认 2000）。注意：真正发给 API 的输出上限"
+            "会自动放大到 max(此值×4, 6000) —— 这个模型写正文前会先花几千 token 思考，"
+            "上限给小了正文一个字都写不出来（实测 4/4 次 finish_reason=length）"
+        ),
     )
     parser.add_argument(
         "--compact-fallback",

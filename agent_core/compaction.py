@@ -315,11 +315,21 @@ def render_transcript(
 # --------------------------------------------------------------------------- #
 # 摘要器工厂：生产用 provider 的独立、无工具、确定性调用
 # --------------------------------------------------------------------------- #
+# 输出额度与「摘要该多长」必须分开，这是实测踩出来的坑：
+# 这个路由在写正文前会先花掉几千 token 的 reasoning。如果把 API 的 max_tokens 直接设成
+# 「摘要目标长度」（默认 2000），模型会把额度全烧在思考上、正文一个字都写不出来，
+# 服务端返回 finish_reason=length —— 用工信事故 session 的真实区间实测 4/4 次失败，
+# 而只把额度提到 8000 就立刻成功（13.2s 写出 3237 字摘要）。
+MIN_SUMMARY_OUTPUT_TOKENS = 6000
+SUMMARY_OUTPUT_MULTIPLIER = 4
+
+
 def make_summarizer(
     provider,
     model: str,
     max_tokens: int = 2000,
     max_transcript_chars: int = DEFAULT_TRANSCRIPT_CHARS,
+    output_tokens: int | None = None,
 ):
     """构造一个「独立的 LLM 摘要调用」的 summarizer。
 
@@ -329,10 +339,16 @@ def make_summarizer(
         [user]   <transcript> 被遮区间的文本渲染 </transcript>
         [user]   总结指令（放在最后：模型只能接着「写摘要」，接不了任务）
 
-    并显式 temperature=0 + max_tokens（真正传给 API，不再是 prompt 里的一句空话）、
-    工具列表为空（provider 层会因此整条不发 tools 字段）。
+    max_tokens 只是**提示词里的目标**（"keep it around N tokens"）；
+    真正发给 API 的输出上限是 output_tokens，默认 max(max_tokens*4, 6000) ——
+    必须给 reasoning 留出空间，否则正文永远写不出来（见上面的实测注释）。
+    另外显式 temperature=0、工具列表为空（provider 层会因此整条不发 tools 字段）。
     """
-    from ai import ToolCall, ToolCallProgress
+    from ai import ProviderError, ToolCall, ToolCallProgress
+
+    api_output_tokens = output_tokens or max(
+        max_tokens * SUMMARY_OUTPUT_MULTIPLIER, MIN_SUMMARY_OUTPUT_TOKENS
+    )
 
     def summarize(region_messages: list[dict]) -> str:
         transcript = render_transcript(region_messages, max_transcript_chars)
@@ -342,17 +358,25 @@ def make_summarizer(
             {"role": "user", "content": SUMMARY_PROMPT.format(max_tokens=max_tokens)},
         ]
         parts: list[str] = []
-        for event in provider.stream(msgs, [], model, temperature=0.0, max_tokens=max_tokens):
-            if isinstance(event, (ToolCall, ToolCallProgress)):
-                # 到这一步还发工具调用，说明模型仍在「接着干活」而不是总结：
-                # 直接判定这次摘要不可用，交给上层拒绝落地（绝不静默丢弃后当真摘要用）。
-                raise SummaryRejected(
-                    "summarizer still tried to call a tool instead of summarizing"
-                )
-            if isinstance(event, TextDelta):
-                parts.append(event.content)
+        try:
+            for event in provider.stream(msgs, [], model, temperature=0.0,
+                                         max_tokens=api_output_tokens):
+                if isinstance(event, (ToolCall, ToolCallProgress)):
+                    # 到这一步还发工具调用，说明模型仍在「接着干活」而不是总结：
+                    # 直接判定这次摘要不可用，交给上层拒绝落地（绝不静默丢弃后当真摘要用）。
+                    raise SummaryRejected(
+                        "summarizer still tried to call a tool instead of summarizing"
+                    )
+                if isinstance(event, TextDelta):
+                    parts.append(event.content)
+        except ProviderError as exc:
+            # finish_reason=length：正文其实已经流出来了，只是被截断。
+            # 截断的摘要仍然有用（后面还有校验把关），没必要时整条丢掉。
+            if getattr(exc, "code", "") != "length" or not "".join(parts).strip():
+                raise
         return "".join(parts).strip()
 
+    summarize.output_tokens = api_output_tokens
     return summarize
 
 
