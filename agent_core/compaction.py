@@ -223,6 +223,7 @@ class CompactionResult:
     reason: str = ""
     folded_messages: int = 0
     summary_chars: int = 0
+    fallback: bool = False   # True = 这次用的是机械摘要，不是模型摘要
 
 
 # --------------------------------------------------------------------------- #
@@ -443,14 +444,25 @@ class CompactionEngine:
             "disabled": bool(self._disabled_reason),
         }
 
-    def _note_success(self, session):
-        self._consecutive_failures = 0
-        self._last_failure_reason = ""
+    def _note_success(self, session, via_fallback: bool = False):
+        """记录一次成功。
+
+        via_fallback=True 时**不清空「模型摘要不可用」的状态** —— 否则下一轮又会去试模型、
+        再超时三次、再兜底，白白烧掉三次调用（实测 12 轮里因此多花了 6 次）。
+        机械摘要成功只是说明上下文压下去了，不代表模型摘要恢复了；要退出兜底模式，
+        得靠一次真正的模型摘要成功（例如用户手动 /compact）。
+        """
+        if not via_fallback:
+            self._consecutive_failures = 0
+            self._last_failure_reason = ""
+            self._disabled_reason = ""
         self._retry_after_messages = 0
-        self._disabled_reason = ""
         self._pause_announced = False
         session.runtime_status["compaction"] = {
-            "consecutive_failures": 0, "last_failure": "", "disabled": False,
+            "consecutive_failures": self._consecutive_failures,
+            "last_failure": self._last_failure_reason,
+            "disabled": bool(self._disabled_reason),
+            "fallback_mode": bool(self._disabled_reason) and self.fallback == "digest",
         }
 
     # --- 切点：工具配对平衡 + 保留尾部 ---
@@ -581,6 +593,7 @@ class CompactionEngine:
                 1 for e in session._path_to_head()[:cut_index] if e.type == "message"
             ),
             summary_chars=len(summary),
+            fallback=use_fallback,
         )
 
     # --- 自动触发生成器（供 Agent 的生成器协作调用）---
@@ -628,7 +641,7 @@ class CompactionEngine:
         })
         result = self.compact_now(session, context_window, cut=cut, use_fallback=use_fallback)
         if result.success:
-            self._note_success(session)
+            self._note_success(session, via_fallback=result.fallback)
         else:
             self._note_failure(session, result.reason or "unknown")
         yield AgentEvent("compaction_end", {

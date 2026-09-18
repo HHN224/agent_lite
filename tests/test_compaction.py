@@ -650,6 +650,77 @@ def test_cli_wires_compact_fallback_and_manual_force(monkeypatch, tmp_path):
     assert forced == [True], "手动 /compact 必须以 force=True 触发"
 
 
+def test_fallback_success_keeps_the_llm_disabled_state():
+    """机械摘要成功**不能**清空「模型摘要不可用」状态。
+
+    否则下一轮又去试模型、再超时三次、再兜底 —— 实测 12 轮里因此多烧了 6 次调用。
+    要退出兜底模式，得靠一次真正的模型摘要成功（例如用户手动 /compact）。
+    """
+    calls = []
+
+    def failing(region):
+        calls.append(1)
+        raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=2,
+                              fallback="digest")
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))     # 失败 1
+    for i in range(6):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+    list(engine.compact_if_needed(s, context_window=2000))     # 失败 2 -> 进入兜底模式
+    assert len(calls) == 2
+
+    for round_index in range(4):                              # 之后每轮都走机械兜底
+        for i in range(6):
+            s.append_message("user", f"再来{round_index}-{i}" + "w" * 400)
+        events = list(engine.compact_if_needed(s, context_window=2000))
+        end = [e for e in events if e.type == "compaction_end"]
+        assert end and end[0].data["success"] is True and end[0].data["fallback"] is True
+
+    assert len(calls) == 2, f"兜底模式下不该再调用模型摘要（实际 {len(calls)} 次）"
+    assert s.runtime_status["compaction"]["fallback_mode"] is True
+
+
+def test_manual_force_can_leave_fallback_mode():
+    """手动 /compact 成功后应该退出兜底模式，恢复正常模型摘要。"""
+    calls = []
+    failing = {"on": True}
+
+    def flaky(region):
+        calls.append(1)
+        if failing["on"]:
+            raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+        return GOOD_SUMMARY
+
+    engine = CompactionEngine(summarizer=flaky, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=1,
+                              fallback="digest")
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))      # 失败 -> 兜底模式
+    for i in range(6):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+    events = list(engine.compact_if_needed(s, context_window=2000))
+    assert [e for e in events if e.type == "compaction_end"][0].data["fallback"] is True
+
+    failing["on"] = False
+    for i in range(6):
+        s.append_message("user", f"再来{i}" + "w" * 400)
+    events = list(engine.compact_if_needed(s, context_window=2000, force=True))
+    end = [e for e in events if e.type == "compaction_end"][0]
+    assert end.data["success"] is True and end.data["fallback"] is False
+    assert s.runtime_status["compaction"]["fallback_mode"] is False
+
+
 def test_agent_does_not_retry_a_failing_compaction_forever():
     """回归：压缩一直失败时不能每轮都重试（真实事故：任务被卡死）。
 
