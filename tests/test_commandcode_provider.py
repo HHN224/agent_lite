@@ -117,3 +117,46 @@ def test_main_selects_commandcode_key_without_deepseek_key(monkeypatch, tmp_path
     monkeypatch.setattr(cli, "run_tui", lambda **kw: kw["agent_factory"]())
     cli.main()
     assert received == ["goat-test"]
+
+
+# --------------------------------------------------------------------------- #
+# 摘要等旁路调用的请求形状：真正无工具 + 可控采样参数
+# --------------------------------------------------------------------------- #
+def _recording_provider():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return sse([{"content": "ok"}])
+
+    return make_provider(handler), bodies
+
+
+def test_empty_tools_are_omitted_from_the_wire_request():
+    """摘要调用必须真的无工具：空 tools 不能以 [] 的形式出现（部分路由仍会据此发工具调用）。"""
+    provider, bodies = _recording_provider()
+    try:
+        list(provider.stream([{"role": "user", "content": "x"}], [], provider.DEFAULT_MODEL))
+        assert "tools" not in bodies[0]
+
+        # 有工具时照旧发送
+        list(provider.stream([{"role": "user", "content": "x"}], [Tool("read", "Read a file")],
+                             provider.DEFAULT_MODEL))
+        assert bodies[1]["tools"][0]["function"]["name"] == "read"
+    finally:
+        provider.client.close()
+
+
+def test_stream_passes_sampling_options_only_when_given():
+    provider, bodies = _recording_provider()
+    try:
+        list(provider.stream([], [], provider.DEFAULT_MODEL, temperature=0, max_tokens=256))
+        assert bodies[0]["temperature"] == 0
+        assert bodies[0]["max_tokens"] == 256
+
+        # 不传时保持服务端默认：字段完全不出现
+        list(provider.stream([], [], provider.DEFAULT_MODEL))
+        assert "temperature" not in bodies[1]
+        assert "max_tokens" not in bodies[1]
+    finally:
+        provider.client.close()

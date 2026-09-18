@@ -18,8 +18,10 @@ class FauxProvider(LLMProvider):
         self.script = list(script)
         self.calls: list = []
 
-    def stream(self, messages: list[dict], tools: list[Tool], model: str):
-        self.calls.append({"messages": list(messages), "tools": list(tools), "model": model})
+    def stream(self, messages: list[dict], tools: list[Tool], model: str, **options):
+        self.calls.append(
+            {"messages": list(messages), "tools": list(tools), "model": model, **options}
+        )
 
         if not self.script:
             return iter(())
