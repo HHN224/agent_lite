@@ -110,9 +110,10 @@ def cli_listener(event: AgentEvent):
     elif event.type == "compaction_end":
         d = event.data
         if d["success"]:
-            safe_print(f">>> 压缩完成：已折叠 {d['compacted_count']} 条，保留从 {d['first_kept_entry_id']} 起")
+            folded = d.get("folded_messages", d["compacted_count"])
+            safe_print(f">>> 压缩完成：已折叠 {folded} 条消息，保留从 {d['first_kept_entry_id']} 起")
         else:
-            safe_print(">>> 压缩中止（未找到安全切点）")
+            safe_print(f">>> 压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}")
     elif event.type == "compaction_skip":
         safe_print(f">>> 跳过压缩：{event.data['reason']}")
 
@@ -326,9 +327,17 @@ def build_agent(args, api_key):
     # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
     context_manager = ContextManager(threshold_ratio=args.compact_threshold)
 
-    # 阶段 B：真压缩引擎。摘要走独立 provider 调用；保留尾部按窗口比例（默认 0.16 DSH）。
+    # 阶段 B：真压缩引擎。摘要走**独立 provider 实例**：与主循环共用实例时，
+    # 摘要调用的 usage 会写进 provider.last_usage，而那是上下文计量校准 session.usage
+    # 的真实锚点（被覆盖 = 计量失真）。摘要模型与主体模型相同，但 temperature=0、
+    # max_tokens 真正生效，且整条请求不带工具（见 make_summarizer）。
+    summary_provider = provider_class(api_key=api_key, base_url=args.base_url)
     compaction_engine = CompactionEngine(
-        summarizer=make_summarizer(provider=provider, model=args.model, max_tokens=args.compact_max_tokens),
+        summarizer=make_summarizer(
+            provider=summary_provider,
+            model=args.model,
+            max_tokens=args.compact_max_tokens,
+        ),
         retain_ratio=args.compact_retain,
     )
 

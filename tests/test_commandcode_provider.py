@@ -98,7 +98,11 @@ def test_commandcode_startup_uses_cmd_key_and_longer_tool_budget(monkeypatch, tm
     monkeypatch.setattr(cli, "build_tools", lambda *a, **kw: [EchoTool()])
     agent = cli.build_agent(args, "goat-key")
     assert agent.loop.provider is provider
-    assert credentials == [{"api_key": "goat-key", "base_url": CommandCodeProvider.DEFAULT_BASE_URL}]
+    # 主循环一个 provider 实例，摘要调用另起一个（避免摘要的 usage 覆盖计量锚点）
+    assert credentials == [
+        {"api_key": "goat-key", "base_url": CommandCodeProvider.DEFAULT_BASE_URL},
+        {"api_key": "goat-key", "base_url": CommandCodeProvider.DEFAULT_BASE_URL},
+    ]
     output = list(agent.prompt("do the task"))
     assert output[-1].data["text"] == "finished"
     assert len(provider.calls) == 12
@@ -160,3 +164,56 @@ def test_stream_passes_sampling_options_only_when_given():
         assert "max_tokens" not in bodies[1]
     finally:
         provider.client.close()
+
+
+# --------------------------------------------------------------------------- #
+# 压缩相关的接线与播报
+# --------------------------------------------------------------------------- #
+def test_summarizer_gets_its_own_provider_instance(monkeypatch, tmp_path):
+    """摘要调用不能复用主循环的 provider：否则摘要的 usage 会覆盖计量锚点。"""
+    from coding_agent import __main__ as cli
+    from faux_provider import FauxProvider
+    from test_loop import EchoTool
+    made = []
+
+    def factory(**kwargs):
+        provider = FauxProvider([])
+        made.append(provider)
+        return provider
+
+    args = cli.parse_args(["--workspace", str(tmp_path), "--new"])
+    monkeypatch.setattr(cli, "CommandCodeProvider", factory)
+    monkeypatch.setattr(cli, "SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(cli, "build_tools", lambda *a, **kw: [EchoTool()])
+    agent = cli.build_agent(args, "key")
+
+    assert len(made) == 2
+    assert agent.loop.provider is made[0]
+    # 真正被摘要器调用的是第二个实例，主循环那个一次都没被摘要碰过
+    agent.compaction_engine.summarizer([{"role": "user", "content": "hi"}])
+    assert len(made[1].calls) == 1
+    assert made[0].calls == []
+
+
+def test_cli_listener_reports_compaction_failure_and_skip(capsys):
+    from agent_core import AgentEvent
+    from coding_agent.__main__ import cli_listener
+
+    cli_listener(AgentEvent("compaction_end", {
+        "success": False,
+        "reason": "summary too short (3 chars < 40)",
+        "compacted_count": 12, "folded_messages": 12, "summary_chars": 0,
+        "first_kept_entry_id": "e9",
+    }))
+    out = capsys.readouterr().out
+    assert "压缩未生效" in out and "too short" in out
+
+    cli_listener(AgentEvent("compaction_skip", {"reason": "nothing to fold"}))
+    assert "跳过压缩" in capsys.readouterr().out
+
+    cli_listener(AgentEvent("compaction_end", {
+        "success": True, "reason": "", "compacted_count": 12, "folded_messages": 12,
+        "summary_chars": 900, "first_kept_entry_id": "e9",
+    }))
+    ok = capsys.readouterr().out
+    assert "压缩完成" in ok and "12" in ok

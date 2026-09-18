@@ -1342,10 +1342,18 @@ class AgentApp(App):
         elif t == "compaction_start":
             self._phase = "正在压缩上下文"
             self._add_notice("正在整理较早的对话记录…", "info")
+        elif t == "compaction_skip":
+            self._add_notice(f"跳过压缩：{event.data.get('reason') or '没有可折叠的内容'}", "warn")
         elif t == "compaction_end":
             d = event.data
             if d.get("success"):
-                self._add_notice(f"◆ 压缩完成，折叠 {d['compacted_count']} 条")
+                folded = d.get("folded_messages", d.get("compacted_count", 0))
+                self._add_notice(f"◆ 压缩完成，折叠 {folded} 条消息")
+            else:
+                # 失败必须可见：以前这里什么都不显示，用户以为压缩成功了
+                self._add_notice(
+                    f"压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}", "warn"
+                )
 
 
 def run_tui(agent: Agent | None = None, *, agent_factory=None, workspace=None) -> None:
