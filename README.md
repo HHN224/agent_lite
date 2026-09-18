@@ -19,6 +19,7 @@ Agent Lite 是一个受 pi-agent 启发的学习与实验项目。它通过 Open
 - **会话持久化**：自动保存、恢复最近会话、按 ID 恢复，以及新建、命名、列出和删除会话。
 - **上下文管理**：结合 API 输入 token 用量与新增内容估算，在阈值处生成摘要并保留近期原文；超长工具输出截断后保存全文。
 - **受控取件**：沙箱不联网，装依赖与取文件走域名白名单通道，不执行被下载代码，全程审计。
+- **页面验证**：`render_page` 用本机 headless Edge/Chrome 跑页面，回报运行时错误与交互是否生效，替代"开浏览器抄堆栈"的人工回路。
 - **任务模式与图片输入**：提供 `default` / `plan` / `code` / `review` 系统提示词；TUI 可通过 `/image` 发送本地图片，是否可识别取决于所选模型。
 - **可替换命令后端**：Docker、WSL、宿主机执行，以及自动探测。
 
@@ -140,7 +141,8 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | `--bypass` | 关闭 | 等同 `--permission-policy auto` |
 | `--sandbox` | `auto` | `auto` / `docker` / `wsl` / `host` |
 | `--bash-image` | `python:3.12-slim` | Docker 后端所用镜像 |
-| `--allow-host` | 空（可重复） | 扩展受控取件的域名白名单，例如 `--allow-host example.com`；不改沙箱本身（沙箱始终无网络出网） |
+| `--allow-host` | 空（可重复） | 扩展受控取件的域名白名单，例如 `--allow-host example.com`；不改沙箱本身（沙箱始终无网络出网），`render_page` 也用这份名单放行页面请求 |
+| `--no-browser-image` | 关闭 | `render_page` 不把截图附加给模型（只给路径），用于模型不支持图片输入时 |
 | `--context-window` | `128000` | 上下文计量窗口；设为 `0` 关闭自动上下文检查 |
 | `--compact-threshold` | `0.8` | 自动压缩触发占比 |
 | `--compact-retain` | `0.16` | 压缩时尾部原文的目标预算，占窗口的比例 |
@@ -159,10 +161,33 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | `find` | 按名称及其他条件查找文件或目录 |
 | `install` | 受控取件：把 Python 依赖下到工作区并解包到 `.agent-lite/deps/python`（已在沙箱 `PYTHONPATH` 上） |
 | `fetch` | 受控取件：把白名单域名下的一个 http(s) URL 下到 `.agent-lite/downloads/` |
+| `render_page` | 在本机浏览器（headless Edge/Chrome）里真的跑一遍工作区内的页面，回报运行时错误、被拦请求、canvas 尺寸、首屏文本与交互是否改变画面 |
 
 `write`、`edit`、`bash` 标记为危险工具，受权限策略控制。默认 `ask` 使用终端 `y/N` 确认；当前 TUI 也沿用该确认函数，尚无专用审批弹窗，需要逐次确认时建议使用 CLI。
 
 `install` 与 `fetch` **不是**危险工具，也不需要逐条确认：它们的安全性由机制保证，而不是由用户在弹窗上点 yes（审批疲劳下的 yes 等于没有确认）。
+
+## 页面验证：`render_page` 为什么必须有
+
+前端 / 可视化（WebGL、canvas、交互）类任务里，**静态推理补不上运行时反馈**。这不是推测，是真实 session 的取证结论：agent 反复确认"no browser available，只能靠仔细推理"，于是**人被迫当测试台** —— 手动开 Edge、把控制台堆栈抄进 `sessions/scene_browser_feedback*.txt` 再粘回来，3 轮往返只修掉 3 个运行时错误（着色器编译失败、`z is not defined`、方法名写错）；同一批 session 还花了 12 条 bash 命令去 `which chromium` / `import playwright` 找浏览器。
+
+`render_page(path, wait_ms, actions, screenshot)` 把这条回路交还给 agent：
+
+- **复用你已装的 Edge / Chrome**（`channel: msedge → chrome → bundled`），不下载 Chromium；Node 从 PATH 取，Playwright 模块自动探测（也可用 `AGENT_LITE_PLAYWRIGHT` 指定）。
+- **文本优先**：捕获 `pageerror`、`console.error`（**WebGL / 着色器编译错误就在这里**）、`console.warning`、被拦请求、页面标题、canvas 尺寸、首屏可见文本。
+- **交互验证**：给出 `actions`（`drag` / `wheel` / `click` / `wait`）后做**像素差分**，把"渲染循环与交互到底活着没有"变成一个明确的「发生了变化 / 没有任何变化」。
+- **页面通过网络访问外部**：在浏览器层拦截，只放行 `127.0.0.1` 与白名单域名，其余 abort 并记入报告与 `.agent-lite/network.log`。
+- **静态服务只绑 `127.0.0.1`，且拒绝服务 `.env`、`*.pem`、`sessions/`、`.git/`、`.agent-lite/`**（实测页面内 `fetch('/.env')` 得到 403）。没有这层，页面同源一句 fetch 就能读到密钥与全部对话存档。
+- **截图**落在 `.agent-lite/browser/`（全尺寸 png + 小 jpg + 交互后 png）；只有 ≤150KB 的小图才会附加给模型（`--no-browser-image` 可关）。这条限制来自实测：模型确实吃图（user 消息里放图能答对颜色），但 tool 结果里 205KB 的图片曾触发过 HTTP 400。
+
+诚实边界：它能自动化**错误回路**，不能判断"好不好看"（审美仍需你打开截图看）；headless 与真实浏览器在字体/GPU 上仍有差异；交互自动化本身可能 flaky（默认只做少量动作、每个动作后等待稳定）。
+
+依赖不可用时（没有 node，或 node 加载不到 playwright），工具会**直接说清缺什么、怎么补**，而不是静默失败：
+
+```powershell
+npm i -g playwright
+npx playwright install msedge   # 或者直接用已装好的 Edge（channel: msedge）
+```
 
 ## 联网策略：沙箱不联网，取件走受控通道
 
@@ -270,7 +295,7 @@ agent_lite/
 └── requirements.txt
 ```
 
-运行后产生的 `sessions/` 与工作目录内的 `.agent-lite/` 都不纳入版本控制。`.agent-lite/` 下分别是：`tool-results/`（被截断工具输出的全文）、`deps/`（受控取件装好的依赖与 wheel 缓存，即沙箱 `PYTHONPATH` 指向处）、`downloads/`（`fetch` 取回的文件）、`network.log`（取件审计）。
+运行后产生的 `sessions/` 与工作目录内的 `.agent-lite/` 都不纳入版本控制。`.agent-lite/` 下分别是：`tool-results/`（被截断工具输出的全文）、`deps/`（受控取件装好的依赖与 wheel 缓存，即沙箱 `PYTHONPATH` 指向处）、`downloads/`（`fetch` 取回的文件）、`browser/`（`render_page` 的截图）、`network.log`（取件与页面请求的审计）。
 
 ```mermaid
 flowchart TD
