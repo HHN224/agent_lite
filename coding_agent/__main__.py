@@ -215,6 +215,17 @@ def parse_args(argv=None):
         help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim，仅 --sandbox=docker 时生效）",
     )
     parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=None,
+        metavar="DOMAIN",
+        help=(
+            "扩展受控取件的域名白名单（可重复），例如 --allow-host example.com。"
+            "默认只放行 pypi / npm / github 等取依赖必需的注册表；"
+            "install 与 fetch 工具受此白名单约束，沙箱本身始终没有网络出网能力"
+        ),
+    )
+    parser.add_argument(
         "--sandbox",
         choices=["auto", "host", "wsl", "docker"],
         default="auto",
@@ -297,7 +308,12 @@ def build_agent(args, api_key):
         except Exception as e:
             raise RuntimeError(f"错误：{e}") from e
 
-    tools = build_tools(args.workspace, bash_image=args.bash_image, runner=runner)
+    tools = build_tools(
+        args.workspace,
+        bash_image=args.bash_image,
+        runner=runner,
+        allowed_hosts=args.allow_host,
+    )
 
     loop = AgentLoop(
         provider=provider,

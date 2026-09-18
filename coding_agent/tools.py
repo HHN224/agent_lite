@@ -6,6 +6,7 @@ from pathlib import Path
 from agent_core import AgentTool, ToolResult
 from agent_core.content import image_block
 
+from . import fetch as fetch_mod
 from .sandbox import CommandRunner, DockerRunner, DEFAULT_BASH_IMAGE
 
 
@@ -599,15 +600,144 @@ class EditTool(AgentTool):
         return ToolResult(content=f"Successfully edited {path}")
 
 
+class InstallTool(AgentTool):
+    """受控取件：把 Python 依赖装进工作区内的 .agent-lite/deps/，供离线沙箱使用。
+
+    为什么不做成「给沙箱开网络」：沙箱里没有 pip，而且 /tmp、/home 每条命令都会丢弃，
+    开了网也装不上、装上也留不住。所以取件由本工具在沙箱**外**执行：
+      · 只走域名白名单（默认 pypi 等注册表；可用 --allow-host 扩展）
+      · `pip download --only-binary=:all:` —— 只下 wheel，绝不下载会执行 setup.py 的 sdist
+      · 解包前拒绝遮蔽标准库的顶层模块，解包时挡 zip-slip / 软链接
+      · 全程 append-only 审计到 .agent-lite/network.log
+    因此它是 dangerous=False：安全性由机制保证，不需要用户逐条点 yes（点了也不会看）。
+
+    诚实边界：pip 自身的下载目标由其配置（pip.conf / 镜像）决定，白名单强制作用在
+    fetch 工具与内网阻断上；审计日志会记录 pip 的实际输出以便事后核对。
+    """
+
+    argument_types = {"packages": list}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None, run_command=None):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        self.run_command = run_command
+        super().__init__(
+            name="install",
+            description=(
+                "Install Python packages into the offline workspace so later shell commands can "
+                "import them. Downloads wheels on the host (registry allowlist, wheels only, "
+                "no package code is executed during download) and unpacks them into "
+                ".agent-lite/deps/python, which is already on PYTHONPATH inside the sandbox. "
+                "Use this instead of 'pip install' inside bash — the sandbox itself has no network."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "packages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Package specs, e.g. [\"requests==2.31.0\", \"rich\"]",
+                    },
+                },
+                "required": ["packages"],
+            },
+            timeout=600,
+            dangerous=False,
+        )
+
+    def execute(self, packages: list[str]) -> ToolResult:
+        if not isinstance(packages, list) or not all(isinstance(p, str) for p in packages):
+            return ToolResult(content="Error: packages must be a list of strings", is_error=True)
+        try:
+            downloaded = fetch_mod.download_pip_wheels(
+                self.workspace, packages, run_command=self.run_command
+            )
+            unpacked = fetch_mod.unpack_wheels(self.workspace)
+        except fetch_mod.FetchError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+
+        if unpacked["unpacked"] == 0:
+            return ToolResult(
+                content=(
+                    "Error: no usable wheel was downloaded "
+                    "(the package may only ship a source distribution, which cannot be built "
+                    "in the offline sandbox)"
+                ),
+                is_error=True,
+            )
+
+        modules = ", ".join(unpacked["modules"][:8]) or "(unknown)"
+        size_kb = max(1, downloaded["bytes"] // 1024)
+        indexed = next(
+            (line for line in downloaded["output"].splitlines() if "Looking in indexes" in line),
+            "",
+        )
+        audit = fetch_mod.audit_log_path(self.workspace)
+        return ToolResult(content=(
+            f"Installed {unpacked['unpacked']} wheel(s), {size_kb} KB, into "
+            f"{fetch_mod.deps_python_dir(self.workspace)}.\n"
+            f"Top-level modules now importable: {modules}\n"
+            "PYTHONPATH already points there inside the sandbox, so `python3 -c \"import ...\"` works "
+            "in the next bash command. The dependencies persist across commands in the workspace.\n"
+            + (f"{indexed}\n" if indexed else "")
+            + f"Audit log: {audit}"
+        ))
+
+
+class FetchTool(AgentTool):
+    """受控取件：把一个白名单 URL 下到 .agent-lite/downloads/（不执行任何内容）。"""
+
+    argument_types = {"url": str}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        super().__init__(
+            name="fetch",
+            description=(
+                "Download one http(s) URL into .agent-lite/downloads/ inside the workspace, then "
+                "read it with the read tool. Only allowlisted hosts are reachable, private and "
+                "link-local addresses are refused, redirects are re-checked, and every request is "
+                "logged. Nothing downloaded is executed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "http(s) URL on an allowlisted host"},
+                    "filename": {"type": "string", "description": "Optional name to save as"},
+                },
+                "required": ["url"],
+            },
+            timeout=120,
+            dangerous=False,
+        )
+
+    def execute(self, url: str, filename: str | None = None) -> ToolResult:
+        try:
+            result = fetch_mod.fetch_url(
+                self.workspace, url, filename,
+                allowed=fetch_mod.allowed_hosts(list(self.allowed_hosts)),
+            )
+        except fetch_mod.FetchError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+        relative = result["path"].relative_to(self.workspace).as_posix()
+        return ToolResult(content=(
+            f"Fetched {result['bytes']} bytes from {result['url']} -> {relative} "
+            f"(readable with read(path=\"{relative}\"))"
+        ))
+
+
 def build_tools(
     workspace: Path,
     bash_image: str = DEFAULT_BASH_IMAGE,
     runner: CommandRunner | None = None,
+    allowed_hosts: list[str] | None = None,
 ) -> list[AgentTool]:
-    """按工作目录组装全部工具（read / write / bash / edit）。
+    """按工作目录组装全部工具（read / write / bash / edit / install / fetch）。
 
     bash 的隔离后端通过 runner 注入（host / wsl / docker）；
     未注入时默认用 DockerRunner（image 由 bash_image 决定），保持向后兼容。
+    allowed_hosts 扩展受控取件的域名白名单（install / fetch 用）。
     """
     return [
         ReadTool(workspace),
@@ -617,4 +747,6 @@ def build_tools(
         GrepTool(workspace),
         LsTool(workspace),
         FindTool(workspace),
+        InstallTool(workspace, allowed_hosts=allowed_hosts),
+        FetchTool(workspace, allowed_hosts=allowed_hosts),
     ]

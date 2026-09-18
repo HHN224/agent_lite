@@ -83,9 +83,9 @@ def test_bash_tool_marks_dangerous(tmp_path):
     assert tools["read"].dangerous is False
 
 
-def test_build_tools_has_seven_defaults(tmp_path):
+def test_build_tools_has_expected_defaults(tmp_path):
     names = sorted(t.name for t in build_tools(tmp_path))
-    assert names == ["bash", "edit", "find", "grep", "ls", "read", "write"]
+    assert names == ["bash", "edit", "fetch", "find", "grep", "install", "ls", "read", "write"]
 
 
 def test_describe_call_default_uses_repr(tmp_path):
@@ -317,6 +317,106 @@ def test_bash_tool_default_timeout_uses_runner(tmp_path, monkeypatch):
     tools["bash"].execute(command="true")
     # 未传 timeout 时应使用 runner 默认（DockerRunner 默认 60）
     assert captured["timeout"] == 60
+
+
+# --------------------------------------------------------------------------- #
+# 受控取件工具：install / fetch
+# --------------------------------------------------------------------------- #
+def _fake_wheel_run(wheel_name="demo-1.0-py3-none-any.whl", module="demo", returncode=0, stderr=""):
+    """假的 pip download：往 wheelhouse 里放一个真的（最小）wheel。"""
+    import zipfile
+    from coding_agent.fetch import wheelhouse_dir
+
+    def run(command, workspace):
+        if returncode == 0:
+            dest = wheelhouse_dir(workspace)
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dest / wheel_name, "w") as archive:
+                archive.writestr(f"{module}/__init__.py", "VALUE = 42\n")
+                archive.writestr(f"{module}-1.0.dist-info/METADATA", "Name: demo\n")
+        class P:
+            pass
+        proc = P()
+        proc.returncode = returncode
+        proc.stdout = "Looking in indexes: https://pypi.org/simple\nSaved " + wheel_name
+        proc.stderr = stderr
+        return proc
+
+    return run
+
+
+def test_install_tool_unpacks_into_deps_and_reports(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run())
+
+    result = tool.execute(packages=["demo==1.0"])
+    assert not result.is_error
+    assert "Installed 1 wheel(s)" in result.content
+    assert "demo" in result.content
+    assert "PYTHONPATH already points there" in result.content
+    assert "Looking in indexes" in result.content          # 透明：pip 实际用了哪个索引
+    assert (tmp_path / ".agent-lite" / "deps" / "python" / "demo" / "__init__.py").is_file()
+    # 审计日志落在工作区内
+    assert (tmp_path / ".agent-lite" / "network.log").is_file()
+
+
+def test_install_tool_reports_source_only_packages_as_errors(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(
+        tmp_path,
+        run_command=_fake_wheel_run(returncode=1, stderr="ERROR: No matching distribution found for foo"),
+    )
+    result = tool.execute(packages=["foo"])
+    assert result.is_error
+    assert "Linux wheel" in result.content
+
+
+def test_install_tool_rejects_bad_arguments(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run())
+    assert tool.execute(packages="requests").is_error          # 必须是 list
+    assert tool.execute(packages=[123]).is_error               # 元素必须是 str
+    assert tool.execute(packages=["requests; rm -rf /"]).is_error
+
+
+def test_install_tool_refuses_stdlib_shadowing(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run(wheel_name="s-1.0-py3-none-any.whl", module="json"))
+    result = tool.execute(packages=["s"])
+    assert result.is_error and "遮蔽" in result.content
+
+
+def test_fetch_tool_rejects_non_allowlisted_host(tmp_path):
+    from coding_agent.tools import FetchTool
+    tool = FetchTool(tmp_path)
+    result = tool.execute(url="https://evil.example.com/x")
+    assert result.is_error and "白名单" in result.content
+
+
+def test_fetch_tool_reports_saved_path(tmp_path, monkeypatch):
+    from coding_agent import fetch as fetch_mod
+    from coding_agent.tools import FetchTool
+
+    def fake_fetch(workspace, url, filename=None, allowed=None):
+        target = workspace / ".agent-lite" / "downloads" / "doc.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("hello", encoding="utf-8")
+        return {"path": target, "bytes": 5, "url": url}
+
+    monkeypatch.setattr(fetch_mod, "fetch_url", fake_fetch)
+    result = FetchTool(tmp_path).execute(url="https://pypi.org/doc.txt")
+    assert not result.is_error
+    assert "5 bytes" in result.content
+    assert '.agent-lite/downloads/doc.txt' in result.content
+
+
+def test_build_tools_includes_controlled_fetch_tools(tmp_path):
+    from coding_agent.tools import build_tools
+    tools = {t.name: t for t in build_tools(tmp_path, allowed_hosts=["example.com"])}
+    assert "install" in tools and "fetch" in tools
+    assert tools["fetch"].allowed_hosts == ("example.com",)
+    # 机制保证安全 -> 不需要用户逐条确认
+    assert tools["install"].dangerous is False and tools["fetch"].dangerous is False
 
 
 def test_grep_literal_finds_match(tmp_path):
