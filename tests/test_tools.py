@@ -215,14 +215,69 @@ def test_read_offset_and_limit(tmp_path):
     result = tools["read"].execute(path="f.txt", offset=2, limit=3)
     assert not result.is_error
     # 行号为 2,3,4（cat -n 风格）
-    assert result.content == "     2\tb\n     3\tc\n     4\td"
+    assert result.content.startswith("     2\tb\n     3\tc\n     4\td")
+    # 只读到第 4 行：必须自曝还剩 1 行，并给出下一次该用的 offset（问题 2 / 4）
+    assert "READ TRUNCATED: showing lines 2-4 of 5" in result.content
+    assert "offset=5" in result.content
 
 
 def test_read_line_numbers_cat_n(tmp_path):
     tools = {t.name: t for t in build_tools(tmp_path)}
     (tmp_path / "f.txt").write_text("x\ny", encoding="utf-8")
     result = tools["read"].execute(path="f.txt")
+    # 整份文件都读到了，就不该出现任何截断提示
     assert result.content == "     1\tx\n     2\ty"
+    assert "TRUNCATED" not in result.content
+
+
+def test_read_reports_char_budget_with_next_offset(tmp_path):
+    """字符预算生效时也要给出行号区间和下一段 offset，而不是无声截断。"""
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "big.txt").write_text("\n".join("line-%03d" % i for i in range(400)), encoding="utf-8")
+
+    result = tools["read"].execute(path="big.txt", max_chars=500)
+    assert not result.is_error
+    assert "READ TRUNCATED" in result.content
+    assert "Call read again with offset=" in result.content
+    # 预算内的内容不会超过预算太多（提示语另计）
+    assert len(result.content) < 1200
+
+
+def test_read_offset_past_end_reports_clearly(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "f.txt").write_text("a\nb", encoding="utf-8")
+    result = tools["read"].execute(path="f.txt", offset=99)
+    assert result.is_error
+    assert "past the end" in result.content and "2 lines" in result.content
+
+
+def test_read_can_page_the_spilled_tool_output(tmp_path):
+    """端到端：工具全文写盘 -> 模型用 read + offset/limit 真的能分段读完。"""
+    from agent_core import ToolResultStore, workspace_state_dir
+
+    workspace = tmp_path
+    store = ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
+    body = "\n".join(f"payload-{i:04d}" for i in range(500))
+    path = store.write("sess1", "t1", body)
+    tools = {t.name: t for t in build_tools(workspace)}
+    relative = store.relative(path)
+
+    first = tools["read"].execute(path=relative)
+    assert not first.is_error
+    assert "READ TRUNCATED" in first.content  # 500 行读不完，而且它说了
+
+    # 按提示接着读，直到读完（模拟模型照着 offset 翻页）
+    seen = 0
+    offset = 1
+    for _ in range(20):
+        page = tools["read"].execute(path=relative, offset=offset, limit=100)
+        assert not page.is_error
+        body_lines = [ln for ln in page.content.split("\n") if "payload-" in ln]
+        seen += len(body_lines)
+        if "offset=" not in page.content:
+            break
+        offset = int(page.content.rsplit("offset=", 1)[1].split(" ")[0])
+    assert seen == 500
 
 
 def test_read_image_returns_data_uri(tmp_path):

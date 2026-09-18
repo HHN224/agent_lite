@@ -55,12 +55,22 @@ def workspace_path_rules(workspace: Path, runner=None) -> str:
 
 # 图片文件扩展名（读取时返回 base64 图片内容，供多模态模型查看）
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
-# 文本读取的默认行数上限（0 表示不限制）
+# 文本读取的默认行数上限
 DEFAULT_READ_LIMIT = 2000
+# 单次 read 的字符预算：必须留在 ToolOutputTruncator 阈值（默认 8192）之下，
+# 这样「只读到一部分」由 read 自己用带行号的提示说清楚，而不是被上层从字符中间
+# 一刀切掉（那会毁掉行号结构，模型也就无从知道下次该从第几行接着读）。
+DEFAULT_READ_MAX_CHARS = 6000
 
 
 class ReadTool(AgentTool):
-    """读取文件：支持 offset / limit / 行号，图片文件以 base64 返回。"""
+    """读取文件：支持 offset / limit / max_chars 分页，图片文件以 base64 返回。
+
+    关键约定：**读不完就说出来**。默认每行 2000 行、6000 字符，任一上限触发时都会在
+    结果末尾写明「已显示第 A–B 行，共 N 行」，并给出下一次该用的 offset。
+    工具全文写盘（.agent-lite/tool-results/）也是普通文本文件，用本工具配合
+    offset / limit 就能分段读完，不需要任何特殊参数。
+    """
 
     argument_types = {"path": str}
 
@@ -71,7 +81,11 @@ class ReadTool(AgentTool):
             name="read",
             description=(
                 "Read a file. Text files are returned with line numbers (cat -n style). "
-                "Use offset to skip lines and limit to cap how many lines are returned. "
+                "Use offset to skip lines and limit to cap how many lines are returned; "
+                "when the file is longer than one call can return, the result ends with a "
+                "notice telling you which lines were shown and which offset to use next. "
+                "Large tool outputs spilled by the agent are ordinary text files under "
+                ".agent-lite/tool-results/<session>/ — read them back the same way. "
                 "Image files are returned as base64 data for the model to view."
                 + workspace_root_line(self.workspace)
             ),
@@ -81,6 +95,7 @@ class ReadTool(AgentTool):
                     "path": {"type": "string", "description": "The file path to read"},
                     "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)"},
                     "limit": {"type": "integer", "description": "Maximum number of lines to return (default 2000)"},
+                    "max_chars": {"type": "integer", "description": "Character budget for this call (default 6000); lower it to peek, raise it to read more per call"},
                 },
                 "required": ["path"],
             },
@@ -88,7 +103,13 @@ class ReadTool(AgentTool):
             dangerous=False,
         )
 
-    def execute(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
+    def execute(
+        self,
+        path: str,
+        offset: int | None = None,
+        limit: int | None = None,
+        max_chars: int | None = None,
+    ) -> ToolResult:
         file = safe_path(self.workspace, path)
 
         if not file.exists():
@@ -115,18 +136,61 @@ class ReadTool(AgentTool):
             return ToolResult(content=f"Error reading file: {e}", is_error=True)
 
         lines = text.split("\n")
-        start_line = offset or 1
-        if offset is not None and offset > 1:
-            lines = lines[offset - 1:]
-        if limit is not None:
-            lines = lines[:limit]
+        total_lines = len(lines)
 
-        # 加行号（cat -n 风格），便于模型定位
-        numbered = []
-        for i, line in enumerate(lines):
-            line_num = start_line + i
-            numbered.append(f"{line_num:>6}\t{line}")
-        return ToolResult(content="\n".join(numbered))
+        start = 1 if offset is None else int(offset)
+        if start < 1:
+            return ToolResult(
+                content=f"Error: offset must be >= 1 (1-indexed), got {start}", is_error=True
+            )
+        if start > total_lines:
+            return ToolResult(
+                content=(
+                    f"Error: offset {start} is past the end of {path} "
+                    f"({total_lines} lines total)"
+                ),
+                is_error=True,
+            )
+
+        window = DEFAULT_READ_LIMIT if limit is None else int(limit)
+        if window < 1:
+            return ToolResult(
+                content=f"Error: limit must be >= 1, got {window}", is_error=True
+            )
+        budget = DEFAULT_READ_MAX_CHARS if max_chars is None else int(max_chars)
+        budget = max(200, budget)
+
+        # 加行号（cat -n 风格）并累计字符预算；超出预算就停在这里，行号结构保持完整
+        numbered: list[str] = []
+        used = 0
+        for i, line in enumerate(lines[start - 1: start - 1 + window]):
+            rendered = f"{start + i:>6}\t{line}"
+            if not numbered:
+                if len(rendered) > budget:
+                    rendered = (
+                        rendered[:budget]
+                        + f" [... this single line was cut at {budget} characters ...]"
+                    )
+                numbered.append(rendered)
+                used = len(rendered)
+                continue
+            if used + len(rendered) + 1 > budget:
+                break
+            numbered.append(rendered)
+            used += len(rendered) + 1
+
+        end = start + len(numbered) - 1
+        content = "\n".join(numbered)
+
+        remaining = total_lines - end
+        if remaining > 0:
+            content += (
+                f"\n\n[... READ TRUNCATED: showing lines {start}-{end} of {total_lines}; "
+                f"{remaining} more lines were NOT shown. Call read again with "
+                f"offset={end + 1} (optionally limit=<lines> / max_chars=<chars>) "
+                f"to continue — the file above is incomplete ...]"
+            )
+        return ToolResult(content=content)
 
 
 class WriteTool(AgentTool):
