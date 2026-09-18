@@ -10,20 +10,30 @@ from agent_core import (
     SessionRepository,
     make_summarizer,
 )
+from agent_core.compaction import (
+    SUMMARY_SYSTEM_PROMPT,
+    TRANSCRIPT_CLOSE,
+    TRANSCRIPT_OPEN,
+    render_transcript,
+)
 from ai import TextDelta
 
 from faux_provider import FauxProvider
 
 
+# 校验要求摘要不能过短（Step C），所以假的「合法摘要」必须够长且像摘要
+GOOD_SUMMARY = "## 摘要\n### 目标\n把会话目标、已执行步骤、结论与待办都记录下来。" * 3
+
+
 # --------------------------------------------------------------------------- #
 # 一个确定性的假摘要器：record 被摘的 region，返回固定文本
 # --------------------------------------------------------------------------- #
-def make_recording_summarizer():
+def make_recording_summarizer(text: str = GOOD_SUMMARY):
     calls = []
 
-    def summarize(region_messages, system_prompt):
-        calls.append({"region_messages": list(region_messages), "system_prompt": system_prompt})
-        return "SUMMARY:" + str(len(region_messages))
+    def summarize(region_messages):
+        calls.append({"region_messages": list(region_messages)})
+        return text
 
     return summarize, calls
 
@@ -48,7 +58,7 @@ def _make_session_with_tool_usage():
 
 def test_find_cut_is_not_on_tool_message():
     s = _make_session_with_tool_usage()
-    engine = CompactionEngine(summarizer=lambda r, sp: "x", retain_ratio=0.16)
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
     cut = engine.find_cut(s, context_window=100000)
     assert cut is not None
     cut_index, first_kept_id = cut
@@ -60,33 +70,40 @@ def test_find_cut_is_not_on_tool_message():
 def test_find_cut_returns_none_when_too_short():
     s = Session(session_id="abc", system_prompt="sys")
     s.append_message("user", "hi")
-    engine = CompactionEngine(summarizer=lambda r, sp: "x", retain_ratio=0.16)
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
     assert engine.find_cut(s, context_window=100000) is None
 
 
 def test_compact_now_lands_compaction_and_renders_user():
-    s = _make_session_with_tool_usage()
+    # 小窗口 + 一段真实长度的历史：切点落在中间，被遮区间非空（否则压缩没有意义）
+    s = Session(session_id="abc", system_prompt="sys")
+    for i in range(6):
+        s.append_message("user", f"第{i}轮问题" + "x" * 200)
+        s.append_message("assistant", f"第{i}轮回答" + "y" * 200)
+
     summarize, calls = make_recording_summarizer()
     engine = CompactionEngine(summarizer=summarize, retain_ratio=0.16)
-    result = engine.compact_now(s, context_window=100000)
+    result = engine.compact_now(s, context_window=100)
 
     assert result.success is True
-    assert result.summary.startswith("SUMMARY:")
+    assert result.summary == GOOD_SUMMARY
     assert result.first_kept_entry_id is not None
+    assert result.folded_messages > 0
     # 落地的 compaction 节点在 entries 里
     assert any(e.type == "compaction" for e in s.entries.values())
+    # 摘要器只拿到被遮区间的消息，且不再接收会话的编码 agent 人格
+    assert calls[0]["region_messages"]
     # 压缩后 payload：system → user(摘要) → 保留消息；摘要不是第二条 system
     payload = s.build_llm_payload()
     assert payload[0] == {"role": "system", "content": "sys"}
     assert payload[1]["role"] == "user"
-    assert payload[1]["content"].startswith("SUMMARY:")
-    assert calls[0]["system_prompt"] == "sys"
+    assert GOOD_SUMMARY in payload[1]["content"]
 
 
 def test_compact_now_returns_failure_when_no_cut():
     s = Session(session_id="abc", system_prompt="sys")
     s.append_message("user", "hi")
-    engine = CompactionEngine(summarizer=lambda r, sp: "x", retain_ratio=0.16)
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
     result = engine.compact_now(s, context_window=100000)
     assert result.success is False
 
@@ -108,6 +125,72 @@ def test_summary_input_includes_prior_compaction_summary():
     assert result.success is True
     region_texts = [m.get("content", "") for m in calls[0]["region_messages"]]
     assert any("先前摘要" in t for t in region_texts)
+    # 先前摘要必须以「引用材料」的措辞出现，不能被当成新指令
+    assert any("reference material only" in t for t in region_texts)
+
+
+# --------------------------------------------------------------------------- #
+# 摘要请求的形状（Step B 的核心）：transcript 引用块 + 指令在最后 + 绝无工具
+# --------------------------------------------------------------------------- #
+def test_summarizer_request_shape_puts_instruction_last_and_uses_compressor_persona():
+    provider = FauxProvider([[TextDelta(GOOD_SUMMARY)]])
+    summarize = make_summarizer(provider, "test-model", max_tokens=1234)
+    summarize([{"role": "user", "content": "把雨夜便利店做成三渲二场景"},
+               {"role": "assistant", "content": "我先看仓库结构"}])
+
+    call = provider.calls[0]
+    msgs = call["messages"]
+    # 三段式：压缩器人格 -> transcript 引用块 -> 指令（最后）
+    assert msgs[0] == {"role": "system", "content": SUMMARY_SYSTEM_PROMPT}
+    assert msgs[1]["content"].startswith(TRANSCRIPT_OPEN)
+    assert msgs[1]["content"].rstrip().endswith(TRANSCRIPT_CLOSE)
+    assert msgs[-1]["role"] == "user"
+    assert "Do NOT continue" in msgs[-1]["content"]
+    # 会话里的编码人格不再冒充摘要 system prompt
+    assert "coding-focused AI agent" not in str(msgs)
+    # 采样参数真的传给了 provider，且无工具
+    assert call["tools"] == []
+    assert call["temperature"] == 0.0
+    assert call["max_tokens"] == 1234
+
+
+def test_summarizer_request_contains_no_tool_call_shaped_messages():
+    """发出去的摘要请求里不能出现 assistant.tool_calls / role=tool 消息（那是『接着说』的诱因）。"""
+    provider = FauxProvider([[TextDelta(GOOD_SUMMARY)]])
+    summarize = make_summarizer(provider, "test-model")
+    summarize([
+        {"role": "user", "content": "跑一下测试"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "t1", "type": "function",
+                         "function": {"name": "bash", "arguments": '{"command": "pytest -q"}'}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "3 failed"},
+    ])
+
+    msgs = provider.calls[0]["messages"]
+    assert all("tool_calls" not in m for m in msgs)
+    assert all(m["role"] != "tool" for m in msgs)
+    # 工具调用与结果必须以文本形式出现在 transcript 里，信息不丢
+    assert "[tool call] bash(" in msgs[1]["content"]
+    assert "[tool result id=t1]" in msgs[1]["content"]
+
+
+def test_render_transcript_budget_keeps_head_and_tail():
+    messages = [{"role": "user", "content": f"消息{i}-" + "x" * 200} for i in range(40)]
+    out = render_transcript(messages, max_chars=2000)
+
+    assert len(out) < 4000
+    assert "TRANSCRIPT TRUNCATED" in out
+    assert "消息0" in out          # 开头保留（目标/约束通常在这里）
+    assert "消息39" in out         # 结尾保留（最新状态）
+
+
+def test_render_transcript_replaces_images_with_placeholder():
+    out = render_transcript([
+        {"role": "tool", "tool_call_id": "i1",
+         "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+    ])
+    assert "[image omitted]" in out
+    assert "base64" not in out
 
 
 # --------------------------------------------------------------------------- #
@@ -127,7 +210,7 @@ def test_compact_if_needed_yields_events():
 def test_compact_if_needed_skips_when_no_cut():
     s = Session(session_id="abc", system_prompt="sys")
     s.append_message("user", "hi")
-    engine = CompactionEngine(summarizer=lambda r, sp: "x", retain_ratio=0.16)
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
     events = list(engine.compact_if_needed(s, context_window=100000))
     assert events[0].type == "compaction_skip"
 
@@ -178,7 +261,7 @@ def test_agent_does_not_compact_when_below_threshold():
         session_kw={"usage": 30000, "new_usage": 0},
         context_window=100000,
         threshold=0.8,
-        engine=CompactionEngine(summarizer=lambda r, sp: "x", retain_ratio=0.16),
+        engine=CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16),
     )
     events = list(agent.prompt("请继续"))
     types = [e.type for e in events]

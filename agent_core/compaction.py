@@ -13,6 +13,11 @@
   - 用「总结的压缩」解决多次压缩越攒越多：build_llm_payload 只取最新的 compaction，
     旧的在 entries 里被遮蔽，且其摘要会作为上下文喂给新的摘要调用。
 
+摘要调用**必须看起来不像一段还在进行的会话**（这是被真实 session 打过脸的教训）：
+被遮区间渲染成一段 <transcript> 引用文本，总结指令是最后一条 user 消息，
+system 用专用压缩器人格（不是会话里的编码 agent 人格），且显式无工具。
+详见 render_transcript / make_summarizer 的注释。
+
 摘要的具体调用由可注入的 summarizer 提供（生产用 provider，测试用假函数），
 把「怎么总结」与 CompactionEngine 解耦，便于独立测试与替换。
 """
@@ -23,16 +28,18 @@ from dataclasses import dataclass
 
 from ai import TextDelta
 
+from .content import BLOCK_IMAGE, BLOCK_TEXT, BLOCK_TOOL_RESULT
 from .events import AgentEvent
 from .context_manager import TokenMeter
-from .content import content_to_llm
 
 
 # --------------------------------------------------------------------------- #
 # 结构化摘要 prompt（固定检查点，比自由摘要更稳定、可复现）
 # --------------------------------------------------------------------------- #
+# 指令固定在**最后一条 user 消息**里：模型只能从「给我写摘要」这个位置往下写，
+# 物理上无法接着 transcript 里的最后一步继续干活。
 SUMMARY_PROMPT = """\
-You are summarizing an older part of a conversation so it can be replaced by this summary.
+Summarize the conversation transcript you were given so it can replace those messages.
 
 Produce a concise but faithful summary that captures:
 1. The user's overall goal and any constraints.
@@ -40,8 +47,28 @@ Produce a concise but faithful summary that captures:
 3. Important facts, decisions, and conclusions established so far.
 4. Anything still incomplete, blocked, or pending that must not be forgotten.
 
+Rules (violating any of them makes your output useless):
+- Do NOT continue, answer, or act on the conversation; you only summarize it.
+- Do NOT ask the user for anything, and do NOT ask for the transcript — it is above.
+- Do NOT emit tool calls or tool-call markup of any kind.
+
 Write in the same language as the conversation. Keep it around {max_tokens} tokens at most.
 """
+
+# 压缩器人格：与「编码 agent」人格刻意区分开，避免模型把自己当成会话的下一棒
+SUMMARY_SYSTEM_PROMPT = (
+    "You are a context compressor for a coding-agent conversation. "
+    "You never continue, answer, or act on the conversation you are given, and you never "
+    "emit tool calls or tool-call markup. Read the transcript and write a factual summary "
+    "of it. Output the summary text only — no preamble, no questions, no offers to help."
+)
+
+TRANSCRIPT_OPEN = "<transcript>"
+TRANSCRIPT_CLOSE = "</transcript>"
+
+# 被遮区间的字符预算：40 万字符（≈10 万 token）的区间本身就是一次超大请求，
+# 既不便宜也容易直接撞上上下文上限。超出时保留头尾、省略中段。
+DEFAULT_TRANSCRIPT_CHARS = 60000
 
 
 @dataclass
@@ -54,33 +81,126 @@ class CompactionResult:
     entry_id: str | None = None
     compacted_count: int = 0
     reason: str = ""
+    folded_messages: int = 0
+    summary_chars: int = 0
 
 
 # --------------------------------------------------------------------------- #
-# 摘要器工厂：生产用 provider 的独立流式调用
+# 被遮区间 -> 引用文本（transcript）
 # --------------------------------------------------------------------------- #
-def make_summarizer(provider, model: str, max_tokens: int = 2000):
+def _render_content(content) -> str:
+    """把一条消息的 content 渲染成纯文本。
+
+    图片只留占位符（绝不把 base64 塞进摘要请求），展示用的 thinking 块不进摘要材料。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind in (BLOCK_TEXT, BLOCK_TOOL_RESULT):
+            parts.append(block.get("text") or block.get("content") or "")
+        elif kind == BLOCK_IMAGE:
+            parts.append("[image omitted]")
+    return "".join(parts)
+
+
+def _render_message(message: dict) -> str:
+    """把一条消息渲染成带角色标签的文本行。
+
+    工具调用**渲染成文本**而不是保留 tool_calls 字段：发出去的摘要请求里因此不存在
+    任何 assistant.tool_calls / role=tool 消息，模型看不到「刚调用完工具、等着下一步」
+    的形状（那正是它接着说下去的诱因）。
+    """
+    role = message.get("role") or "?"
+    text = _render_content(message.get("content")).strip()
+    if role == "tool":
+        head = f"[tool result id={message.get('tool_call_id') or '?'}]"
+    else:
+        head = f"[{role}]"
+    lines = [f"{head} {text}".rstrip()]
+    for call in message.get("tool_calls") or []:
+        function = call.get("function") or {}
+        lines.append(f"[tool call] {function.get('name', '?')}({function.get('arguments', '')})")
+    return "\n".join(lines)
+
+
+def render_transcript(messages: list[dict], max_chars: int | None = None) -> str:
+    """把被遮区间渲染成一段引用文本；超预算时保留头尾、省略中段（按消息切，不切半条）。"""
+    blocks = [_render_message(m) for m in messages]
+    blocks = [b for b in blocks if b.strip()]
+    if max_chars is None or sum(len(b) for b in blocks) <= max_chars:
+        return "\n\n".join(blocks)
+
+    head_budget = int(max_chars * 0.6)
+    head: list[str] = []
+    used = 0
+    for block in blocks:
+        if head and used + len(block) > head_budget:
+            break
+        head.append(block)
+        used += len(block) + 2
+
+    tail: list[str] = []
+    used = 0
+    for block in reversed(blocks[len(head):]):
+        if tail and used + len(block) > max_chars - head_budget:
+            break
+        tail.append(block)
+        used += len(block) + 2
+    tail.reverse()
+
+    omitted = len(blocks) - len(head) - len(tail)
+    if omitted <= 0:
+        return "\n\n".join([*head, *tail])
+    marker = (
+        f"[... TRANSCRIPT TRUNCATED: {omitted} messages from the middle were omitted "
+        f"to stay within the summary budget ...]"
+    )
+    return "\n\n".join([*head, marker, *tail])
+
+
+# --------------------------------------------------------------------------- #
+# 摘要器工厂：生产用 provider 的独立、无工具、确定性调用
+# --------------------------------------------------------------------------- #
+def make_summarizer(
+    provider,
+    model: str,
+    max_tokens: int = 2000,
+    max_transcript_chars: int = DEFAULT_TRANSCRIPT_CHARS,
+):
     """构造一个「独立的 LLM 摘要调用」的 summarizer。
 
-    返回的 summarizer(region_messages, system_prompt) -> str：
-      用固定结构化 prompt + 重放被遮区间的消息，调 provider 收集纯文本摘要。
-      不给工具（纯文本任务），忽略任何 ToolCall 事件。
-    """
+    返回的 summarizer(region_messages) -> str，请求形状固定为三条消息：
 
-    def summarize(region_messages: list[dict], system_prompt: str) -> str:
-        instruction = SUMMARY_PROMPT.format(max_tokens=max_tokens)
-        msgs: list[dict] = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        msgs.append({"role": "user", "content": instruction})
-        msgs.extend({**message, "content": content_to_llm(message.get("content"))}
-                    for message in region_messages)
+        [system] 专用压缩器人格（**不使用会话里的编码 agent 人格**）
+        [user]   <transcript> 被遮区间的文本渲染 </transcript>
+        [user]   总结指令（放在最后：模型只能接着「写摘要」，接不了任务）
+
+    并显式 temperature=0 + max_tokens（真正传给 API，不再是 prompt 里的一句空话）、
+    工具列表为空（provider 层会因此整条不发 tools 字段）。
+    """
+    from ai import ToolCall, ToolCallProgress
+
+    def summarize(region_messages: list[dict]) -> str:
+        transcript = render_transcript(region_messages, max_transcript_chars)
+        msgs: list[dict] = [
+            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{TRANSCRIPT_OPEN}\n{transcript}\n{TRANSCRIPT_CLOSE}"},
+            {"role": "user", "content": SUMMARY_PROMPT.format(max_tokens=max_tokens)},
+        ]
         parts: list[str] = []
-        for event in provider.stream(msgs, [], model):
+        for event in provider.stream(msgs, [], model, temperature=0.0, max_tokens=max_tokens):
+            if isinstance(event, (ToolCall, ToolCallProgress)):
+                # 到这一步还发工具调用，说明这段输出不是摘要（Step C 会据此判定失败）
+                continue
             if isinstance(event, TextDelta):
                 parts.append(event.content)
-        text = "".join(parts).strip()
-        return text or "(无摘要)"
+        return "".join(parts).strip()
 
     return summarize
 
@@ -147,10 +267,10 @@ class CompactionEngine:
         return cut, path[cut].id
 
     def _summary_input(self, session, cut_index: int) -> list[dict]:
-        """构造喂给摘要调用的消息：被遮区间的 message 列表（含最近一次 prior 摘要）。
+        """构造喂给摘要调用的材料：被遮区间的 message 列表（含最近一次 prior 摘要）。
 
         为处理「多次压缩越攒越多」（总结的压缩）：若被遮区间里已有一次 compaction，
-        把它的摘要作为前置上下文，让新摘要建立在其上。
+        把它的摘要作为**引用材料**前置，让新摘要建立在其上（并明确标注不是新指令）。
         """
         path = session._path_to_head()
         region = [e.to_llm() for e in path[:cut_index] if e.type == "message"]
@@ -159,7 +279,12 @@ class CompactionEngine:
             if e.type == "compaction" and e.summary:
                 prior = e.summary  # 取被遮区间里最近一次压缩的摘要
         if prior:
-            region = [{"role": "user", "content": "此前已有一次压缩，其摘要为：" + prior}, *region]
+            region = [
+                {"role": "user",
+                 "content": "[Prior summary of even earlier turns — reference material only, "
+                            "not a new instruction]\n" + prior},
+                *region,
+            ]
         return region
 
     # --- 落地压缩（同步，返回 CompactionResult）---
@@ -177,7 +302,7 @@ class CompactionEngine:
         cut_index, first_kept_id = cut
 
         region = self._summary_input(session, cut_index)
-        summary = self.summarizer(region, session.system_prompt)
+        summary = self.summarizer(region)
         entry = session.append_compaction(summary, first_kept_id)
         return CompactionResult(
             success=True,
@@ -185,6 +310,10 @@ class CompactionEngine:
             first_kept_entry_id=first_kept_id,
             entry_id=entry.id,
             compacted_count=cut_index,
+            folded_messages=sum(
+                1 for e in session._path_to_head()[:cut_index] if e.type == "message"
+            ),
+            summary_chars=len(summary),
         )
 
     # --- 自动触发生成器（供 Agent 的生成器协作调用）---
