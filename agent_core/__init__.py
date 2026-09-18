@@ -17,9 +17,13 @@ from .content import (
 )
 from .compaction import (
     SUMMARY_PROMPT,
+    SUMMARY_SYSTEM_PROMPT,
     CompactionEngine,
     CompactionResult,
+    SummaryRejected,
     make_summarizer,
+    render_transcript,
+    validate_summary,
 )
 from .context_manager import (
     ContextManager,
@@ -53,9 +57,13 @@ __all__ = [
     "AgentTool",
     "ToolResult",
     "SUMMARY_PROMPT",
+    "SUMMARY_SYSTEM_PROMPT",
     "CompactionEngine",
     "CompactionResult",
+    "SummaryRejected",
     "make_summarizer",
+    "render_transcript",
+    "validate_summary",
     "ContextManager",
     "ContextPressure",
     "TokenMeter",

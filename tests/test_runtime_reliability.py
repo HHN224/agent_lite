@@ -119,7 +119,10 @@ def test_long_task_compacts_between_tool_rounds_without_losing_history():
     provider = FauxProvider([[ToolCall(str(i), "echo", {"text": "work " * 100})] for i in range(5)]
                             + [[TextDelta("complete")]])
     session = Session("long-task")
-    engine = CompactionEngine(summarizer=lambda *args: "earlier work preserved", retain_ratio=0.25)
+    engine = CompactionEngine(
+        summarizer=lambda *args: "earlier work preserved：" + "摘要内容" * 30,
+        retain_ratio=0.25,
+    )
     agent = Agent(AgentLoop(provider, "test", [EchoTool()]), session,
                   context_manager=ContextManager(threshold_ratio=0.8), context_window=500,
                   compaction_engine=engine)

@@ -15,8 +15,9 @@ from agent_core.compaction import (
     TRANSCRIPT_CLOSE,
     TRANSCRIPT_OPEN,
     render_transcript,
+    validate_summary,
 )
-from ai import TextDelta
+from ai import TextDelta, ToolCall
 
 from faux_provider import FauxProvider
 
@@ -194,13 +195,111 @@ def test_render_transcript_replaces_images_with_placeholder():
 
 
 # --------------------------------------------------------------------------- #
+# 摘要输出的硬校验 + 失败拒绝落地（Step C）
+# --------------------------------------------------------------------------- #
+def _long_session():
+    s = Session(session_id="abc", system_prompt="sys")
+    for i in range(6):
+        s.append_message("user", f"第{i}轮问题" + "x" * 200)
+        s.append_message("assistant", f"第{i}轮回答" + "y" * 200)
+    return s
+
+
+def _compaction_entries(session):
+    return [e for e in session.entries.values() if e.type == "compaction"]
+
+
+def test_validate_summary_accepts_a_real_summary():
+    ok, reason = validate_summary(
+        "## 摘要\n### 1. 总体目标与约束\n用户要把雨夜便利店街角做成三渲二微缩场景，"
+        "无 UI、正方形底座。\n### 2. 已执行步骤\n已完成环境探测，确认沙箱无网络。"
+    )
+    assert ok is True and reason == ""
+
+
+@pytest.mark.parametrize("junk, expected", [
+    ("", "too short"),
+    ("太短", "too short"),
+    ("DSML invoke name=\"bash\" and then run pytest -q repeatedly", "tool-call markup"),
+    ('{"tool_calls": [{"name": "bash"}]} plus more filler text here', "tool-call markup"),
+    ("I don't see any prior conversation content; please paste the actual conversation text",
+     "asks the user"),
+    ("看不到任何历史，请把对话粘给我，我再给你写摘要。", "asks the user"),
+])
+def test_validate_summary_rejects_junk(junk, expected):
+    ok, reason = validate_summary(junk)
+    assert ok is False
+    assert expected in reason
+
+
+@pytest.mark.parametrize("junk", [
+    "",                                          # 空
+    "无语",                                       # 过短
+    "DSML invoke name=\"bash\": pytest -q",      # 工具调用标记
+    "please paste the actual conversation text",  # 反问用户
+])
+def test_compact_now_refuses_to_land_junk_summaries(junk):
+    """垃圾摘要绝不落地：不新增 compaction、payload 里也不会多出一条假 user 消息。"""
+    s = _long_session()
+    before = len(_compaction_entries(s))
+    engine = CompactionEngine(summarizer=lambda region: junk, retain_ratio=0.16)
+    result = engine.compact_now(s, context_window=100)
+
+    assert result.success is False
+    assert result.reason
+    assert len(_compaction_entries(s)) == before      # 没有落地
+    assert len(s.build_llm_payload()) == len(s._path_to_head()) + 1  # 只有 system 在前面
+
+
+def test_summarizer_tool_call_is_a_rejected_compaction():
+    """模型在摘要调用里仍然发工具调用 -> 判定失败，而不是把工具调用当摘要存下来。"""
+    provider = FauxProvider([[ToolCall("t1", "bash", {"command": "pytest -q"})]])
+    summarize = make_summarizer(provider, "test-model")
+    s = _long_session()
+    engine = CompactionEngine(summarizer=summarize, retain_ratio=0.16)
+    result = engine.compact_now(s, context_window=100)
+
+    assert result.success is False
+    assert "tool" in result.reason
+    assert _compaction_entries(s) == []
+
+
+def test_provider_error_during_summary_is_a_soft_failure():
+    """摘要调用报错不该炸掉用户这一轮：压缩软失败，原文保留。"""
+    from ai import ProviderError
+
+    def failing(region):
+        raise ProviderError("模型 API 错误: 503", retryable=True, code="http_503")
+
+    s = _long_session()
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16)
+    result = engine.compact_now(s, context_window=100)
+
+    assert result.success is False
+    assert "503" in result.reason
+    assert _compaction_entries(s) == []
+
+
+def test_compaction_end_event_carries_reason_and_counts():
+    provider = FauxProvider([[ToolCall("t1", "bash", {"command": "x"})]])
+    engine = CompactionEngine(summarizer=make_summarizer(provider, "test-model"), retain_ratio=0.16)
+    s = _long_session()
+    events = list(engine.compact_if_needed(s, context_window=100))
+
+    end = [e for e in events if e.type == "compaction_end"][0]
+    assert end.data["success"] is False
+    assert end.data["reason"]
+    assert "folded_messages" in end.data and "summary_chars" in end.data
+
+
+# --------------------------------------------------------------------------- #
 # 自动触发：compact_if_needed 生成器 + Agent 集成
 # --------------------------------------------------------------------------- #
 def test_compact_if_needed_yields_events():
-    s = _make_session_with_tool_usage()
+    s = _long_session()
     summarize, _ = make_recording_summarizer()
     engine = CompactionEngine(summarizer=summarize, retain_ratio=0.16)
-    events = list(engine.compact_if_needed(s, context_window=100000))
+    events = list(engine.compact_if_needed(s, context_window=100))
     types = [e.type for e in events]
     assert "compaction_start" in types
     assert "compaction_end" in types

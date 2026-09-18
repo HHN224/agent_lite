@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ai import TextDelta
+from ai import ProviderError, TextDelta
 
 from .content import BLOCK_IMAGE, BLOCK_TEXT, BLOCK_TOOL_RESULT
 from .events import AgentEvent
@@ -69,6 +69,62 @@ TRANSCRIPT_CLOSE = "</transcript>"
 # 被遮区间的字符预算：40 万字符（≈10 万 token）的区间本身就是一次超大请求，
 # 既不便宜也容易直接撞上上下文上限。超出时保留头尾、省略中段。
 DEFAULT_TRANSCRIPT_CHARS = 60000
+
+
+# --------------------------------------------------------------------------- #
+# 摘要输出的硬校验：宁可不压缩，也不把垃圾当摘要写进历史
+# --------------------------------------------------------------------------- #
+# 事实依据：修复前的 8 次真实压缩里，6 次存下来的是「继续任务」「DSML 工具调用原文」
+# 「反问用户要历史」。这些内容一旦落地成 compaction，被折叠的历史就**永久丢失**，
+# 而且会以 user 消息的形式注入后续每一次请求。所以必须有一道闸门。
+class SummaryRejected(Exception):
+    """摘要调用明确不该被采用（模型仍在发工具调用等）。"""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+MIN_SUMMARY_CHARS = 40
+MAX_SUMMARY_CHARS = 16000
+
+# 模型把工具调用写进正文时的标记（GOAT / DeepSeek 路由实测会输出 DSML 文本标记）
+_TOOL_CALL_MARKERS = (
+    "dsml", "<\uff5c", "\uff5c\uff5c", "<tool_call", "</tool_call",
+    "invoke name=", '"tool_calls"', "antml:invoke",
+)
+# 模型反过来向用户要材料时的措辞（实测出现过「请把对话粘给我」）
+_ASKED_FOR_INPUT = (
+    "please paste", "paste the actual conversation", "paste the older conversation",
+    "i don't see any prior", "i don't have any prior",
+    "请把对话", "请提供对话", "看不到任何历史", "没有可总结的对话",
+)
+
+
+def validate_summary(text: str) -> tuple[bool, str]:
+    """判断一段输出能不能当摘要用。返回 (ok, reason)。
+
+    先查「特征很明确」的垃圾（工具调用标记 / 反问用户），再查长度：
+    这样一段很短的 DSML 片段会被报成 tool-call markup，而不是含糊的 too short。
+    """
+    clean = (text or "").strip()
+    lowered = clean.lower()
+    for marker in _TOOL_CALL_MARKERS:
+        if marker in lowered:
+            return False, f"summary contains tool-call markup ({marker!r})"
+    for phrase in _ASKED_FOR_INPUT:
+        if phrase in lowered:
+            return False, "summary asks the user for the transcript instead of summarizing it"
+    if len(clean) < MIN_SUMMARY_CHARS:
+        return False, f"summary too short ({len(clean)} chars < {MIN_SUMMARY_CHARS})"
+    return True, ""
+
+
+def cap_summary(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
+    """摘要过长时按字符截断（长摘要仍然有用，所以截断而不是丢弃）。"""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[... summary truncated by the agent ...]"
 
 
 @dataclass
@@ -196,8 +252,11 @@ def make_summarizer(
         parts: list[str] = []
         for event in provider.stream(msgs, [], model, temperature=0.0, max_tokens=max_tokens):
             if isinstance(event, (ToolCall, ToolCallProgress)):
-                # 到这一步还发工具调用，说明这段输出不是摘要（Step C 会据此判定失败）
-                continue
+                # 到这一步还发工具调用，说明模型仍在「接着干活」而不是总结：
+                # 直接判定这次摘要不可用，交给上层拒绝落地（绝不静默丢弃后当真摘要用）。
+                raise SummaryRejected(
+                    "summarizer still tried to call a tool instead of summarizing"
+                )
             if isinstance(event, TextDelta):
                 parts.append(event.content)
         return "".join(parts).strip()
@@ -294,7 +353,12 @@ class CompactionEngine:
         context_window: int,
         cut: tuple[int, str] | None = None,
     ) -> CompactionResult:
-        """强制压缩一次。cut 可显式指定；缺省自动 find_cut。"""
+        """强制压缩一次。cut 可显式指定；缺省自动 find_cut。
+
+        摘要不合格（校验失败 / 模型仍在发工具调用 / provider 报错）时返回 success=False，
+        **不落地任何 compaction、不重置任何计量**：宁可这次不压，也不让被折叠的历史
+        永远丢失，更不让垃圾以 user 消息的形式进入后续每一次请求。
+        """
         if cut is None:
             cut = self.find_cut(session, context_window)
         if cut is None:
@@ -302,7 +366,22 @@ class CompactionEngine:
         cut_index, first_kept_id = cut
 
         region = self._summary_input(session, cut_index)
-        summary = self.summarizer(region)
+        if not region:
+            return CompactionResult(success=False, reason="nothing to summarize (empty region)")
+
+        try:
+            summary = self.summarizer(region)
+        except SummaryRejected as exc:
+            return CompactionResult(success=False, reason=str(exc.reason))
+        except ProviderError as exc:
+            # 摘要调用失败不该炸掉用户这一轮：保留原文继续跑，下一轮还有机会再压
+            return CompactionResult(success=False, reason=f"summarizer call failed: {exc}")
+
+        ok, reason = validate_summary(summary)
+        if not ok:
+            return CompactionResult(success=False, reason=reason)
+
+        summary = cap_summary(summary)
         entry = session.append_compaction(summary, first_kept_id)
         return CompactionResult(
             success=True,
@@ -320,8 +399,9 @@ class CompactionEngine:
     def compact_if_needed(self, session, context_window: int):
         """若到阈值则压缩，yield 事件，return CompactionResult；否则 return None。
 
-        这是生成器：把「正在压缩 / 压缩完成」以事件形式发射给消费者，
+        这是生成器：把「正在压缩 / 压缩完成（含失败原因）」以事件形式发射给消费者，
         压缩动作本身由 compact_now 同步完成（MVP 不流式播报摘要）。
+        失败时 result.success=False 且 reason 会随事件带给 UI，绝不静默。
         """
         cut = self.find_cut(session, context_window)
         if cut is None:
@@ -331,7 +411,10 @@ class CompactionEngine:
         result = self.compact_now(session, context_window, cut=cut)
         yield AgentEvent("compaction_end", {
             "success": result.success,
+            "reason": result.reason,
             "compacted_count": result.compacted_count,
+            "folded_messages": result.folded_messages,
+            "summary_chars": result.summary_chars,
             "first_kept_entry_id": result.first_kept_entry_id,
         })
         return result
