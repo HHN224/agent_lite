@@ -6,7 +6,10 @@
 关键原则：
   - 所有 truncate_* 只作用于 content 字符串，**不触碰 tool_call_id**，因此模型历史
     中 assistant 的 tool_calls 与 tool 结果的配对关系永远不被破坏。
-  - 写盘是可选的：store 为 None 时退化为纯截断，不影响上下文结构。
+  - **截断必须自曝**：任何被截断的文本都会带上「截了、从哪边截的、丢了多少」的提示，
+    并给出把剩余内容读回来的具体做法。模型不该在毫不知情的情况下拿到残缺输出。
+  - 写盘是可选的：store 为 None 时退化为纯截断，不影响上下文结构；但写盘位置必须
+    在工作目录内（见 workspace_state_dir），否则模型读不回自己的工具输出。
   - 不做任何"为了兼容旧存档"的防御性代码——开发阶段允许破坏性修改，只要达成目的。
 """
 
@@ -20,7 +23,46 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # 截断标记
 # --------------------------------------------------------------------------- #
-TOOL_TRUNCATE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"
+# 设计原则：**截断必须在文本里说出来**。模型上下文里如果只剩「内容突然断掉」，
+# 它会以为那就是全部输出，然后基于残缺信息下结论、或者反复重跑同一个工具。
+# 所以每个标记都要说清三件事：截了、从哪边截的、大概丢了多少。
+def head_truncated_notice(kept: int, total: int) -> str:
+    """保留开头（丢弃尾部）时的提示。"""
+    return (
+        f"\n\n[... OUTPUT TRUNCATED: showing only the FIRST {kept} of {total} characters; "
+        f"the last {total - kept} characters were dropped from the end — "
+        f"everything below is missing ...]\n\n"
+    )
+
+
+def tail_truncated_notice(kept: int, total: int) -> str:
+    """保留结尾（丢弃头部）时的提示。"""
+    return (
+        f"\n\n[... OUTPUT TRUNCATED: showing only the LAST {kept} of {total} characters; "
+        f"the first {total - kept} characters were dropped from the beginning — "
+        f"everything above is missing ...]\n\n"
+    )
+
+
+def middle_truncated_notice(head: int, tail: int, total: int) -> str:
+    """保留头尾（折叠中段）时的提示。"""
+    return (
+        f"\n\n[... OUTPUT TRUNCATED: showing only the FIRST {head} and the LAST {tail} "
+        f"characters of {total}; {total - head - tail} characters in the middle "
+        f"were dropped ...]\n\n"
+    )
+
+
+def json_truncated_notice(kept: int, total: int) -> str:
+    """JSON 结构感知截断时的提示（键名保留，长值被切）。
+
+    注意：JSON 截断后不再是合法 JSON，模型必须知道这一点，否则会照原样解析。
+    """
+    return (
+        f"\n\n[... OUTPUT TRUNCATED: this JSON has been structurally shrunk — "
+        f"long values were cut, only ~{kept} of {total} characters survive and "
+        f"the result is no longer valid JSON ...]\n\n"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -54,19 +96,19 @@ def _safe_segment(value: str, max_len: int = 64) -> str:
 # truncate_* 基础函数（都只改 content，返回新的字符串）
 # --------------------------------------------------------------------------- #
 def truncate_head(text: str, max_chars: int, marker: str | None = None) -> str:
-    """保留开头，丢弃尾部。未超阈值原样返回。"""
+    """保留开头，丢弃尾部。未超阈值原样返回；截断时带上「截了多少」的提示。"""
     if text is None or len(text) <= max_chars:
         return text or ""
-    marker = marker or "\n\n[... tool result tail truncated ...]\n\n"
-    return text[:max_chars] + marker
+    return text[:max_chars] + (
+        marker or head_truncated_notice(max_chars, len(text))
+    )
 
 
 def truncate_tail(text: str, max_chars: int, marker: str | None = None) -> str:
-    """保留结尾，丢弃头部。未超阈值原样返回。"""
+    """保留结尾，丢弃头部。未超阈值原样返回；截断时带上「截了多少」的提示。"""
     if text is None or len(text) <= max_chars:
         return text or ""
-    marker = marker or "\n\n[... tool result head truncated ...]\n\n"
-    return marker + text[-max_chars:]
+    return (marker or tail_truncated_notice(max_chars, len(text))) + text[-max_chars:]
 
 
 def truncate_head_tail(
@@ -83,11 +125,11 @@ def truncate_head_tail(
     """
     if text is None or len(text) <= max_chars:
         return text or ""
-    marker = marker or TOOL_TRUNCATE_MARKER
     head = head_chars or int(max_chars * 0.8)
     tail = tail_chars or int(max_chars * 0.2)
     if head + tail > max_chars:
         tail = max_chars - head
+    marker = marker or middle_truncated_notice(head, tail, len(text))
     return text[:head] + marker + text[-tail:]
 
 
@@ -98,11 +140,19 @@ def truncate_line(text: str, max_line_chars: int, max_lines: int | None = None) 
     lines = text.split("\n")
     if max_lines is not None and len(lines) > max_lines:
         keep = lines[:max_lines]
-        return "\n".join(keep) + f"\n[... {len(lines) - max_lines} lines truncated ...]"
+        dropped = len(lines) - max_lines
+        return (
+            "\n".join(keep)
+            + f"\n[... OUTPUT TRUNCATED: showing only the first {max_lines} of "
+              f"{len(lines)} lines; the remaining {dropped} lines were dropped ...]"
+        )
     out = []
     for ln in lines:
         if len(ln) > max_line_chars:
-            out.append(ln[: max_line_chars] + "...")
+            out.append(
+                ln[:max_line_chars]
+                + f"... [+{len(ln) - max_line_chars} chars truncated from this line]"
+            )
         else:
             out.append(ln)
     return "\n".join(out)
@@ -143,7 +193,7 @@ def truncate_json(text: str, max_chars: int, max_key_len: int = 32) -> str:
         return v
 
     shrunk = json.dumps(shrink(data, int(max_chars * 0.9)), ensure_ascii=False)
-    return shrunk + TOOL_TRUNCATE_MARKER
+    return shrunk + json_truncated_notice(len(shrunk), len(text))
 
 
 # --------------------------------------------------------------------------- #
@@ -169,7 +219,7 @@ class ToolOutputTruncator:
       其他             -> truncate_head_tail
 
     store 为可选的 ToolResultStore；提供时，超阈值结果会全文写盘，
-    模型看到的内容末尾追加 full output path。
+    模型看到的内容末尾追加 full output path 与「怎么把剩下的读回来」的明确指引。
     """
 
     def __init__(
@@ -195,6 +245,30 @@ class ToolOutputTruncator:
             t, self.threshold_chars, self.head_chars, self.tail_chars
         )
 
+    def _continuation_hint(self, full_path: str | None) -> str:
+        """截断之后必须给模型一条**能照着做**的出路，而不是只丢一个路径。
+
+        有全文写盘：给出工作目录内相对写法 + read(offset/limit) 分页指引。
+        没有写盘：明确说「剩下的没保存」，并给出缩小查询范围的做法。
+        """
+        if full_path:
+            relative = self.store.relative(full_path) if self.store is not None else None
+            where = f"{full_path}"
+            if relative:
+                where += f" (workspace-relative: {relative})"
+            read_path = relative or full_path
+            return (
+                f"\n\n(full output saved to {where})\n"
+                f"[The preview above is incomplete. Read the full text back with "
+                f'read(path="{read_path}", offset=<line>, limit=<lines>) — do not guess '
+                f"or re-run the same command blindly.]"
+            )
+        return (
+            "\n\n[The preview above is truncated and the rest was NOT saved. "
+            "Narrow the query (e.g. grep for the interesting part, head/tail, "
+            "sed -n 'start,endp') instead of re-running the same call.]"
+        )
+
     def truncate(
         self,
         content: str,
@@ -215,7 +289,7 @@ class ToolOutputTruncator:
             preview = fn(content)
             if self.store is not None and session_id and tool_call_id:
                 full_path = self.store.write(session_id, tool_call_id, content)
-                preview = preview + f"\n\n(full output saved to {full_path})"
+            preview = preview + self._continuation_hint(full_path)
         return TruncationResult(preview, truncated, full_length, full_path)
 
 

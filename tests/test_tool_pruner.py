@@ -32,40 +32,49 @@ def test_truncate_head_keeps_below_threshold():
 def test_truncate_head_truncates_tail():
     out = truncate_head("A" * 200, 100)
     assert out.startswith("A" * 100)
-    assert "[... tool result tail truncated ...]" in out
-    assert len(out) < 200
+    # 截断必须自曝：说清从哪边截的、丢了多少
+    assert "OUTPUT TRUNCATED" in out
+    assert "FIRST 100 of 200 characters" in out
+    assert "100 characters were dropped from the end" in out
+    # 实际保留的内容只有 100 个字符（提示语本身不算内容）
+    assert len(out) - len(out.lstrip("A")) == 100
 
 
 def test_truncate_tail_truncates_head():
     out = truncate_tail("A" * 200, 100)
     assert out.endswith("A" * 100)
-    assert "[... tool result head truncated ...]" in out
+    assert "OUTPUT TRUNCATED" in out
+    assert "LAST 100 of 200 characters" in out
+    assert "dropped from the beginning" in out
 
 
 def test_truncate_head_tail_folds_middle():
     out = truncate_head_tail("A" * 200, 100, head_chars=20, tail_chars=10)
     assert out.startswith("A" * 20)
     assert out.endswith("A" * 10)
-    assert "[... tool result middle pruned ...]" in out
+    assert "OUTPUT TRUNCATED" in out
+    assert "170 characters in the middle" in out
     assert len(out) < 200
 
 
 def test_truncate_head_tail_respects_budget():
     out = truncate_head_tail("A" * 200, 100, head_chars=90, tail_chars=90)
-    # head+tail 不应超过预算
-    assert len(out) <= 100 + 100  # 允许 marker 占一些
+    # head+tail 不应超过预算（提示语本身不计入内容预算）
+    assert len(out) - len(out.lstrip("A")) == 90
+    assert len(out) - len(out.rstrip("A")) == 10
     assert out.startswith("A" * 90)
 
 
 def test_truncate_line_limits_lines_and_length():
     out = truncate_line("a\nb\nc\nd", max_line_chars=10, max_lines=2)
     assert out.startswith("a\nb")
-    assert "lines truncated" in out
+    assert "OUTPUT TRUNCATED" in out
+    assert "first 2 of 4 lines" in out
 
 
 def test_truncate_line_folds_long_lines():
     out = truncate_line("x" * 100 + "\nok", max_line_chars=10)
-    assert out.split("\n")[0].endswith("...")
+    assert "truncated from this line" in out.split("\n")[0]
     assert "ok" in out
 
 
@@ -75,12 +84,13 @@ def test_truncate_json_preserves_keys():
     assert "alpha" in out
     assert "beta" in out
     assert "gamma" in out
-    assert "[... tool result middle pruned ...]" in out
+    assert "OUTPUT TRUNCATED" in out
+    assert "no longer valid JSON" in out
 
 
 def test_truncate_json_handles_non_json():
     out = truncate_json("not json " * 50, 100)
-    assert "[... tool result middle pruned ...]" in out
+    assert "OUTPUT TRUNCATED" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +109,8 @@ def test_truncator_folds_long_content():
     r = t.truncate("A" * 200, tool_name="bash")
     assert r.truncated is True
     assert r.content.startswith("A" * 20)
-    assert r.content.endswith("A" * 10)
+    assert "A" * 10 in r.content
+    assert "OUTPUT TRUNCATED" in r.content
 
 
 def test_truncator_uses_read_strategy_for_read_tool():
@@ -108,7 +119,8 @@ def test_truncator_uses_read_strategy_for_read_tool():
     r = t.truncate("A" * 200, tool_name="read")
     assert r.truncated is True
     assert r.content.startswith("A" * 100)
-    assert "[... tool result tail truncated ...]" in r.content
+    assert "OUTPUT TRUNCATED" in r.content
+    assert "FIRST 100 of 200 characters" in r.content
 
 
 def test_truncator_writes_full_output_when_store_provided(tmp_path):
@@ -161,7 +173,24 @@ def test_truncator_does_not_write_when_no_store():
     t = ToolOutputTruncator(threshold_chars=100)
     r = t.truncate("A" * 500, tool_name="bash", tool_call_id="call_123", session_id="sess1")
     assert r.full_output_path is None
-    assert "saved to" not in r.content
+    assert "full output saved to" not in r.content
+    # 没写盘也要说清「剩下的没保存」，并给出缩小查询范围的做法
+    assert "NOT saved" in r.content
+    assert "Narrow the query" in r.content
+
+
+def test_truncator_hint_tells_model_how_to_read_the_rest(tmp_path):
+    """截断之后必须给模型一条能照着做的出路（workdir 内相对路径 + read 分页）。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
+    t = ToolOutputTruncator(threshold_chars=100, store=store)
+    r = t.truncate("A" * 500, tool_name="bash", tool_call_id="c1", session_id="s1")
+
+    assert "OUTPUT TRUNCATED" in r.content
+    assert "full output saved to" in r.content
+    assert 'read(path=".agent-lite/tool-results/s1/c1.txt"' in r.content
+    assert "offset=" in r.content and "limit=" in r.content
 
 
 def test_truncator_handles_none_content():
@@ -218,7 +247,8 @@ def test_tool_result_is_truncated_before_backfill():
     tool_msg = messages[2]  # user, assistant(tool_calls), tool
     assert tool_msg["role"] == "tool"
     assert tool_msg["tool_call_id"] == "t1"  # 配对保持不变
-    assert "[... tool result middle pruned ...]" in tool_msg["content"]
+    assert "OUTPUT TRUNCATED" in tool_msg["content"]
+    assert "470 characters in the middle" in tool_msg["content"]
     assert len(tool_msg["content"]) < 500
 
 
@@ -246,7 +276,7 @@ def test_no_truncate_when_content_below_threshold():
     messages = [{"role": "user", "content": "x"}]
     list(loop.run(messages))
     assert messages[2]["content"] == "X" * 50
-    assert "middle pruned" not in messages[2]["content"]
+    assert "OUTPUT TRUNCATED" not in messages[2]["content"]
 
 
 def test_default_truncator_constructed():
