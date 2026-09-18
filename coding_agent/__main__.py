@@ -217,6 +217,15 @@ def parse_args(argv=None):
         help="压缩摘要的最大 token 数（默认 2000）",
     )
     parser.add_argument(
+        "--compact-fallback",
+        choices=["digest", "none"],
+        default="digest",
+        help=(
+            "模型摘要连续失败后怎么办：digest 用机械摘要兜底继续压缩（默认，保证上下文能压下去、"
+            "任务不被拖死）；none 则彻底停手，只保留原文（严格档，上下文会一直增长）"
+        ),
+    )
+    parser.add_argument(
         "--bash-image",
         default="python:3.12-slim",
         help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim，仅 --sandbox=docker 时生效）",
@@ -373,6 +382,7 @@ def build_agent(args, api_key):
             max_tokens=args.compact_max_tokens,
         ),
         retain_ratio=args.compact_retain,
+        fallback=args.compact_fallback,
     )
 
     agent = Agent(
@@ -479,13 +489,7 @@ def main():
             continue
 
         if user_input.strip() == "/compact":
-            # 阶段 B：手动触发一次真压缩（边界吸附 + 保留尾部 + 独立摘要）
-            print(">>> 手动压缩 ...")
-            for ev in agent.compaction_engine.compact_if_needed(
-                agent.session, agent.context_window
-            ):
-                cli_listener(ev)
-            agent._save()
+            _manual_compact(agent)
             continue
 
         # 执行阶段：Ctrl+C 触发 abort（中止本轮），而非退出 REPL
@@ -517,6 +521,23 @@ def _cmd_sessions(repo: SessionRepository, agent):
     for m in metas:
         mark = " *" if m.session_id == agent.session_id else ""
         print(f"   {m.session_id}  {m.name or '<未命名>':<16}  {m.message_count} 条消息  {m.updated_at:.0f}{mark}")
+
+
+def _manual_compact(agent):
+    """/compact：手动触发一次压缩。
+
+    force=True 是关键：自动压缩失败后会进入退避甚至停手，但用户手动要求时必须真的
+    再试一次模型摘要，否则「手动再试」就成了空话。
+    """
+    if agent.compaction_engine is None:
+        print(">>> 未配置上下文压缩")
+        return
+    print(">>> 手动压缩 ...")
+    for ev in agent.compaction_engine.compact_if_needed(
+        agent.session, agent.context_window, force=True
+    ):
+        cli_listener(ev)
+    agent._save()
 
 
 def _cmd_deps(workspace, raw: str):

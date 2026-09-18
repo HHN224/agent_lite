@@ -24,6 +24,8 @@ system 用专用压缩器人格（不是会话里的编码 agent 人格），且
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 
 from ai import ProviderError, TextDelta
@@ -125,6 +127,88 @@ def cap_summary(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "\n\n[... summary truncated by the agent ...]"
+
+
+def sanitize_summary(text: str) -> tuple[str, bool]:
+    """从模型输出里救回可用的摘要正文；返回 (清理后的文本, 是否清理过)。
+
+    为什么需要：这个路由会把工具调用序列化成 DSML 文本混在正文里（我在两次独立探针里
+    都撞到过）。以前只要检测到标记就整条丢弃 —— 但实测那种输出往往是「一段真摘要 +
+    一段工具调用尾巴」，整条扔掉等于白花一次调用，还让压缩一直失败。现在只砍掉标记
+    及其之后的内容：前面那段正文仍然可用。
+    """
+    clean = (text or "").strip()
+    cut = len(clean)
+    lowered = clean.lower()
+    for marker in _TOOL_CALL_MARKERS:
+        index = lowered.find(marker)
+        if index != -1:
+            cut = min(cut, index)
+    if cut >= len(clean):
+        return clean, False
+    # 截断处可能留下半个标签，一并去掉
+    salvaged = re.sub(r"<[^>]*$", "", clean[:cut]).strip()
+    return salvaged, True
+
+
+def mechanical_digest(region: list[dict]) -> str:
+    """不依赖模型的机械摘要：模型摘要连续失败时用它兜底，保证上下文一定压得下去。
+
+    只摘「机械就能拿到」的事实：用户目标/要求、触及的文件、跑过的命令、最后的结论。
+    它比模型摘要粗，所以明确标注来源；但它永不失败、不花一次 API 调用、也不会把
+    任务卡住（真实事故：模型摘要一直超时，压缩 0 次成功，会话涨到 328 条）。
+    """
+    users: list[str] = []
+    assistants: list[str] = []
+    files: list[str] = []
+    commands: list[str] = []
+
+    for message in region:
+        role = message.get("role")
+        text = _render_content(message.get("content")).strip()
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            name = function.get("name")
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except (ValueError, TypeError):
+                args = {}
+            if not isinstance(args, dict):
+                continue
+            if name in ("read", "write", "edit") and args.get("path"):
+                files.append(f"{name} {args['path']}")
+            elif name == "bash" and args.get("command"):
+                commands.append(str(args["command"]).strip().splitlines()[0][:160])
+        if role == "user" and text:
+            users.append(text.replace("\n", " ")[:240])
+        elif role == "assistant" and text:
+            assistants.append(text.replace("\n", " ")[:240])
+
+    def unique(items: list[str], limit: int) -> list[str]:
+        seen, out = set(), []
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out[-limit:]
+
+    parts = [
+        "[机械压缩摘要] 模型摘要连续失败，以下为 agent 从被折叠区间机械提取的事实"
+        f"（共 {len(region)} 条消息）。细节可能不完整，如需原始内容请查看会话存档。",
+    ]
+    goals = unique(users, 6)
+    if goals:
+        parts.append("\n## 用户目标与要求\n" + "\n".join(f"- {g}" for g in goals))
+    touched = unique(files, 20)
+    if touched:
+        parts.append("\n## 触及的文件\n" + "\n".join(f"- {f}" for f in touched))
+    ran = unique(commands, 12)
+    if ran:
+        parts.append("\n## 执行过的命令（截断）\n" + "\n".join(f"- {c}" for c in ran))
+    conclusions = unique(assistants, 3)
+    if conclusions:
+        parts.append("\n## 最近的结论/说明\n" + "\n".join(f"- {c}" for c in conclusions))
+    return cap_summary("\n".join(parts), max_chars=6000)
 
 
 @dataclass
@@ -323,16 +407,24 @@ class CompactionEngine:
             self._reset_failure_state()
             self._session_id = getattr(session, "session_id", None)
 
-    def paused_reason(self, session) -> str:
-        """现在是否处于「压不动，先别试」的状态；返回原因，空串表示可以尝试。"""
+    def _pause_reason(self, session) -> str:
+        """现在该不该「先别试」；返回原因，空串表示可以尝试。
+
+        fallback="digest" 时，连续失败到上限**不算停手**：改成走机械摘要继续压，
+        所以不返回停手原因（否则上下文会一直涨下去）。
+        """
         self._sync_session(session)
-        if self._disabled_reason:
+        if self._disabled_reason and self.fallback != "digest":
             return self._disabled_reason
         if self._consecutive_failures and session.message_count < self._retry_after_messages:
             remaining = self._retry_after_messages - session.message_count
             return (f"上次压缩失败（{self._last_failure_reason}），"
                     f"退避中：再增长约 {remaining} 条消息后重试")
         return ""
+
+    def paused_reason(self, session) -> str:
+        """对外可见的暂停原因（供测试与 UI 使用）。"""
+        return self._pause_reason(session)
 
     def _note_failure(self, session, reason: str):
         self._consecutive_failures += 1
@@ -435,8 +527,12 @@ class CompactionEngine:
         session,
         context_window: int,
         cut: tuple[int, str] | None = None,
+        use_fallback: bool = False,
     ) -> CompactionResult:
         """强制压缩一次。cut 可显式指定；缺省自动 find_cut。
+
+        use_fallback=True 时不再调用模型，直接用机械摘要兜底（模型摘要连续失败后走这条路，
+        保证上下文一定压得下去，见 mechanical_digest）。
 
         摘要不合格（校验失败 / 模型仍在发工具调用 / provider 报错）时返回 success=False，
         **不落地任何 compaction、不重置任何计量**：宁可这次不压，也不让被折叠的历史
@@ -452,19 +548,28 @@ class CompactionEngine:
         if not region:
             return CompactionResult(success=False, reason="nothing to summarize (empty region)")
 
-        try:
-            summary = self.summarizer(region)
-        except SummaryRejected as exc:
-            return CompactionResult(success=False, reason=str(exc.reason))
-        except ProviderError as exc:
-            # 摘要调用失败不该炸掉用户这一轮：保留原文继续跑，下一轮还有机会再压
-            return CompactionResult(success=False, reason=f"summarizer call failed: {exc}")
+        note = ""
+        if use_fallback:
+            summary = mechanical_digest(region)
+        else:
+            try:
+                raw = self.summarizer(region)
+            except SummaryRejected as exc:
+                return CompactionResult(success=False, reason=str(exc.reason))
+            except ProviderError as exc:
+                # 摘要调用失败不该炸掉用户这一轮：保留原文继续跑，由退避机制决定何时再试
+                return CompactionResult(success=False, reason=f"summarizer call failed: {exc}")
 
-        ok, reason = validate_summary(summary)
-        if not ok:
-            return CompactionResult(success=False, reason=reason)
+            summary, salvaged = sanitize_summary(raw)
+            if salvaged:
+                # 这个路由会把工具调用序列化成文本混进正文；救回标记之前的正文，
+                # 而不是整条丢弃（实测：模型摘要经常带着这类尾巴）
+                note = "\n\n[注：摘要末尾的工具调用标记已由 agent 丢弃]"
+            ok, reason = validate_summary(summary)
+            if not ok:
+                return CompactionResult(success=False, reason=reason)
 
-        summary = cap_summary(summary)
+        summary = cap_summary(summary + note)
         entry = session.append_compaction(summary, first_kept_id)
         return CompactionResult(
             success=True,
@@ -479,7 +584,7 @@ class CompactionEngine:
         )
 
     # --- 自动触发生成器（供 Agent 的生成器协作调用）---
-    def compact_if_needed(self, session, context_window: int):
+    def compact_if_needed(self, session, context_window: int, force: bool = False):
         """若到阈值则压缩，yield 事件，return CompactionResult；否则 return None。
 
         这是生成器：把「正在压缩 / 压缩完成（含失败原因）/ 退避中」以事件形式发射给消费者，
@@ -487,19 +592,24 @@ class CompactionEngine:
         失败时 result.success=False 且 reason 会随事件带给 UI，绝不静默。
 
         退避：上次失败后、上下文还没长够之前不重试（否则每个工具轮次都发一次摘要请求，
-        任务会被拖死）；连续失败到上限后彻底停手。退避只在**状态刚变化时**播报一次，
-        避免每个轮次刷一条重复提示。
+        任务会被拖死）；连续失败到上限后，fallback="digest" 改为机械摘要继续压，
+        fallback="none" 则彻底停手。退避只在**状态刚变化时**播报一次，避免刷屏。
+
+        force=True（用户手动 /compact）会忽略退避与停手，强制再试一次模型摘要。
         """
-        paused = self.paused_reason(session)
-        if paused:
-            if not self._pause_announced:
-                self._pause_announced = True
-                yield AgentEvent("compaction_paused", {
-                    "reason": paused,
-                    "consecutive_failures": self._consecutive_failures,
-                    "disabled": bool(self._disabled_reason),
-                })
-            return None
+        self._sync_session(session)
+        if not force:
+            paused = self._pause_reason(session)
+            if paused:
+                if not self._pause_announced:
+                    self._pause_announced = True
+                    yield AgentEvent("compaction_paused", {
+                        "reason": paused,
+                        "consecutive_failures": self._consecutive_failures,
+                        "disabled": bool(self._disabled_reason),
+                        "fallback": self.fallback,
+                    })
+                return None
 
         cut = self.find_cut(session, context_window)
         if cut is None:
@@ -509,8 +619,14 @@ class CompactionEngine:
             })
             return None
 
-        yield AgentEvent("compaction_start", {"compacted_count": cut[0]})
-        result = self.compact_now(session, context_window, cut=cut)
+        use_fallback = (
+            self.fallback == "digest" and bool(self._disabled_reason) and not force
+        )
+        yield AgentEvent("compaction_start", {
+            "compacted_count": cut[0],
+            "fallback": use_fallback,
+        })
+        result = self.compact_now(session, context_window, cut=cut, use_fallback=use_fallback)
         if result.success:
             self._note_success(session)
         else:
@@ -518,6 +634,7 @@ class CompactionEngine:
         yield AgentEvent("compaction_end", {
             "success": result.success,
             "reason": result.reason,
+            "fallback": use_fallback,
             "compacted_count": result.compacted_count,
             "folded_messages": result.folded_messages,
             "summary_chars": result.summary_chars,

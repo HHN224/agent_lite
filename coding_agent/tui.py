@@ -1054,7 +1054,10 @@ class AgentApp(App):
             return
         self._add_notice("✦ 正在压缩上下文…")
         def compact():
-            for event in self.agent.compaction_engine.compact_if_needed(self.agent.session, self.agent.context_window):
+            # force=True：手动触发要能越过「失败退避/停手」，强制再试一次模型摘要
+            for event in self.agent.compaction_engine.compact_if_needed(
+                self.agent.session, self.agent.context_window, force=True
+            ):
                 self._put_event(event)
             self.agent._save()
         await self._run_worker(compact)

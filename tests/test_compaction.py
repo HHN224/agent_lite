@@ -319,6 +319,169 @@ def test_provider_error_during_summary_is_a_soft_failure():
     assert _compaction_entries(s) == []
 
 
+# --------------------------------------------------------------------------- #
+# 摘要末尾带工具调用标记时：救回正文，而不是整条丢弃
+# --------------------------------------------------------------------------- #
+DSML_MARKUP = "<" + "\uff5c\uff5cDSML\uff5c\uff5c calls>\n<" + "\uff5c\uff5cDSML\uff5c\uff5c invoke name=\"bash\">"
+
+
+def test_sanitize_salvages_prose_before_markup():
+    from agent_core.compaction import sanitize_summary
+
+    text = GOOD_SUMMARY + "\n\n" + DSML_MARKUP + "\npytest -q\n</" + "\uff5c\uff5cDSML\uff5c\uff5c calls>"
+    salvaged, changed = sanitize_summary(text)
+
+    assert changed is True
+    assert "DSML" not in salvaged
+    assert salvaged.startswith("## 摘要")
+    assert validate_summary(salvaged)[0] is True
+
+
+def test_sanitize_leaves_clean_summary_untouched():
+    from agent_core.compaction import sanitize_summary
+
+    salvaged, changed = sanitize_summary(GOOD_SUMMARY)
+    assert changed is False and salvaged == GOOD_SUMMARY
+
+
+def test_compaction_accepts_a_summary_that_had_markup_stripped():
+    """以前只要含标记就整条拒绝（于是压缩一直失败）；现在救回正文并落地。"""
+    s = _long_session()
+    engine = CompactionEngine(
+        summarizer=lambda region: GOOD_SUMMARY + "\n\n" + DSML_MARKUP,
+        retain_ratio=0.16,
+    )
+    result = engine.compact_now(s, context_window=100)
+
+    assert result.success is True
+    assert "DSML" not in result.summary
+    assert "工具调用标记已由 agent 丢弃" in result.summary
+    assert len(_compaction_entries(s)) == 1
+
+
+def test_pure_markup_summary_is_still_rejected():
+    s = _long_session()
+    engine = CompactionEngine(summarizer=lambda region: DSML_MARKUP, retain_ratio=0.16)
+    result = engine.compact_now(s, context_window=100)
+
+    assert result.success is False
+    assert _compaction_entries(s) == []
+
+
+# --------------------------------------------------------------------------- #
+# 机械兜底：模型摘要彻底失败后，上下文仍然压得下去
+# --------------------------------------------------------------------------- #
+def test_mechanical_digest_captures_goals_files_and_commands():
+    from agent_core.compaction import mechanical_digest
+
+    region = [
+        {"role": "user", "content": "把雨夜便利店场景改成三渲二风格"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "t1", "type": "function",
+             "function": {"name": "bash", "arguments": '{"command": "python3 tools/duk.py index.html"}'}}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "ok"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "t2", "type": "function",
+             "function": {"name": "edit", "arguments": '{"path": "src/lib/02-toon.js", "old_string": "a", "new_string": "b"}'}}]},
+        {"role": "tool", "tool_call_id": "t2", "content": "done"},
+        {"role": "assistant", "content": "已把材质换成 cel shading。"},
+    ]
+    digest = mechanical_digest(region)
+
+    assert "机械压缩摘要" in digest
+    assert "雨夜便利店" in digest
+    assert "src/lib/02-toon.js" in digest
+    assert "duk.py" in digest
+    assert "cel shading" in digest
+
+
+def test_digest_fallback_lands_a_compaction_after_repeated_failures():
+    """连续失败到上限后：不再调用模型，改用机械摘要把上下文压下去（绝不空转）。"""
+    calls = []
+
+    def failing(region):
+        calls.append(1)
+        raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=2,
+                              fallback="digest")
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))          # 第 1 次失败
+    for i in range(10):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+    list(engine.compact_if_needed(s, context_window=2000))          # 第 2 次失败 -> 达到上限
+    assert len(calls) == 2
+
+    for i in range(10):
+        s.append_message("user", f"再来{i}" + "w" * 400)
+    events = list(engine.compact_if_needed(s, context_window=2000))
+
+    end = [e for e in events if e.type == "compaction_end"]
+    assert end and end[0].data["success"] is True
+    assert end[0].data["fallback"] is True, "达到上限后应该走机械兜底，而不是停止压缩"
+    assert len(calls) == 2, "兜底路径不应该再调用模型摘要"
+    landed = _compaction_entries(s)
+    assert landed and "机械压缩摘要" in landed[-1].summary
+
+
+def test_fallback_none_stops_instead_of_degrading():
+    """--compact-fallback none：连续失败后彻底停手（严格拒绝，不写任何 compaction）。"""
+    def failing(region):
+        raise ProviderError("boom", retryable=True, code="http_503")
+
+    engine = CompactionEngine(summarizer=failing, retain_ratio=0.16,
+                              failure_backoff_messages=5, max_consecutive_failures=1,
+                              fallback="none")
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))
+    for i in range(20):
+        s.append_message("user", f"更多{i}" + "z" * 400)
+    events = list(engine.compact_if_needed(s, context_window=2000))
+
+    assert [e.type for e in events] == ["compaction_paused"]
+    assert events[0].data["disabled"] is True
+    assert _compaction_entries(s) == []
+
+
+def test_force_bypasses_the_pause_for_manual_compact():
+    """用户手动 /compact 时应该强制再试一次模型摘要，而不是被退避挡住。"""
+    calls = []
+    failing = {"on": True}
+
+    def flaky(region):
+        calls.append(1)
+        if failing["on"]:
+            raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
+        return GOOD_SUMMARY
+
+    engine = CompactionEngine(summarizer=flaky, retain_ratio=0.16,
+                              failure_backoff_messages=50, max_consecutive_failures=1)
+    s = Session(session_id="s1", system_prompt="sys")
+    for i in range(40):
+        s.append_message("user", f"需求{i}" + "x" * 400)
+        s.append_message("assistant", f"实现{i}" + "y" * 400)
+
+    list(engine.compact_if_needed(s, context_window=2000))       # 失败 -> 停手
+    assert len(calls) == 1
+    assert engine.paused_reason(s)
+
+    failing["on"] = False
+    events = list(engine.compact_if_needed(s, context_window=2000, force=True))
+    end = [e for e in events if e.type == "compaction_end"]
+    assert end and end[0].data["success"] is True
+    assert len(calls) == 2, "手动 /compact 必须真的再试一次"
+    assert engine.paused_reason(s) == ""
+
+
 def test_compaction_end_event_carries_reason_and_counts():
     provider = FauxProvider([[ToolCall("t1", "bash", {"command": "x"})]])
     engine = CompactionEngine(summarizer=make_summarizer(provider, "test-model"), retain_ratio=0.16)
@@ -370,7 +533,7 @@ def make_agent(script, session_kw=None, context_window=100000, threshold=0.8, en
 
 
 def test_engine_backs_off_then_stops_after_repeated_failures():
-    """连续失败到上限后彻底停手；退避期内的重复触发不再调用摘要器。"""
+    """连续失败到上限后彻底停手（fallback=none 的严格档）；退避期内的重复触发不再调用摘要器。"""
     calls = []
 
     def failing(region):
@@ -378,7 +541,8 @@ def test_engine_backs_off_then_stops_after_repeated_failures():
         raise ProviderError("模型 API 错误: Request timed out.", retryable=True, code="APITimeoutError")
 
     engine = CompactionEngine(summarizer=failing, retain_ratio=0.16,
-                              failure_backoff_messages=5, max_consecutive_failures=2)
+                              failure_backoff_messages=5, max_consecutive_failures=2,
+                              fallback="none")
     s = Session(session_id="s1", system_prompt="sys")
     for i in range(40):
         s.append_message("user", f"需求{i}" + "x" * 400)
@@ -453,6 +617,37 @@ def test_failure_state_does_not_leak_across_sessions():
     for i in range(40):
         b.append_message("user", "y" * 400)
     assert engine.paused_reason(b) == "", "换会话必须重置退避状态"
+
+
+def test_cli_wires_compact_fallback_and_manual_force(monkeypatch, tmp_path):
+    """CLI：--compact-fallback 传到引擎；手动 /compact 走 force（能越过退避）。"""
+    from coding_agent import __main__ as cli
+    from faux_provider import FauxProvider
+    from test_loop import EchoTool
+
+    args = cli.parse_args(["--workspace", str(tmp_path), "--new",
+                           "--compact-fallback", "none"])
+    assert args.compact_fallback == "none"
+    assert cli.parse_args(["--workspace", str(tmp_path)]).compact_fallback == "digest"
+
+    monkeypatch.setattr(cli, "CommandCodeProvider", lambda **kw: FauxProvider([]))
+    monkeypatch.setattr(cli, "SESSIONS_DIR", tmp_path / "sessions")
+    monkeypatch.setattr(cli, "build_tools", lambda *a, **kw: [EchoTool()])
+    agent = cli.build_agent(args, "key")
+    assert agent.compaction_engine.fallback == "none"
+
+    forced = []
+    original = agent.compaction_engine.compact_if_needed
+
+    def spy(session, context_window, force=False):
+        forced.append(force)
+        return original(session, context_window, force=force)
+
+    agent.compaction_engine.compact_if_needed = spy
+    for i in range(40):
+        agent.session.append_message("user", "需求" + "x" * 400)
+    cli._manual_compact(agent)
+    assert forced == [True], "手动 /compact 必须以 force=True 触发"
 
 
 def test_agent_does_not_retry_a_failing_compaction_forever():
