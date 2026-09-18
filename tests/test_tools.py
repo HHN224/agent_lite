@@ -83,9 +83,10 @@ def test_bash_tool_marks_dangerous(tmp_path):
     assert tools["read"].dangerous is False
 
 
-def test_build_tools_has_seven_defaults(tmp_path):
+def test_build_tools_has_expected_defaults(tmp_path):
     names = sorted(t.name for t in build_tools(tmp_path))
-    assert names == ["bash", "edit", "find", "grep", "ls", "read", "write"]
+    assert names == ["bash", "edit", "fetch", "find", "grep", "install", "ls", "read",
+                     "render_page", "write"]
 
 
 def test_describe_call_default_uses_repr(tmp_path):
@@ -215,14 +216,69 @@ def test_read_offset_and_limit(tmp_path):
     result = tools["read"].execute(path="f.txt", offset=2, limit=3)
     assert not result.is_error
     # 行号为 2,3,4（cat -n 风格）
-    assert result.content == "     2\tb\n     3\tc\n     4\td"
+    assert result.content.startswith("     2\tb\n     3\tc\n     4\td")
+    # 只读到第 4 行：必须自曝还剩 1 行，并给出下一次该用的 offset（问题 2 / 4）
+    assert "READ TRUNCATED: showing lines 2-4 of 5" in result.content
+    assert "offset=5" in result.content
 
 
 def test_read_line_numbers_cat_n(tmp_path):
     tools = {t.name: t for t in build_tools(tmp_path)}
     (tmp_path / "f.txt").write_text("x\ny", encoding="utf-8")
     result = tools["read"].execute(path="f.txt")
+    # 整份文件都读到了，就不该出现任何截断提示
     assert result.content == "     1\tx\n     2\ty"
+    assert "TRUNCATED" not in result.content
+
+
+def test_read_reports_char_budget_with_next_offset(tmp_path):
+    """字符预算生效时也要给出行号区间和下一段 offset，而不是无声截断。"""
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "big.txt").write_text("\n".join("line-%03d" % i for i in range(400)), encoding="utf-8")
+
+    result = tools["read"].execute(path="big.txt", max_chars=500)
+    assert not result.is_error
+    assert "READ TRUNCATED" in result.content
+    assert "Call read again with offset=" in result.content
+    # 预算内的内容不会超过预算太多（提示语另计）
+    assert len(result.content) < 1200
+
+
+def test_read_offset_past_end_reports_clearly(tmp_path):
+    tools = {t.name: t for t in build_tools(tmp_path)}
+    (tmp_path / "f.txt").write_text("a\nb", encoding="utf-8")
+    result = tools["read"].execute(path="f.txt", offset=99)
+    assert result.is_error
+    assert "past the end" in result.content and "2 lines" in result.content
+
+
+def test_read_can_page_the_spilled_tool_output(tmp_path):
+    """端到端：工具全文写盘 -> 模型用 read + offset/limit 真的能分段读完。"""
+    from agent_core import ToolResultStore, workspace_state_dir
+
+    workspace = tmp_path
+    store = ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
+    body = "\n".join(f"payload-{i:04d}" for i in range(500))
+    path = store.write("sess1", "t1", body)
+    tools = {t.name: t for t in build_tools(workspace)}
+    relative = store.relative(path)
+
+    first = tools["read"].execute(path=relative)
+    assert not first.is_error
+    assert "READ TRUNCATED" in first.content  # 500 行读不完，而且它说了
+
+    # 按提示接着读，直到读完（模拟模型照着 offset 翻页）
+    seen = 0
+    offset = 1
+    for _ in range(20):
+        page = tools["read"].execute(path=relative, offset=offset, limit=100)
+        assert not page.is_error
+        body_lines = [ln for ln in page.content.split("\n") if "payload-" in ln]
+        seen += len(body_lines)
+        if "offset=" not in page.content:
+            break
+        offset = int(page.content.rsplit("offset=", 1)[1].split(" ")[0])
+    assert seen == 500
 
 
 def test_read_image_returns_data_uri(tmp_path):
@@ -262,6 +318,164 @@ def test_bash_tool_default_timeout_uses_runner(tmp_path, monkeypatch):
     tools["bash"].execute(command="true")
     # 未传 timeout 时应使用 runner 默认（DockerRunner 默认 60）
     assert captured["timeout"] == 60
+
+
+# --------------------------------------------------------------------------- #
+# 受控取件工具：install / fetch
+# --------------------------------------------------------------------------- #
+def _fake_wheel_run(wheel_name="demo-1.0-py3-none-any.whl", module="demo", returncode=0, stderr=""):
+    """假的 pip download：往 wheelhouse 里放一个真的（最小）wheel。"""
+    import zipfile
+    from coding_agent.fetch import wheelhouse_dir
+
+    def run(command, workspace):
+        if returncode == 0:
+            dest = wheelhouse_dir(workspace)
+            dest.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dest / wheel_name, "w") as archive:
+                archive.writestr(f"{module}/__init__.py", "VALUE = 42\n")
+                archive.writestr(f"{module}-1.0.dist-info/METADATA", "Name: demo\n")
+        class P:
+            pass
+        proc = P()
+        proc.returncode = returncode
+        proc.stdout = "Looking in indexes: https://pypi.org/simple\nSaved " + wheel_name
+        proc.stderr = stderr
+        return proc
+
+    return run
+
+
+def test_install_tool_unpacks_into_deps_and_reports(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run())
+
+    result = tool.execute(packages=["demo==1.0"])
+    assert not result.is_error
+    assert "Installed 1 wheel(s)" in result.content
+    assert "demo" in result.content
+    assert "PYTHONPATH already points there" in result.content
+    assert "Looking in indexes" in result.content          # 透明：pip 实际用了哪个索引
+    assert (tmp_path / ".agent-lite" / "deps" / "python" / "demo" / "__init__.py").is_file()
+    # 审计日志落在工作区内
+    assert (tmp_path / ".agent-lite" / "network.log").is_file()
+
+
+def test_install_tool_reports_source_only_packages_as_errors(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(
+        tmp_path,
+        run_command=_fake_wheel_run(returncode=1, stderr="ERROR: No matching distribution found for foo"),
+    )
+    result = tool.execute(packages=["foo"])
+    assert result.is_error
+    assert "Linux wheel" in result.content
+
+
+def test_install_tool_rejects_bad_arguments(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run())
+    assert tool.execute(packages="requests").is_error          # 必须是 list
+    assert tool.execute(packages=[123]).is_error               # 元素必须是 str
+    assert tool.execute(packages=["requests; rm -rf /"]).is_error
+
+
+def test_install_tool_refuses_stdlib_shadowing(tmp_path):
+    from coding_agent.tools import InstallTool
+    tool = InstallTool(tmp_path, run_command=_fake_wheel_run(wheel_name="s-1.0-py3-none-any.whl", module="json"))
+    result = tool.execute(packages=["s"])
+    assert result.is_error and "遮蔽" in result.content
+
+
+def test_fetch_tool_rejects_non_allowlisted_host(tmp_path):
+    from coding_agent.tools import FetchTool
+    tool = FetchTool(tmp_path)
+    result = tool.execute(url="https://evil.example.com/x")
+    assert result.is_error and "白名单" in result.content
+
+
+def test_fetch_tool_reports_saved_path(tmp_path, monkeypatch):
+    from coding_agent import fetch as fetch_mod
+    from coding_agent.tools import FetchTool
+
+    def fake_fetch(workspace, url, filename=None, allowed=None):
+        target = workspace / ".agent-lite" / "downloads" / "doc.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("hello", encoding="utf-8")
+        return {"path": target, "bytes": 5, "url": url}
+
+    monkeypatch.setattr(fetch_mod, "fetch_url", fake_fetch)
+    result = FetchTool(tmp_path).execute(url="https://pypi.org/doc.txt")
+    assert not result.is_error
+    assert "5 bytes" in result.content
+    assert '.agent-lite/downloads/doc.txt' in result.content
+
+
+def test_build_tools_includes_controlled_fetch_tools(tmp_path):
+    from coding_agent.tools import build_tools
+    tools = {t.name: t for t in build_tools(tmp_path, allowed_hosts=["example.com"])}
+    assert "install" in tools and "fetch" in tools and "render_page" in tools
+    assert tools["fetch"].allowed_hosts == ("example.com",)
+    # 机制保证安全 -> 不需要用户逐条确认
+    assert tools["install"].dangerous is False and tools["fetch"].dangerous is False
+    assert tools["render_page"].dangerous is False
+
+
+def test_render_page_tool_reports_errors_and_saves_screenshot(tmp_path, monkeypatch):
+    """render_page 工具：把浏览器报告转成工具结果；页面报错时标记 is_error 但仍给报告。"""
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    fake_report = {
+        "ok": False, "fatal": None, "channel": "msedge", "load_ms": 321,
+        "errors": ["console.error: SHADER: ERROR: 0:130: 'a' : vector field selection out of range"],
+        "warnings": [], "blocked": [], "contacted": [],
+        "page": {"title": "scene", "text": "hello", "canvases": [{"width": 1200, "height": 850}]},
+        "screenshots": {}, "changed": None, "page_file": "index.html",
+    }
+    monkeypatch.setattr(browser_mod, "render_page", lambda *a, **k: dict(fake_report))
+
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert result.is_error is True                       # 页面报错 = 任务失败信号
+    assert "vector field selection out of range" in result.content
+
+
+def test_render_page_tool_handles_unavailable_runner(tmp_path, monkeypatch):
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    def boom(*a, **k):
+        raise browser_mod.BrowserError("没找到 node")
+
+    monkeypatch.setattr(browser_mod, "render_page", boom)
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert result.is_error and "没找到 node" in result.content
+
+
+def test_render_page_tool_attaches_small_screenshot_only(tmp_path, monkeypatch):
+    from coding_agent import browser as browser_mod
+    from coding_agent.tools import RenderPageTool
+
+    shot = tmp_path / ".agent-lite" / "browser" / "s.jpg"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"\xff\xd8\xff" + b"x" * 2048)
+    report = {
+        "ok": True, "fatal": None, "channel": "msedge", "load_ms": 10, "errors": [],
+        "warnings": [], "blocked": [], "contacted": [],
+        "page": {"title": "t", "text": "", "canvases": []},
+        "screenshots": {"small": str(shot)}, "changed": True, "page_file": "index.html",
+    }
+    monkeypatch.setattr(browser_mod, "render_page", lambda *a, **k: dict(report))
+
+    result = RenderPageTool(tmp_path).execute(path="index.html")
+    assert isinstance(result.content, list)
+    assert result.content[0]["type"] == "text"
+    assert result.content[1]["type"] == "image_url"
+    assert result.is_error is False
+
+    # 关掉图片附加时只回文本
+    plain = RenderPageTool(tmp_path, attach_image=False).execute(path="index.html")
+    assert isinstance(plain.content, str)
 
 
 def test_grep_literal_finds_match(tmp_path):

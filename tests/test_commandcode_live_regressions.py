@@ -111,7 +111,7 @@ def test_compaction_does_not_resend_stored_reasoning_blocks():
     provider = FauxProvider([[TextDelta("summary")]])
     summarize = make_summarizer(provider, "test")
     summarize([{"role": "assistant", "content": [{"type": "thinking", "text": "PRIVATE_PLANNING"},
-                                                   {"type": "text", "text": "visible answer"}]}], "")
+                                                   {"type": "text", "text": "visible answer"}]}])
     assert "PRIVATE_PLANNING" not in str(provider.calls[0]["messages"])
     assert "visible answer" in str(provider.calls[0]["messages"])
 

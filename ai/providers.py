@@ -71,11 +71,20 @@ class LLMProvider(ABC):
 
     只负责「如何向某个 LLM 提问」，不知道也不关心谁来消费这些事件。
     任何失败都抛 ProviderError。
+
+    temperature / max_tokens 为可选采样参数：主循环不传（保持服务端默认），
+    摘要这类「要确定性、要控长度」的旁路调用会显式传（temperature=0 + 真实上限）。
     """
 
     @abstractmethod
     def stream(
-        self, messages: list[dict], tools: list[Tool], model: str
+        self,
+        messages: list[dict],
+        tools: list[Tool],
+        model: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Iterator[StreamEvent]:
         """产出文本、推理、工具参数进度和完整工具调用事件。"""
         raise NotImplementedError
@@ -130,7 +139,13 @@ class OpenAIProvider(LLMProvider):
         return result
 
     def stream(
-        self, messages: list[dict], tools: list[Tool], model: str
+        self,
+        messages: list[dict],
+        tools: list[Tool],
+        model: str,
+        *,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Iterator[StreamEvent]:
         # 流式协议下 tool_calls 按 index 分片到达，先累积、流结束后再产出完整事件
         pending: dict[int, dict[str, str]] = {}
@@ -138,14 +153,24 @@ class OpenAIProvider(LLMProvider):
         response = None
         finish_reason = None
 
+        options: dict = {
+            "model": model,
+            "messages": self._chat_messages(messages),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        # 关键：工具列表为空时**整个字段都不发**。空数组在某些 OpenAI 兼容路由上
+        # 仍有「工具可用」的语义，模型会照着自己刚看到的历史继续发工具调用。
+        # 摘要调用必须显式无工具，所以这里只在实际有工具时才带上 tools。
+        if tools:
+            options["tools"] = [t.to_schema() for t in tools]
+        if temperature is not None:
+            options["temperature"] = temperature
+        if max_tokens is not None:
+            options["max_tokens"] = max_tokens
+
         try:
-            response = self.client.chat.completions.create(
-                model=model,
-                messages=self._chat_messages(messages),
-                tools=[t.to_schema() for t in tools],
-                stream=True,
-                stream_options={"include_usage": True},
-            )
+            response = self.client.chat.completions.create(**options)
 
             # 收集流末的真实 usage（非流式末 chunk，通常无 choices）
             usage: dict | None = None

@@ -311,6 +311,15 @@ class LazyCommandRunner:
     def mode(self):
         return self._runner.mode if self._runner is not None else f"{self._mode}（待检测）"
 
+    @property
+    def shell_workspace_alias(self):
+        """探测前也要如实回答容器别名（不确定时返回 None，绝不给模型假路径）。"""
+        if self._runner is not None:
+            return getattr(self._runner, "shell_workspace_alias", None)
+        if self._mode in ("wsl", "docker"):
+            return "/workspace"
+        return None
+
     def describe(self):
         if self._runner is not None:
             return self._runner.describe()
@@ -318,7 +327,11 @@ class LazyCommandRunner:
             from .sandbox import DockerRunner, WslRunner
             runner_type = WslRunner if self._mode == "wsl" else DockerRunner
             return runner_type(self.workspace).describe()
-        return "首次执行命令前检测沙箱；auto 模式优先隔离环境，不保证宿主依赖或网络可用。"
+        return (
+            "首次执行命令前检测沙箱；auto 模式优先隔离环境。"
+            "沙箱本身**没有网络出网能力**：装库请用 install 工具（域名白名单 + 审计），"
+            "取网页/文件请用 fetch 工具，不要反复尝试 curl / pip install。"
+        )
 
     def run(self, command, timeout=None):
         with self._lock:
@@ -994,14 +1007,29 @@ class AgentApp(App):
         await asyncio.to_thread(repo.save, session)
         await self._select_session(session)
 
+    def _agent_workspace(self) -> Path:
+        """工作目录的单一真相源：优先用文件工具实际持有的 workspace。
+
+        写盘位置必须与 read 的 safe_path 边界完全一致（同一个 workspace），
+        否则模型又会拿到一个自己打不开的路径。工具就绪前退回启动时的工作目录。
+        """
+        for tool in getattr(self.agent.loop, "tools", None) or []:
+            workspace = getattr(tool, "workspace", None)
+            if workspace is not None:
+                return Path(workspace).resolve()
+        return Path(self._workspace).resolve()
+
     async def _select_session(self, session):
-        from agent_core import ToolOutputTruncator, ToolResultStore
+        from agent_core import ToolOutputTruncator, ToolResultStore, workspace_state_dir
         self.agent.session = session
         self.agent.clear_queues()
         self.agent.loop.session_id = session.session_id
-        if self.agent.repo is not None:
-            folder = self.agent.repo._path(session.session_id).parent / session.session_id
-            self.agent.loop.truncator = ToolOutputTruncator(store=ToolResultStore(folder))
+        # 工具全文写盘必须落在工作目录内（read 的 safe_path 只认工作目录内的路径），
+        # 否则模型拿到的「全文路径」是一张它打不开的空头支票。
+        workspace = self._agent_workspace()
+        self.agent.loop.truncator = ToolOutputTruncator(
+            store=ToolResultStore(workspace_state_dir(workspace), workspace=workspace)
+        )
         await self._show_session()
 
     async def _resume_session(self, session_id):
@@ -1318,10 +1346,18 @@ class AgentApp(App):
         elif t == "compaction_start":
             self._phase = "正在压缩上下文"
             self._add_notice("正在整理较早的对话记录…", "info")
+        elif t == "compaction_skip":
+            self._add_notice(f"跳过压缩：{event.data.get('reason') or '没有可折叠的内容'}", "warn")
         elif t == "compaction_end":
             d = event.data
             if d.get("success"):
-                self._add_notice(f"◆ 压缩完成，折叠 {d['compacted_count']} 条")
+                folded = d.get("folded_messages", d.get("compacted_count", 0))
+                self._add_notice(f"◆ 压缩完成，折叠 {folded} 条消息")
+            else:
+                # 失败必须可见：以前这里什么都不显示，用户以为压缩成功了
+                self._add_notice(
+                    f"压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}", "warn"
+                )
 
 
 def run_tui(agent: Agent | None = None, *, agent_factory=None, workspace=None) -> None:

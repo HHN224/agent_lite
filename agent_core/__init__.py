@@ -17,9 +17,13 @@ from .content import (
 )
 from .compaction import (
     SUMMARY_PROMPT,
+    SUMMARY_SYSTEM_PROMPT,
     CompactionEngine,
     CompactionResult,
+    SummaryRejected,
     make_summarizer,
+    render_transcript,
+    validate_summary,
 )
 from .context_manager import (
     ContextManager,
@@ -39,6 +43,7 @@ from .truncate import (
     TruncationResult,
     ToolOutputTruncator,
     ToolResultStore,
+    workspace_state_dir,
     truncate_head,
     truncate_tail,
     truncate_head_tail,
@@ -52,9 +57,13 @@ __all__ = [
     "AgentTool",
     "ToolResult",
     "SUMMARY_PROMPT",
+    "SUMMARY_SYSTEM_PROMPT",
     "CompactionEngine",
     "CompactionResult",
+    "SummaryRejected",
     "make_summarizer",
+    "render_transcript",
+    "validate_summary",
     "ContextManager",
     "ContextPressure",
     "TokenMeter",
@@ -73,6 +82,7 @@ __all__ = [
     "TruncationResult",
     "ToolOutputTruncator",
     "ToolResultStore",
+    "workspace_state_dir",
     "truncate_head",
     "truncate_tail",
     "truncate_head_tail",

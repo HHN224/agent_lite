@@ -22,6 +22,7 @@ from agent_core import (
     ToolOutputTruncator,
     ToolResultStore,
     make_summarizer,
+    workspace_state_dir,
 )
 from coding_agent.modes import get_mode, mode_names
 from coding_agent.sandbox import detect_backend
@@ -109,12 +110,12 @@ def cli_listener(event: AgentEvent):
     elif event.type == "compaction_end":
         d = event.data
         if d["success"]:
-            safe_print(f">>> 压缩完成：已折叠 {d['compacted_count']} 条，保留从 {d['first_kept_entry_id']} 起")
+            folded = d.get("folded_messages", d["compacted_count"])
+            safe_print(f">>> 压缩完成：已折叠 {folded} 条消息，保留从 {d['first_kept_entry_id']} 起")
         else:
-            safe_print(">>> 压缩中止（未找到安全切点）")
+            safe_print(f">>> 压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}")
     elif event.type == "compaction_skip":
         safe_print(f">>> 跳过压缩：{event.data['reason']}")
-
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -213,6 +214,22 @@ def parse_args(argv=None):
         help="bash 工具使用的 Docker 运行镜像（默认 python:3.12-slim，仅 --sandbox=docker 时生效）",
     )
     parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=None,
+        metavar="DOMAIN",
+        help=(
+            "扩展受控取件的域名白名单（可重复），例如 --allow-host example.com。"
+            "默认只放行 pypi / npm / github 等取依赖必需的注册表；"
+            "install / fetch / render_page 三个工具受此白名单约束，沙箱本身始终没有网络出网能力"
+        ),
+    )
+    parser.add_argument(
+        "--no-browser-image",
+        action="store_true",
+        help="render_page 不把截图附加给模型（只给路径），用于模型不支持图片输入时",
+    )
+    parser.add_argument(
         "--sandbox",
         choices=["auto", "host", "wsl", "docker"],
         default="auto",
@@ -282,6 +299,8 @@ def build_agent(args, api_key):
             sandbox=args.sandbox,
             workspace=args.workspace,
             bash_image=args.bash_image,
+            # 会话存档（含全部对话与工具输出）也掩蔽掉：它通常就在工作区内
+            mask=[SESSIONS_DIR],
         )
 
     if args.ui == "tui" and _HAS_TUI:
@@ -293,7 +312,16 @@ def build_agent(args, api_key):
         except Exception as e:
             raise RuntimeError(f"错误：{e}") from e
 
-    tools = build_tools(args.workspace, bash_image=args.bash_image, runner=runner)
+    tools = build_tools(
+        args.workspace,
+        bash_image=args.bash_image,
+        runner=runner,
+        allowed_hosts=args.allow_host,
+    )
+    if args.no_browser_image:
+        for tool in tools:
+            if tool.name == "render_page":
+                tool.attach_image = False
 
     loop = AgentLoop(
         provider=provider,
@@ -313,18 +341,29 @@ def build_agent(args, api_key):
     if is_new:
         repo.save(session)  # 新建的立即落盘
 
-    # Phase 2：工具输出管理 —— 按 session 粒度写盘，模型见 preview + 路径
+    # Phase 2：工具输出管理 —— 全文写进**工作目录内**的 .agent-lite/，模型见 preview + 路径。
+    # 写在工作目录之外时 read 的 safe_path 会拒绝，模型就永远读不回自己的工具输出。
     loop.session_id = session.session_id
     loop.truncator = ToolOutputTruncator(
-        store=ToolResultStore(SESSIONS_DIR / session.session_id),
+        store=ToolResultStore(
+            workspace_state_dir(args.workspace), workspace=args.workspace
+        ),
     )
 
     # 上下文管理（阶段 A）：计量 + 触发。阈值做成配置，窗口默认 128000。
     context_manager = ContextManager(threshold_ratio=args.compact_threshold)
 
-    # 阶段 B：真压缩引擎。摘要走独立 provider 调用；保留尾部按窗口比例（默认 0.16 DSH）。
+    # 阶段 B：真压缩引擎。摘要走**独立 provider 实例**：与主循环共用实例时，
+    # 摘要调用的 usage 会写进 provider.last_usage，而那是上下文计量校准 session.usage
+    # 的真实锚点（被覆盖 = 计量失真）。摘要模型与主体模型相同，但 temperature=0、
+    # max_tokens 真正生效，且整条请求不带工具（见 make_summarizer）。
+    summary_provider = provider_class(api_key=api_key, base_url=args.base_url)
     compaction_engine = CompactionEngine(
-        summarizer=make_summarizer(provider=provider, model=args.model, max_tokens=args.compact_max_tokens),
+        summarizer=make_summarizer(
+            provider=summary_provider,
+            model=args.model,
+            max_tokens=args.compact_max_tokens,
+        ),
         retain_ratio=args.compact_retain,
     )
 
@@ -372,6 +411,7 @@ def main():
     print(f">>> 上下文窗口: {args.context_window}（阈值 {args.compact_threshold:.0%}，保留 {args.compact_retain:.0%}）")
     print(f">>> 模式: {args.mode}（/mode 切换，可选: {', '.join(mode_names())}）")
     print(f">>> 输入 /sessions 查看 / 重命名 / 删除会话")
+    print(f">>> 输入 /deps 查看受控取件的依赖与审计日志")
 
     # 当前任务模式（/mode 会更新）；新建会话用 get_mode(current_mode) 作为 system prompt
     current_mode = args.mode
@@ -416,6 +456,10 @@ def main():
 
         if user_input.strip().startswith("/sessions"):
             _cmd_sessions(repo, agent)
+            continue
+
+        if user_input.strip().startswith("/deps"):
+            _cmd_deps(args.workspace, user_input.strip())
             continue
 
         if user_input.strip().startswith("/name"):
@@ -465,6 +509,19 @@ def _cmd_sessions(repo: SessionRepository, agent):
     for m in metas:
         mark = " *" if m.session_id == agent.session_id else ""
         print(f"   {m.session_id}  {m.name or '<未命名>':<16}  {m.message_count} 条消息  {m.updated_at:.0f}{mark}")
+
+
+def _cmd_deps(workspace, raw: str):
+    """/deps 查看受控取件的产物与审计；/deps clear 清空（可逆）。"""
+    from coding_agent import fetch as fetch_mod
+
+    parts = raw.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip() in ("clear", "clean"):
+        fetch_mod.clear_deps(workspace)
+        print(">>> 已清空 .agent-lite/deps（wheel 缓存与解包产物）")
+        return
+    safe_print(fetch_mod.deps_summary(workspace))
+    print(">>> 用法: /deps 查看 | /deps clear 清空依赖")
 
 
 def _cmd_name(repo: SessionRepository, agent, raw: str):

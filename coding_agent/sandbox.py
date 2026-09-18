@@ -22,6 +22,60 @@ from agent_core import ToolResult
 DEFAULT_BASH_IMAGE = "python:3.12-slim"
 
 
+# --------------------------------------------------------------------------- #
+# 沙箱内的秘密掩蔽（内核级，不依赖用户的判断力）
+# --------------------------------------------------------------------------- #
+# 为什么必须有这一层：工作区里通常躺着密钥（.env）与全部对话存档（sessions/），
+# 而沙箱把整个工作区 bind 进 /workspace。只要有任何一个出网路径能被注入的指令利用，
+# 这些内容就是第一个被带走的东西。不靠"逐条确认"挡它 —— 用户会条件反射点 yes。
+#
+# 掩蔽方式（都在挂载层完成，进程内无法绕过）：
+#   文件 -> --ro-bind /dev/null <path>
+#   目录 -> --tmpfs <path>               看到空目录，写入也不落盘
+# 实测（真实 WSL bubblewrap，见 Step 1 冒烟记录）：文件读到的是 **Permission denied**
+# 而不是空内容 —— /mnt/c 这类 drvfs 是 nodev 挂载，绑进去的设备节点打不开。
+# 「明确拒绝」比「静默读到空内容」更好：既不会泄密，也不会让模型以为配置是空的而继续跑。
+SENSITIVE_FILE_PATTERNS = (
+    ".env", ".env.*",
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.keystore",
+    "id_rsa", "id_ed25519", "id_ecdsa",
+    ".netrc", ".npmrc", ".pypirc", ".git-credentials", "credentials.json",
+)
+SENSITIVE_DIR_NAMES = (".ssh", ".aws", ".gnupg", ".docker", "secrets")
+
+
+def _masked_entries(workspace: Path, extra_paths: list[Path] | None = None):
+    """列出工作区内需要掩蔽的条目：[(相对路径, 'file' | 'dir')]。
+
+    只返回**真实存在**的条目（bwrap 不会为一个不存在的挂载点报错，但没必要多写参数）。
+    extra_paths 由调用方传入（例如 agent 自己的会话存档目录），只有落在工作区内才生效。
+    """
+    workspace = Path(workspace).resolve()
+    found: dict[str, str] = {}
+
+    for pattern in SENSITIVE_FILE_PATTERNS:
+        for path in workspace.glob(pattern):
+            if path.is_file():
+                found[path.name] = "file"
+
+    for name in SENSITIVE_DIR_NAMES:
+        path = workspace / name
+        if path.is_dir():
+            found[name] = "dir"
+
+    for extra in extra_paths or []:
+        try:
+            relative = Path(extra).resolve().relative_to(workspace)
+        except ValueError:
+            continue  # 不在工作区内的路径不需要掩蔽
+        if (workspace / relative).is_dir():
+            found[relative.as_posix()] = "dir"
+        elif (workspace / relative).is_file():
+            found[relative.as_posix()] = "file"
+
+    return sorted(found.items())
+
+
 def _run_command(*args, **kwargs):
     """Unattended tools must not read draft keys or share the TUI console."""
     return subprocess.run(*args, stdin=subprocess.DEVNULL,
@@ -101,10 +155,21 @@ class CommandRunner(ABC):
     """
 
     mode = "abstract"  # 后端标识，供 BashTool / CLI 展示与描述
+    # 容器内的工作目录别名（host 档为 None）。
+    # 关键：这个别名只对 bash 生效；read / write / edit 认的是宿主真实工作目录，
+    # 把别名喂给它们只会被 safe_path 拒绝，所以要说清楚而不是让模型自己猜。
+    shell_workspace_alias: str | None = None
+    # 掩蔽是否真的生效（host 档只是"文档承诺"，见 describe）
+    masks_secrets = False
 
-    def __init__(self, workspace, timeout: int = 60):
+    def __init__(self, workspace, timeout: int = 60, mask: list | None = None):
         self.workspace = Path(workspace).resolve()
         self.timeout = timeout
+        self.mask_paths = list(mask or [])
+
+    def masked_entries(self):
+        """本 runner 会在沙箱里掩蔽的条目：[(相对路径, 'file' | 'dir')]。"""
+        return _masked_entries(self.workspace, self.mask_paths)
 
     @abstractmethod
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
@@ -129,6 +194,7 @@ class HostRunner(CommandRunner):
     """
 
     mode = "host"
+    masks_secrets = False  # 宿主直跑：无法在内核层掩蔽密钥，只能如实告知
 
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
         t = self.timeout if timeout is None else timeout
@@ -143,7 +209,9 @@ class HostRunner(CommandRunner):
 
     def describe(self) -> str:
         return (
-            "宿主直跑（无内核文件系统隔离），真实边界依赖权限门 + safe_path；"
+            f"宿主直跑（无内核文件系统隔离），cwd = 工作目录 {self.workspace}；"
+            "真实边界依赖权限门 + safe_path；"
+            "密钥掩蔽在本档**不生效**（.env / sessions/ 对命令仍然可见），"
             "bash 命令请用 WSL/Docker 档以获取真正的隔离"
         )
 
@@ -157,6 +225,8 @@ class WslRunner(CommandRunner):
     """
 
     mode = "wsl"
+    shell_workspace_alias = "/workspace"
+    masks_secrets = True
 
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
         t = self.timeout if timeout is None else timeout
@@ -178,9 +248,12 @@ class WslRunner(CommandRunner):
             "--clearenv",
             "--setenv", "HOME", "/tmp",
             "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            # 依赖目录（受控取件的落地点）暴露给命令；目录不存在也无害
+            "--setenv", "PYTHONPATH", "/workspace/.agent-lite/deps/python",
             "--chdir", "/workspace",
-            "sh", "-lc", command,
         ]
+        args.extend(self._mask_args())
+        args.extend(["sh", "-lc", command])
         proc = _run_command(
             args,
             capture_output=True,
@@ -188,12 +261,32 @@ class WslRunner(CommandRunner):
         )
         return _compose_result(proc)
 
+    def _mask_args(self) -> list[str]:
+        """把密钥/存档掩蔽掉：文件用 /dev/null 覆盖（读会被拒绝），目录用空 tmpfs。"""
+        args: list[str] = []
+        for relative, kind in self.masked_entries():
+            target = f"/workspace/{relative}"
+            if kind == "dir":
+                args.extend(["--tmpfs", target])
+            else:
+                args.extend(["--ro-bind", "/dev/null", target])
+        return args
+
     def describe(self) -> str:
+        masked = [name for name, _ in self.masked_entries()]
+        mask_note = (
+            f"沙箱内已掩蔽敏感内容（{', '.join(masked)}）：读这些路径会是 "
+            "Permission denied 或空目录，这是**故意**的，不要尝试绕过或改写它们；"
+            if masked else ""
+        )
         return (
-            "WSL2 + Bubblewrap（免 Docker daemon）：无网络、系统只读，"
-            "仅工作目录映射为可写的 /workspace（也是命令的当前目录）。"
+            "WSL2 + Bubblewrap（免 Docker daemon）：**无网络出网**、系统只读，"
+            f"仅工作目录（宿主真实路径 {self.workspace}）映射为可写的 /workspace"
+            "（也是命令的当前目录）。"
+            + mask_note +
             "宿主 /mnt、/home、/root 不可见；/tmp 等临时目录在每次命令结束后丢弃。"
-            "不能访问宿主浏览器或靠下载补齐依赖；需要跨命令保留的文件放在工作目录。"
+            "要装库请用 install 工具（域名白名单 + 审计，落 .agent-lite/deps 并自动进 PYTHONPATH），"
+            "要取网页/文件请用 fetch 工具；沙箱本身无法联网，不要反复尝试 curl/pip install。"
         )
 
 
@@ -205,9 +298,11 @@ class DockerRunner(CommandRunner):
     """
 
     mode = "docker"
+    shell_workspace_alias = "/workspace"
+    masks_secrets = True
 
-    def __init__(self, workspace, image: str = DEFAULT_BASH_IMAGE, timeout: int = 60):
-        super().__init__(workspace, timeout)
+    def __init__(self, workspace, image: str = DEFAULT_BASH_IMAGE, timeout: int = 60, mask=None):
+        super().__init__(workspace, timeout, mask)
         self.image = image
 
     def run(self, command: str, timeout: int | None = None) -> ToolResult:
@@ -223,9 +318,15 @@ class DockerRunner(CommandRunner):
             "--mount",
             f"type=bind,source={self.workspace},target=/workspace",
             "--workdir", "/workspace",
-            self.image,
-            "sh", "-lc", command,
+            "--env", "PYTHONPATH=/workspace/.agent-lite/deps/python",
         ]
+        for relative, kind in self.masked_entries():
+            if kind == "dir":
+                args.extend(["--tmpfs", f"/workspace/{relative}"])
+            else:
+                args.extend(["--mount",
+                             f"type=bind,source=/dev/null,target=/workspace/{relative},readonly"])
+        args.extend([self.image, "sh", "-lc", command])
         proc = _run_command(
             args,
             capture_output=True,
@@ -234,9 +335,13 @@ class DockerRunner(CommandRunner):
         return _compose_result(proc)
 
     def describe(self) -> str:
+        masked = [name for name, _ in self.masked_entries()]
+        mask_note = f"已掩蔽敏感内容（{', '.join(masked)}）；" if masked else ""
         return (
             f"Docker 沙箱（无网络/只读根/资源限额），镜像 {self.image}；"
-            "工作目录通过 bind mount 暴露为 /workspace"
+            f"工作目录（宿主真实路径 {self.workspace}）通过 bind mount 暴露为 /workspace；"
+            + mask_note +
+            "要装库请用 install 工具（域名白名单 + 审计），要取网页/文件请用 fetch 工具"
         )
 
 
@@ -270,6 +375,7 @@ def detect_backend(
     sandbox: str = "auto",
     workspace=None,
     bash_image: str = DEFAULT_BASH_IMAGE,
+    mask: list | None = None,
 ) -> CommandRunner:
     """按运行环境选择后端，返回一个 runner 实例。
 
@@ -279,28 +385,31 @@ def detect_backend(
       wsl    强制 WSL2 + Bubblewrap；不可用则抛 SandboxUnavailableError（fail-closed，不静默降级）。
       docker 强制 Docker；不可用则抛 SandboxUnavailableError。
 
+    mask 为额外需要掩蔽的路径（如 agent 自己的会话存档目录），
+    只有落在工作区内才生效；内置的密钥文件模式始终掩蔽。
+
     探测行为：docker/wsl 各执行一次轻量探测命令；host 永远可用。
     """
     workspace = Path(workspace) if workspace is not None else Path.cwd()
 
     if sandbox == "host":
-        return HostRunner(workspace)
+        return HostRunner(workspace, mask=mask)
     if sandbox == "wsl":
         if not _wsl_available():
             raise SandboxUnavailableError(
                 "--sandbox=wsl 已指定，但默认 WSL 发行版不可用或未安装 bubblewrap"
             )
-        return WslRunner(workspace)
+        return WslRunner(workspace, mask=mask)
     if sandbox == "docker":
         if not _docker_available():
             raise SandboxUnavailableError(
                 "--sandbox=docker 已指定，但 Docker daemon 不可用（请先启动 Docker Desktop）"
             )
-        return DockerRunner(workspace, image=bash_image)
+        return DockerRunner(workspace, image=bash_image, mask=mask)
 
     # auto：优先最强可用档，host 无条件兜底
     if _docker_available():
-        return DockerRunner(workspace, image=bash_image)
+        return DockerRunner(workspace, image=bash_image, mask=mask)
     if _wsl_available():
-        return WslRunner(workspace)
-    return HostRunner(workspace)
+        return WslRunner(workspace, mask=mask)
+    return HostRunner(workspace, mask=mask)

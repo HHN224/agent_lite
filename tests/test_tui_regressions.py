@@ -326,6 +326,62 @@ def test_resume_and_older_keep_history_order_and_new_session_separate(tmp_path):
     asyncio.run(run())
 
 
+def test_session_switch_keeps_tool_output_spill_inside_the_workspace(tmp_path):
+    """切会话后重新接线 truncator：写盘位置必须仍与文件工具的 workspace 一致。"""
+    from pathlib import Path
+    from agent_core import SessionRepository
+    from coding_agent.tools import ReadTool
+
+    async def run():
+        agent = make_agent(None)
+        agent.loop.tools = [ReadTool(tmp_path)]
+        agent.repo = SessionRepository(tmp_path / "sessions")
+        app = AgentApp(agent, workspace=str(tmp_path))
+        async with app.run_test() as pilot:
+            app._handle_command("/new")
+            await asyncio.wait_for(app._task, 3)
+            await pilot.pause()
+            store = agent.loop.truncator.store
+            assert store is not None
+            assert Path(store.base_dir).resolve().is_relative_to(tmp_path.resolve())
+            assert store.workspace == tmp_path.resolve()
+            assert agent.loop.session_id == agent.session.session_id
+    asyncio.run(run())
+
+
+def test_tui_reports_compaction_failure_and_skip():
+    """压缩失败/跳过必须在 TUI 里可见：以前只显示成功，用户以为压缩成功了。"""
+    from agent_core import AgentEvent
+
+    def notice_text(app):
+        parts = []
+        for widget in app.query(".notice"):
+            content = getattr(widget, "content", None)
+            parts.append(getattr(content, "plain", None) or str(widget.render()))
+        return "\n".join(parts)
+
+    async def run():
+        app = AgentApp(make_agent(None))
+        async with app.run_test() as pilot:
+            app._put_event(AgentEvent("compaction_end", {
+                "success": False, "reason": "summary too short (3 chars < 40)",
+                "compacted_count": 0, "folded_messages": 0, "summary_chars": 0,
+            }))
+            app._put_event(AgentEvent("compaction_skip", {"reason": "nothing to fold"}))
+            app._put_event(AgentEvent("compaction_end", {
+                "success": True, "reason": "", "compacted_count": 12,
+                "folded_messages": 12, "summary_chars": 900, "first_kept_entry_id": "e9",
+            }))
+            app._drain_events()
+            await app._flush_cards()
+            await pilot.pause()
+            text = notice_text(app)
+            assert "压缩未生效" in text and "too short" in text
+            assert "跳过压缩" in text and "nothing to fold" in text
+            assert "压缩完成，折叠 12 条消息" in text
+    asyncio.run(run())
+
+
 def test_long_reply_keeps_composer_inside_terminal():
     class Provider:
         def stream(self, *args):

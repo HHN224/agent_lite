@@ -6,6 +6,8 @@ from pathlib import Path
 from agent_core import AgentTool, ToolResult
 from agent_core.content import image_block
 
+from . import browser as browser_mod
+from . import fetch as fetch_mod
 from .sandbox import CommandRunner, DockerRunner, DEFAULT_BASH_IMAGE
 
 
@@ -20,14 +22,57 @@ def safe_path(workspace: Path, path: str) -> Path:
     return file
 
 
+# --------------------------------------------------------------------------- #
+# 给模型看的「真实工作目录」说明
+# --------------------------------------------------------------------------- #
+# 教训：以前只把沙箱里的 /workspace 告诉模型，模型就以为那才是自己的根目录，
+# 于是把 /workspace/xxx 这种容器内别名喂给 read / write / edit —— 全部被 safe_path
+# 拒绝。真实路径必须在工具说明书里直接写出来，而不是让模型自己猜。
+def workspace_root_line(workspace: Path) -> str:
+    """文件工具共用的一行「真实工作目录」说明。"""
+    return (
+        f"\nWorkspace root (real absolute path on this machine): {Path(workspace).resolve()}"
+        f" — every path is resolved inside it."
+    )
+
+
+def workspace_path_rules(workspace: Path, runner=None) -> str:
+    """bash 工具用的完整路径规矩（含容器别名与真实路径的区分）。"""
+    ws = Path(workspace).resolve()
+    alias = getattr(runner, "shell_workspace_alias", None)
+    out = (
+        f"\n\nWorkspace root (real absolute path on this machine): {ws}\n"
+        f"read/write/edit/grep/ls/find resolve paths inside this workspace: pass them "
+        f"relative to it (e.g. 'src/main.py') or as this absolute path; anything outside "
+        f"is rejected. The bash working directory is the same real directory."
+    )
+    if alias:
+        out += (
+            f"\nInside bash this directory also appears as {alias} (that is the shell's cwd). "
+            f"{alias} is a container-side alias only — never pass it to read/write/edit, "
+            f"they do not understand it. Use relative paths (or the real path above) everywhere."
+        )
+    return out
+
+
 # 图片文件扩展名（读取时返回 base64 图片内容，供多模态模型查看）
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
-# 文本读取的默认行数上限（0 表示不限制）
+# 文本读取的默认行数上限
 DEFAULT_READ_LIMIT = 2000
+# 单次 read 的字符预算：必须留在 ToolOutputTruncator 阈值（默认 8192）之下，
+# 这样「只读到一部分」由 read 自己用带行号的提示说清楚，而不是被上层从字符中间
+# 一刀切掉（那会毁掉行号结构，模型也就无从知道下次该从第几行接着读）。
+DEFAULT_READ_MAX_CHARS = 6000
 
 
 class ReadTool(AgentTool):
-    """读取文件：支持 offset / limit / 行号，图片文件以 base64 返回。"""
+    """读取文件：支持 offset / limit / max_chars 分页，图片文件以 base64 返回。
+
+    关键约定：**读不完就说出来**。默认每行 2000 行、6000 字符，任一上限触发时都会在
+    结果末尾写明「已显示第 A–B 行，共 N 行」，并给出下一次该用的 offset。
+    工具全文写盘（.agent-lite/tool-results/）也是普通文本文件，用本工具配合
+    offset / limit 就能分段读完，不需要任何特殊参数。
+    """
 
     argument_types = {"path": str}
 
@@ -38,8 +83,13 @@ class ReadTool(AgentTool):
             name="read",
             description=(
                 "Read a file. Text files are returned with line numbers (cat -n style). "
-                "Use offset to skip lines and limit to cap how many lines are returned. "
+                "Use offset to skip lines and limit to cap how many lines are returned; "
+                "when the file is longer than one call can return, the result ends with a "
+                "notice telling you which lines were shown and which offset to use next. "
+                "Large tool outputs spilled by the agent are ordinary text files under "
+                ".agent-lite/tool-results/<session>/ — read them back the same way. "
                 "Image files are returned as base64 data for the model to view."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -47,6 +97,7 @@ class ReadTool(AgentTool):
                     "path": {"type": "string", "description": "The file path to read"},
                     "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)"},
                     "limit": {"type": "integer", "description": "Maximum number of lines to return (default 2000)"},
+                    "max_chars": {"type": "integer", "description": "Character budget for this call (default 6000); lower it to peek, raise it to read more per call"},
                 },
                 "required": ["path"],
             },
@@ -54,7 +105,13 @@ class ReadTool(AgentTool):
             dangerous=False,
         )
 
-    def execute(self, path: str, offset: int | None = None, limit: int | None = None) -> ToolResult:
+    def execute(
+        self,
+        path: str,
+        offset: int | None = None,
+        limit: int | None = None,
+        max_chars: int | None = None,
+    ) -> ToolResult:
         file = safe_path(self.workspace, path)
 
         if not file.exists():
@@ -81,18 +138,61 @@ class ReadTool(AgentTool):
             return ToolResult(content=f"Error reading file: {e}", is_error=True)
 
         lines = text.split("\n")
-        start_line = offset or 1
-        if offset is not None and offset > 1:
-            lines = lines[offset - 1:]
-        if limit is not None:
-            lines = lines[:limit]
+        total_lines = len(lines)
 
-        # 加行号（cat -n 风格），便于模型定位
-        numbered = []
-        for i, line in enumerate(lines):
-            line_num = start_line + i
-            numbered.append(f"{line_num:>6}\t{line}")
-        return ToolResult(content="\n".join(numbered))
+        start = 1 if offset is None else int(offset)
+        if start < 1:
+            return ToolResult(
+                content=f"Error: offset must be >= 1 (1-indexed), got {start}", is_error=True
+            )
+        if start > total_lines:
+            return ToolResult(
+                content=(
+                    f"Error: offset {start} is past the end of {path} "
+                    f"({total_lines} lines total)"
+                ),
+                is_error=True,
+            )
+
+        window = DEFAULT_READ_LIMIT if limit is None else int(limit)
+        if window < 1:
+            return ToolResult(
+                content=f"Error: limit must be >= 1, got {window}", is_error=True
+            )
+        budget = DEFAULT_READ_MAX_CHARS if max_chars is None else int(max_chars)
+        budget = max(200, budget)
+
+        # 加行号（cat -n 风格）并累计字符预算；超出预算就停在这里，行号结构保持完整
+        numbered: list[str] = []
+        used = 0
+        for i, line in enumerate(lines[start - 1: start - 1 + window]):
+            rendered = f"{start + i:>6}\t{line}"
+            if not numbered:
+                if len(rendered) > budget:
+                    rendered = (
+                        rendered[:budget]
+                        + f" [... this single line was cut at {budget} characters ...]"
+                    )
+                numbered.append(rendered)
+                used = len(rendered)
+                continue
+            if used + len(rendered) + 1 > budget:
+                break
+            numbered.append(rendered)
+            used += len(rendered) + 1
+
+        end = start + len(numbered) - 1
+        content = "\n".join(numbered)
+
+        remaining = total_lines - end
+        if remaining > 0:
+            content += (
+                f"\n\n[... READ TRUNCATED: showing lines {start}-{end} of {total_lines}; "
+                f"{remaining} more lines were NOT shown. Call read again with "
+                f"offset={end + 1} (optionally limit=<lines> / max_chars=<chars>) "
+                f"to continue — the file above is incomplete ...]"
+            )
+        return ToolResult(content=content)
 
 
 class WriteTool(AgentTool):
@@ -103,7 +203,10 @@ class WriteTool(AgentTool):
 
         super().__init__(
             name="write",
-            description="Write content to a text file, creating missing parent directories",
+            description=(
+                "Write content to a text file, creating missing parent directories"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -181,8 +284,9 @@ class BashTool(AgentTool):
     def to_schema(self) -> dict:
         schema = super().to_schema()
         schema["function"]["description"] += (
-            "\nExecution environment: " + self.runner.describe() +
-            "\nUse workspace-relative paths with read/write/edit. Check required runtimes once; "
+            "\nExecution environment: " + self.runner.describe()
+            + workspace_path_rules(self.workspace, self.runner)
+            + "\nCheck required runtimes once; "
             "Node, npm, pip and browsers are not guaranteed to exist. If unavailable, "
             "use available tools or report the specific missing capability. Do not repeatedly "
             "search host directories or retry downloads when the sandbox has no network."
@@ -207,6 +311,7 @@ class GrepTool(AgentTool):
             description=(
                 "Search file contents for a regex or literal pattern (ripgrep; falls back to Python). "
                 "Returns up to 100 matches with line numbers."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -299,7 +404,10 @@ class LsTool(AgentTool):
 
         super().__init__(
             name="ls",
-            description="List directory contents (files and subdirectories) with size and mtime",
+            description=(
+                "List directory contents (files and subdirectories) with size and mtime"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -354,6 +462,7 @@ class FindTool(AgentTool):
             description=(
                 "Find files or directories matching a name pattern, type, modified time, or size. "
                 "Name supports glob (*, ?). Scans the workspace recursively."
+                + workspace_root_line(self.workspace)
             ),
             parameters={
                 "type": "object",
@@ -448,7 +557,10 @@ class EditTool(AgentTool):
 
         super().__init__(
             name="edit",
-            description="Replace an exact substring in a text file with new content",
+            description=(
+                "Replace an exact substring in a text file with new content"
+                + workspace_root_line(self.workspace)
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -489,15 +601,225 @@ class EditTool(AgentTool):
         return ToolResult(content=f"Successfully edited {path}")
 
 
+class InstallTool(AgentTool):
+    """受控取件：把 Python 依赖装进工作区内的 .agent-lite/deps/，供离线沙箱使用。
+
+    为什么不做成「给沙箱开网络」：沙箱里没有 pip，而且 /tmp、/home 每条命令都会丢弃，
+    开了网也装不上、装上也留不住。所以取件由本工具在沙箱**外**执行：
+      · 只走域名白名单（默认 pypi 等注册表；可用 --allow-host 扩展）
+      · `pip download --only-binary=:all:` —— 只下 wheel，绝不下载会执行 setup.py 的 sdist
+      · 解包前拒绝遮蔽标准库的顶层模块，解包时挡 zip-slip / 软链接
+      · 全程 append-only 审计到 .agent-lite/network.log
+    因此它是 dangerous=False：安全性由机制保证，不需要用户逐条点 yes（点了也不会看）。
+
+    诚实边界：pip 自身的下载目标由其配置（pip.conf / 镜像）决定，白名单强制作用在
+    fetch 工具与内网阻断上；审计日志会记录 pip 的实际输出以便事后核对。
+    """
+
+    argument_types = {"packages": list}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None, run_command=None):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        self.run_command = run_command
+        hosts = fetch_mod.allowed_hosts(list(self.allowed_hosts))
+        super().__init__(
+            name="install",
+            description=(
+                "Install Python packages into the offline workspace so later shell commands can "
+                "import them. Downloads wheels on the host (wheels only, no package code is "
+                "executed during download) and unpacks them into .agent-lite/deps/python, which is "
+                "already on PYTHONPATH inside the sandbox. Use this instead of 'pip install' "
+                "inside bash — the sandbox itself has no network and no pip. "
+                "Allowed fetch hosts: " + ", ".join(hosts) + "."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "packages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Package specs, e.g. [\"requests==2.31.0\", \"rich\"]",
+                    },
+                },
+                "required": ["packages"],
+            },
+            timeout=600,
+            dangerous=False,
+        )
+
+    def execute(self, packages: list[str]) -> ToolResult:
+        if not isinstance(packages, list) or not all(isinstance(p, str) for p in packages):
+            return ToolResult(content="Error: packages must be a list of strings", is_error=True)
+        try:
+            downloaded = fetch_mod.download_pip_wheels(
+                self.workspace, packages, run_command=self.run_command
+            )
+            unpacked = fetch_mod.unpack_wheels(self.workspace)
+        except fetch_mod.FetchError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+
+        if unpacked["unpacked"] == 0:
+            return ToolResult(
+                content=(
+                    "Error: no usable wheel was downloaded "
+                    "(the package may only ship a source distribution, which cannot be built "
+                    "in the offline sandbox)"
+                ),
+                is_error=True,
+            )
+
+        modules = ", ".join(unpacked["modules"][:8]) or "(unknown)"
+        size_kb = max(1, downloaded["bytes"] // 1024)
+        indexed = next(
+            (line for line in downloaded["output"].splitlines() if "Looking in indexes" in line),
+            "",
+        )
+        audit = fetch_mod.audit_log_path(self.workspace)
+        return ToolResult(content=(
+            f"Installed {unpacked['unpacked']} wheel(s), {size_kb} KB, into "
+            f"{fetch_mod.deps_python_dir(self.workspace)}.\n"
+            f"Top-level modules now importable: {modules}\n"
+            "PYTHONPATH already points there inside the sandbox, so `python3 -c \"import ...\"` works "
+            "in the next bash command. The dependencies persist across commands in the workspace.\n"
+            + (f"{indexed}\n" if indexed else "")
+            + f"Audit log: {audit}"
+        ))
+
+
+class FetchTool(AgentTool):
+    """受控取件：把一个白名单 URL 下到 .agent-lite/downloads/（不执行任何内容）。"""
+
+    argument_types = {"url": str}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        hosts = fetch_mod.allowed_hosts(list(self.allowed_hosts))
+        super().__init__(
+            name="fetch",
+            description=(
+                "Download one http(s) URL into .agent-lite/downloads/ inside the workspace, then "
+                "read it with the read tool. Only these hosts are reachable: " + ", ".join(hosts) +
+                ". Private and link-local addresses are refused, redirects are re-checked, and "
+                "every request is logged. Nothing downloaded is executed."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "http(s) URL on an allowlisted host"},
+                    "filename": {"type": "string", "description": "Optional name to save as"},
+                },
+                "required": ["url"],
+            },
+            timeout=120,
+            dangerous=False,
+        )
+
+    def execute(self, url: str, filename: str | None = None) -> ToolResult:
+        try:
+            result = fetch_mod.fetch_url(
+                self.workspace, url, filename,
+                allowed=fetch_mod.allowed_hosts(list(self.allowed_hosts)),
+            )
+        except fetch_mod.FetchError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+        relative = result["path"].relative_to(self.workspace).as_posix()
+        return ToolResult(content=(
+            f"Fetched {result['bytes']} bytes from {result['url']} -> {relative} "
+            f"(readable with read(path=\"{relative}\"))"
+        ))
+
+
+class RenderPageTool(AgentTool):
+    """在真实浏览器里跑一遍工作区内的页面（本机 Edge/Chrome，headless）。
+
+    这是「前端/可视化任务」的验证闭环：没有它，agent 只能静态推理，错误要由人开浏览器
+    抄回来（真实 session 里为此往返了 3 轮）。它把运行时错误、被拦请求、首屏信息、
+    交互是否改变画面都变成文本；截图落盘给路径，小图才会附加给模型。
+
+    与 install / fetch 同一路线：在沙箱外由我们的代码执行（沙箱是每条命令一次性的，
+    起不了常驻 dev server，WSL 里也没有浏览器）。
+    """
+
+    argument_types = {"path": str}
+
+    def __init__(self, workspace: Path, allowed_hosts: list[str] | None = None, attach_image: bool = True):
+        self.workspace = workspace.resolve()
+        self.allowed_hosts = tuple(allowed_hosts or ())
+        self.attach_image = attach_image
+        super().__init__(
+            name="render_page",
+            description=(
+                "Open a local HTML page in a real headless browser (your installed Edge/Chrome) "
+                "and report what actually happened: uncaught JS errors, console errors (including "
+                "WebGL/shader compile failures), blocked external requests, page title, canvas "
+                "sizes, visible text, and whether the page changed after simulated interaction. "
+                "Use this after writing front-end code instead of guessing whether it works — "
+                "static reasoning cannot catch runtime errors. Pages are served over "
+                "http://127.0.0.1 so ES modules and fetch() work; secrets (.env, sessions/) are "
+                "never served. Screenshots are saved under .agent-lite/browser/ and a small one is "
+                "attached when possible."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Page path inside the workspace, e.g. 'index.html'"},
+                    "wait_ms": {"type": "integer", "description": "Extra wait after load before inspecting (default 2500)"},
+                    "actions": {
+                        "type": "array",
+                        "description": (
+                            "Optional interactions to prove the page responds, e.g. "
+                            "[{\"type\":\"drag\",\"from\":[600,400],\"to\":[760,430]},"
+                            "{\"type\":\"wheel\",\"dy\":-250}]"
+                        ),
+                        "items": {"type": "object"},
+                    },
+                    "screenshot": {"type": "boolean", "description": "Save screenshots (default true)"},
+                },
+                "required": ["path"],
+            },
+            timeout=200,
+            dangerous=False,
+        )
+
+    def execute(self, path: str, wait_ms: int = 2500, actions=None, screenshot: bool = True) -> ToolResult:
+        try:
+            report = browser_mod.render_page(
+                self.workspace, path,
+                wait_ms=wait_ms, actions=actions,
+                allowed_hosts=list(self.allowed_hosts), screenshot=screenshot,
+            )
+        except browser_mod.BrowserError as exc:
+            return ToolResult(content=f"Error: {exc}", is_error=True)
+
+        text = browser_mod.format_report(report)
+        if report.get("fatal"):
+            return ToolResult(content=text, is_error=True)
+
+        content: list[dict] = [{"type": "text", "text": text}]
+        if self.attach_image:
+            image = browser_mod.attach_small_screenshot(self.workspace, report)
+            if image:
+                content.append(image)
+            else:
+                text += "\n（截图体积偏大或未生成，未附加图片；要看画面请打开上面的路径）"
+        # 页面报错算「任务失败信号」，但不阻断工具：模型需要看到报告继续修
+        return ToolResult(content=content if len(content) > 1 else text,
+                          is_error=bool(report.get("errors")))
+
+
 def build_tools(
     workspace: Path,
     bash_image: str = DEFAULT_BASH_IMAGE,
     runner: CommandRunner | None = None,
+    allowed_hosts: list[str] | None = None,
 ) -> list[AgentTool]:
-    """按工作目录组装全部工具（read / write / bash / edit）。
+    """按工作目录组装全部工具（read / write / bash / edit / install / fetch）。
 
     bash 的隔离后端通过 runner 注入（host / wsl / docker）；
     未注入时默认用 DockerRunner（image 由 bash_image 决定），保持向后兼容。
+    allowed_hosts 扩展受控取件的域名白名单（install / fetch 用）。
     """
     return [
         ReadTool(workspace),
@@ -507,4 +829,7 @@ def build_tools(
         GrepTool(workspace),
         LsTool(workspace),
         FindTool(workspace),
+        InstallTool(workspace, allowed_hosts=allowed_hosts),
+        FetchTool(workspace, allowed_hosts=allowed_hosts),
+        RenderPageTool(workspace, allowed_hosts=allowed_hosts),
     ]
