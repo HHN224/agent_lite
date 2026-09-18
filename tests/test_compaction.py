@@ -60,7 +60,8 @@ def _make_session_with_tool_usage():
 def test_find_cut_is_not_on_tool_message():
     s = _make_session_with_tool_usage()
     engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
-    cut = engine.find_cut(s, context_window=100000)
+    # 小窗口才能真的产生切点：切点必须吸附到非 tool 的消息上
+    cut = engine.find_cut(s, context_window=100)
     assert cut is not None
     cut_index, first_kept_id = cut
     # 切点绝不能是 tool 消息（否则保留区段以孤立 tool 结果开头，破坏配对）
@@ -73,6 +74,43 @@ def test_find_cut_returns_none_when_too_short():
     s.append_message("user", "hi")
     engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
     assert engine.find_cut(s, context_window=100000) is None
+
+
+def test_find_cut_returns_none_when_history_fits_in_the_retain_budget():
+    """历史本身就没到保留预算 -> 没有要折叠的东西 -> 必须 None（不能 cut=0）。"""
+    s = _long_session()  # 12 条小消息，远小于 0.16 × 128000
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
+    assert engine.find_cut(s, context_window=128000) is None
+
+
+def test_find_cut_never_yields_an_empty_region():
+    """任何被接受的切点都必须真的折叠了至少一条消息（回归：cut=0 的空压缩）。"""
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
+    cases = [
+        (_long_session(), 100),
+        (_long_session(), 128000),
+        (_make_session_with_tool_usage(), 100),
+        (_make_session_with_tool_usage(), 100000),
+    ]
+    for session, window in cases:
+        cut = engine.find_cut(session, window)
+        if cut is None:
+            continue
+        cut_index, _ = cut
+        path = session._path_to_head()
+        region = [e for e in path[:cut_index] if e.type == "message"]
+        assert cut_index >= 1, f"cut={cut_index} window={window}"
+        assert region, f"empty region for window={window}"
+
+
+def test_compact_now_reports_nothing_to_fold_without_writing_anything():
+    s = _long_session()
+    engine = CompactionEngine(summarizer=lambda r: GOOD_SUMMARY, retain_ratio=0.16)
+    result = engine.compact_now(s, context_window=128000)
+
+    assert result.success is False
+    assert "no safe cut point" in result.reason
+    assert _compaction_entries(s) == []
 
 
 def test_compact_now_lands_compaction_and_renders_user():
@@ -331,18 +369,19 @@ def make_agent(script, session_kw=None, context_window=100000, threshold=0.8, en
 
 
 def test_agent_auto_compacts_on_threshold():
-    # usage 已超阈值（0.9），且历史足够长 → Auto 触发压缩
+    # usage 已超阈值（0.9），且历史确实超过保留预算 → Auto 触发压缩
     summarize, calls = make_recording_summarizer()
     engine = CompactionEngine(summarizer=summarize, retain_ratio=0.16)
-    s = Session(session_id="abc", name="t", system_prompt="sys", usage=90000, new_usage=0)
-    # 造一段足够长的历史，让 find_cut 能找到安全切点
+    s = Session(session_id="abc", name="t", system_prompt="sys", usage=1800, new_usage=0)
+    # 造一段足够长的历史（≈1200 token），窗口 2000 时保留预算只有 320 token，
+    # 于是 find_cut 能找到真实切点（窗口开太大就变成"没有要折叠的东西"）
     for i in range(20):
         s.append_message("user", f"第{i}轮用户问题" + "x" * 100)
         s.append_message("assistant", f"第{i}轮回复" + "y" * 100)
     agent, _ = make_agent(
         [[TextDelta("好的")]],
-        session_kw={"usage": 90000, "new_usage": 0},
-        context_window=100000,
+        session_kw={"usage": 1800, "new_usage": 0},
+        context_window=2000,
         threshold=0.8,
         engine=engine,
     )
@@ -352,6 +391,9 @@ def test_agent_auto_compacts_on_threshold():
     types = [e.type for e in events]
     assert "compaction_start" in types
     assert "compaction_end" in types
+    end = [e for e in events if e.type == "compaction_end"][0]
+    assert end.data["success"] is True
+    assert calls and calls[0]["region_messages"]
 
 
 def test_agent_does_not_compact_when_below_threshold():

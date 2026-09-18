@@ -294,6 +294,11 @@ class CompactionEngine:
         从当前 head 沿链往回累积 token，直到达到保留尾部的 token 预算；
         然后把切点吸附到最近的「安全边界」——绝不落在 tool 消息上
         （否则保留区段会以孤立的 tool 结果开头，破坏工具配对）。
+
+        关键约束：**没有任何消息需要折叠时必须返回 None**。
+        历史本身还没超过保留预算时（扫描走完都没到预算）不能"从 0 折叠"——
+        那会生成一个空区间，模型只会反问用户要历史，而这条反问还会被当成摘要
+        存进存档（实测发生过两次，见 sessions/9c2d5ef1c648）。
         """
         path = session._path_to_head()
         if len(path) < self.min_keep_entries:
@@ -301,7 +306,7 @@ class CompactionEngine:
 
         retain_tokens = max(1, int(context_window * self.retain_ratio))
         acc = 0
-        cut = 0
+        cut: int | None = None
         for i in range(len(path) - 1, -1, -1):
             e = path[i]
             if e.type == "message":
@@ -309,19 +314,23 @@ class CompactionEngine:
             if acc >= retain_tokens:
                 cut = i
                 break
+        if cut is None:
+            # 整个历史都塞得进保留尾部：本来就没有要折叠的东西
+            return None
 
         # 保证保留区段至少 min_keep_entries 条
         if len(path) - cut < self.min_keep_entries:
             cut = len(path) - self.min_keep_entries
 
-        # 边界吸附：切点必须是一条非 tool 的 message；否则向前推进到下一个安全切点
+        # 边界吸附：切点必须是一条非 tool 的 message；否则向后推进到下一个安全切点
         while cut < len(path) and (
             path[cut].type != "message" or path[cut].role == "tool"
         ):
             cut += 1
 
-        if cut >= len(path) or len(path) - cut < self.min_keep_entries:
-            return None  # 找不到安全切点（如全是 tool 消息）
+        # 没有可折叠的消息（cut=0）或找不到安全切点（如全是 tool 消息）→ 不压缩
+        if cut < 1 or cut >= len(path) or len(path) - cut < self.min_keep_entries:
+            return None
 
         return cut, path[cut].id
 
@@ -405,7 +414,10 @@ class CompactionEngine:
         """
         cut = self.find_cut(session, context_window)
         if cut is None:
-            yield AgentEvent("compaction_skip", {"reason": "no safe cut point"})
+            yield AgentEvent("compaction_skip", {
+                "reason": "nothing to fold (history fits in the retained tail) "
+                          "or no safe tool-pairing boundary",
+            })
             return None
         yield AgentEvent("compaction_start", {"compacted_count": cut[0]})
         result = self.compact_now(session, context_window, cut=cut)
