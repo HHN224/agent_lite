@@ -1054,7 +1054,10 @@ class AgentApp(App):
             return
         self._add_notice("✦ 正在压缩上下文…")
         def compact():
-            for event in self.agent.compaction_engine.compact_if_needed(self.agent.session, self.agent.context_window):
+            # force=True：手动触发要能越过「失败退避/停手」，强制再试一次模型摘要
+            for event in self.agent.compaction_engine.compact_if_needed(
+                self.agent.session, self.agent.context_window, force=True
+            ):
                 self._put_event(event)
             self.agent._save()
         await self._run_worker(compact)
@@ -1348,6 +1351,14 @@ class AgentApp(App):
             self._add_notice("正在整理较早的对话记录…", "info")
         elif t == "compaction_skip":
             self._add_notice(f"跳过压缩：{event.data.get('reason') or '没有可折叠的内容'}", "warn")
+        elif t == "compaction_paused":
+            d = event.data
+            if d.get("disabled"):
+                self._add_notice(
+                    f"⚠ 压缩已停手：{d.get('reason')}\n"
+                    "任务不受影响，只是上下文会继续增长；需要时可用 /compact 手动再试。", "warn")
+            else:
+                self._add_notice(f"压缩暂时跳过：{d.get('reason')}", "warn")
         elif t == "compaction_end":
             d = event.data
             if d.get("success"):

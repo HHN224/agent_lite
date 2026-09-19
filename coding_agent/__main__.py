@@ -113,9 +113,17 @@ def cli_listener(event: AgentEvent):
             folded = d.get("folded_messages", d["compacted_count"])
             safe_print(f">>> 压缩完成：已折叠 {folded} 条消息，保留从 {d['first_kept_entry_id']} 起")
         else:
-            safe_print(f">>> 压缩未生效，已保留原文继续：{d.get('reason') or '未知原因'}")
+            failures = d.get("consecutive_failures", 1)
+            safe_print(f">>> 压缩未生效（连续第 {failures} 次），已保留原文继续：{d.get('reason') or '未知原因'}")
     elif event.type == "compaction_skip":
         safe_print(f">>> 跳过压缩：{event.data['reason']}")
+    elif event.type == "compaction_paused":
+        d = event.data
+        if d.get("disabled"):
+            safe_print(f">>> 压缩已停手（任务不受影响）：{d.get('reason')}")
+            safe_print(">>> 需要时可用 /compact 手动再试一次")
+        else:
+            safe_print(f">>> 压缩暂时跳过：{d.get('reason')}")
 # 项目根目录下的 .env 文件（无论从哪里运行都能加载到）
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -206,7 +214,20 @@ def parse_args(argv=None):
         "--compact-max-tokens",
         type=int,
         default=2000,
-        help="压缩摘要的最大 token 数（默认 2000）",
+        help=(
+            "摘要的目标长度（提示词里的数字，默认 2000）。注意：真正发给 API 的输出上限"
+            "会自动放大到 max(此值×4, 6000) —— 这个模型写正文前会先花几千 token 思考，"
+            "上限给小了正文一个字都写不出来（实测 4/4 次 finish_reason=length）"
+        ),
+    )
+    parser.add_argument(
+        "--compact-fallback",
+        choices=["digest", "none"],
+        default="digest",
+        help=(
+            "模型摘要连续失败后怎么办：digest 用机械摘要兜底继续压缩（默认，保证上下文能压下去、"
+            "任务不被拖死）；none 则彻底停手，只保留原文（严格档，上下文会一直增长）"
+        ),
     )
     parser.add_argument(
         "--bash-image",
@@ -365,6 +386,7 @@ def build_agent(args, api_key):
             max_tokens=args.compact_max_tokens,
         ),
         retain_ratio=args.compact_retain,
+        fallback=args.compact_fallback,
     )
 
     agent = Agent(
@@ -471,13 +493,7 @@ def main():
             continue
 
         if user_input.strip() == "/compact":
-            # 阶段 B：手动触发一次真压缩（边界吸附 + 保留尾部 + 独立摘要）
-            print(">>> 手动压缩 ...")
-            for ev in agent.compaction_engine.compact_if_needed(
-                agent.session, agent.context_window
-            ):
-                cli_listener(ev)
-            agent._save()
+            _manual_compact(agent)
             continue
 
         # 执行阶段：Ctrl+C 触发 abort（中止本轮），而非退出 REPL
@@ -509,6 +525,23 @@ def _cmd_sessions(repo: SessionRepository, agent):
     for m in metas:
         mark = " *" if m.session_id == agent.session_id else ""
         print(f"   {m.session_id}  {m.name or '<未命名>':<16}  {m.message_count} 条消息  {m.updated_at:.0f}{mark}")
+
+
+def _manual_compact(agent):
+    """/compact：手动触发一次压缩。
+
+    force=True 是关键：自动压缩失败后会进入退避甚至停手，但用户手动要求时必须真的
+    再试一次模型摘要，否则「手动再试」就成了空话。
+    """
+    if agent.compaction_engine is None:
+        print(">>> 未配置上下文压缩")
+        return
+    print(">>> 手动压缩 ...")
+    for ev in agent.compaction_engine.compact_if_needed(
+        agent.session, agent.context_window, force=True
+    ):
+        cli_listener(ev)
+    agent._save()
 
 
 def _cmd_deps(workspace, raw: str):
