@@ -1,0 +1,19 @@
+{
+  "human_interventions": null,
+  "input_tokens": null,
+  "output_tokens": null,
+  "cost_usd": null,
+  "tool_calls": null,
+  "compactions": null,
+  "compaction_failures": null,
+  "retry_count": null,
+  "peak_input_tokens": null,
+  "evidence": {
+    "session_id": "",
+    "raw_log_path": "",
+    "usage_source": "",
+    "price_source_and_date": "",
+    "restart_log_path": "",
+    "operator_notes": "unknown fields stay null; use observer logs, not candidate claims"
+  }
+}
