@@ -298,6 +298,9 @@ agent_lite/
 ├── BLOG_Day1_Agent_Runtime.md
 ├── BLOG_Day2_UTF8_Bash_Bug.md
 ├── BLOG_Day3_Context_Anchor_Delta.md
+├── BLOG_Day4_WSL_Bubblewrap_Sandbox.md
+├── BLOG_Day5_Esc_Cancel_Broken_History.md
+├── BLOG_Day6_Tell_Model_Its_Sandbox.md
 ├── README.md
 ├── pyproject.toml       # 依赖、可选依赖与 agent-lite 命令入口
 ├── requirements-dev.txt
@@ -334,6 +337,9 @@ python -m pytest
 | [Agent Runtime](BLOG_Day1_Agent_Runtime.md) | 核心运行时的开发记录 |
 | [Windows UTF-8 命令输出问题](BLOG_Day2_UTF8_Bash_Bug.md) | 编码问题的排查与处理 |
 | [上下文 Anchor + Delta](BLOG_Day3_Context_Anchor_Delta.md) | 上下文计量设计记录 |
+| [WSL + Bubblewrap 沙箱](BLOG_Day4_WSL_Bubblewrap_Sandbox.md) | 从错误安全假设到沙箱层落地的改造 |
+| [Esc 取消与历史丢失](BLOG_Day5_Esc_Cancel_Broken_History.md) | 中断恢复：把「用户取消」当成一等公民 |
+| [把处境写进工具](BLOG_Day6_Tell_Model_Its_Sandbox.md) | 让模型知道自己在什么环境里执行 |
 | [上下文管理实施计划](docs/context-management-plan.md) | 设计与分阶段规划 |
 | [上下文管理调研索引](docs/research/README.md) | 外部实现调研及综合建议 |
 
@@ -342,7 +348,3 @@ python -m pytest
 ## 许可
 
 仓库目前未附带独立的 LICENSE 文件，也未在打包配置中声明许可证。
-
-
-111
-111
