@@ -1,5 +1,6 @@
 {
-  "benchmark_version": "1.0.0",
+  "benchmark_version": "2.0.0",
+  "suite": "original-six-functional; see pressure_experiment.json for v2 pressure tests",
   "purpose": "same-model paired harness comparison; fill exact commits before running",
   "model_id": "REPLACE_WITH_EXACT_MODEL_ID",
   "provider_and_endpoint": "REPLACE_WITH_PROVIDER_AND_ENDPOINT_NO_KEY",

@@ -7,7 +7,7 @@ import json
 import random
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 SCALES = {"smoke": 1, "standard": 4, "long": 16}
 CATALOG = {
     "A01": ("跨分片交易对账", "accuracy"),
@@ -478,11 +478,17 @@ processed_count 是全历史首次见到的不同 id 总数（含拒绝）。重
 
 GENERATORS = {"A01": a01, "A02": a02, "A03": a03, "C01": c01, "C02": c02, "L01": l01}
 
+from long_tasks import CATALOG as LONG_CATALOG, generate_long
+CATALOG.update(LONG_CATALOG)
 
-def generate(workspace, task, seed, scale):
+
+def generate(workspace, task, seed, scale, stages=None, history_chars=None):
     # Separate RNG streams per task; do not use salted Python hash().
     rng = random.Random(f"{VERSION}/{task}/{seed}/{scale}")
-    prompt, spec = GENERATORS[task](workspace, rng, SCALES[scale])
+    if task in LONG_CATALOG:
+        prompt, spec = generate_long(workspace, task, rng, SCALES[scale], stages, history_chars)
+    else:
+        prompt, spec = GENERATORS[task](workspace, rng, SCALES[scale])
     write(workspace / "PROMPT.md", COMMON + "\n" + prompt)
     immutable = {}
     mutable = spec.get("mutable", [])

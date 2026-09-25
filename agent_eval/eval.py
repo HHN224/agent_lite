@@ -49,36 +49,60 @@ def within(root, rel):
 
 def load_run(run):
     run = Path(run).resolve()
-    return run, read(run / "run.json"), read(run / "private/spec.json")
+    meta, spec = read(run / "run.json"), read(run / "private/spec.json")
+    spec["immutable"].update(meta.get("runtime_immutable", {}))
+    return run, meta, spec
 
 
-def prepare(task, seed, scale, out):
+def prepare(task, seed, scale, out, stages=None, history_chars=None):
+    if stages is not None and (not 2 <= stages <= 128 or task[0] not in "MWR"):
+        raise ValueError("--stages is only for M/W/R tasks, range 2..128")
+    if history_chars is not None and (not 500 <= history_chars <= 64000 or not task.startswith("M")):
+        raise ValueError("--history-chars is only for M tasks, range 500..64000")
     out = Path(out).resolve()
     if out.exists():
         raise ValueError(f"output already exists; use a fresh directory: {out}")
     out.mkdir(parents=True)
     workspace = out / "workspace"
     workspace.mkdir()
-    spec = generate(workspace, task, seed, scale)
+    spec = generate(workspace, task, seed, scale, stages, history_chars)
+    # Long code tasks have many regression replays; keep them off the per-stage hot path.
+    if "code_cases" in spec:
+        cases = spec.pop("code_cases")
+        case_path = out / "private/code_cases.json"
+        dump(case_path, cases)
+        spec["code_cases_ref"] = {"path": "code_cases.json", "sha256": digest(case_path), "count": len(cases)}
     dump(out / "private/spec.json", spec)
     identity = {"benchmark_version": VERSION, "task": task, "seed": seed, "scale": scale}
     identity["fixture_sha256"] = digest(out / "private/spec.json")
     meta = {**identity, "run_id": uuid.uuid4().hex, "created_at": now(), "status": "prepared",
             "current_phase": 1, "agent": None, "model": None, "variant": None, "repeat": None,
             "budget_seconds": None, "started_at": None, "finished_at": None,
-            "elapsed_seconds": None, "telemetry": {}, "restarts": []}
+            "elapsed_seconds": None, "telemetry": {}, "restarts": [],
+            "stages": len(spec.get("phases", [])),
+            "history_chars": spec.get("pressure_design", {}).get("chars_per_stage_target"),
+            "pressure_requirements": {"min_peak_ratio": None, "min_compactions": 0}}
     dump(out / "run.json", meta)
+    first_prompt = (workspace / "PROMPT.md").read_text(encoding="utf-8")
+    if spec.get("delivery") == "inline_history":
+        first_prompt += "\n" + spec["phases"][0]["prompt"]
+    write(out / "next_prompt.txt", first_prompt)
     return out
 
 
-def start(run, agent, model, variant, repeat, budget_seconds, protocol):
+def start(run, agent, model, variant, repeat, budget_seconds, protocol, min_peak_ratio=None, min_compactions=0):
     run, meta, _ = load_run(run)
     if meta["status"] != "prepared":
         raise ValueError("start is allowed only once, on a prepared run")
     if budget_seconds <= 0 or repeat < 1:
         raise ValueError("positive budget and repeat >= 1 required")
+    if min_peak_ratio is not None and not 0 < min_peak_ratio <= 1:
+        raise ValueError("min peak ratio must be in (0,1]")
+    if min_compactions < 0:
+        raise ValueError("min compactions cannot be negative")
     meta.update(agent=agent, model=model, variant=variant, repeat=repeat, budget_seconds=budget_seconds,
-                protocol=protocol, started_at=now(), status="running")
+                protocol=protocol, started_at=now(), status="running",
+                pressure_requirements={"min_peak_ratio": min_peak_ratio, "min_compactions": min_compactions})
     dump(run / "run.json", meta)
 
 
@@ -100,10 +124,20 @@ def checkpoint(run):
     snapshot = run / "private/snapshots" / Path(rel).name
     if snapshot.exists():
         raise ValueError("checkpoint already frozen")
+    if index + 1 < len(phases):
+        for name in phases[index + 1]["files"]:
+            if within(run / "workspace", name).exists():
+                raise ValueError(f"next stage input already exists: {name}")
+    if phases[index].get("freeze_source"):
+        src = within(run / "workspace", "src")
+        if not src.is_dir() or src.is_symlink() or any(p.is_symlink() for p in src.rglob("*")):
+            raise ValueError("source snapshot requires a regular src directory without symlinks")
+        shutil.copytree(src, run / f"private/source_snapshots/{index + 1:03}/src")
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(path, snapshot)
     # Do not validate correctness here: stage advancement cannot leak a hidden score.
     spec["immutable"][rel] = digest(snapshot)
+    meta.setdefault("runtime_immutable", {})[rel] = digest(snapshot)
     meta.setdefault("checkpoints", []).append({"phase": index + 1, "frozen_at": now(), "sha256": digest(snapshot)})
     meta["current_phase"] += 1
     if index + 1 < len(phases):
@@ -114,12 +148,12 @@ def checkpoint(run):
                 raise ValueError(f"next stage input already exists: {name}")
             dump(target, data)
             spec["immutable"][name] = digest(target)
+            meta["runtime_immutable"][name] = digest(target)
         write(run / "next_prompt.txt", nxt["prompt"] + "\n")
         result = nxt["prompt"]
     else:
         write(run / "next_prompt.txt", "全部阶段已冻结，结束测评。\n")
         result = "All stages frozen. Run finish, then grade."
-    dump(run / "private/spec.json", spec)
     dump(run / "run.json", meta)
     return result
 
@@ -176,8 +210,9 @@ def code_checks(run, meta, spec, execute):
     for case in spec["code_cases"]:
         with tempfile.TemporaryDirectory(prefix="agent-eval-") as temp:
             root = Path(temp)
-            src = run / "workspace/src"
-            if (not src.is_dir() or src.is_symlink() or not src.resolve().is_relative_to((run / "workspace").resolve())
+            source_root = run / (f"private/source_snapshots/{case['source_phase']:03}" if "source_phase" in case else "workspace")
+            src = source_root / "src"
+            if (not src.is_dir() or src.is_symlink() or not src.resolve().is_relative_to(source_root.resolve())
                     or any(p.is_symlink() for p in src.rglob("*"))):
                 results.append({"name": case["name"], "passed": False, "kind": "behavior", "error": "missing src or symlink"})
                 continue
@@ -200,8 +235,9 @@ def code_checks(run, meta, spec, execute):
                     with (root / "stdout.txt").open("wb") as stdout, (root / "stderr.txt").open("wb") as stderr:
                         proc = subprocess.run(cmd, input=json.dumps(batch["input"], ensure_ascii=True).encode("ascii"),
                                               stdout=stdout, stderr=stderr, cwd=root, env=env, timeout=5)
-                    if (root / "stdout.txt").stat().st_size > 2_000_000:
-                        raise ValueError("stdout exceeds 2 MB")
+                    output_limit = max(2_000_000, 4 * len(json.dumps(batch["expected"], ensure_ascii=True)) + 1024)
+                    if (root / "stdout.txt").stat().st_size > output_limit:
+                        raise ValueError("stdout exceeds case output budget")
                     answer = read(root / "stdout.txt")
                     ok = proc.returncode == 0 and same(answer, batch["expected"])
                     if meta["task"] == "C02":
@@ -251,6 +287,12 @@ def grade(run, execute=False):
     if result_path.exists():
         raise ValueError("already graded; a new attempt requires a fresh run")
     checks = integrity_checks(run, spec) + output_checks(run, spec)
+    if "code_cases_ref" in spec:
+        ref = spec["code_cases_ref"]
+        path = within(run / "private", ref["path"])
+        if digest(path) != ref["sha256"]:
+            raise ValueError("hidden case file hash mismatch: evaluator data changed")
+        spec["code_cases"] = read(path)
     if "code_cases" in spec:
         checks += code_checks(run, meta, spec, execute)
     core = [c for c in checks if c["kind"] in {"artifact", "behavior"}]
@@ -265,12 +307,17 @@ def grade(run, execute=False):
                     and meta.get("telemetry", {}).get("compactions", 0) > 0))
     measured_completion = (meta["status"] == "completed" and meta["elapsed_seconds"] is not None
                            and meta["elapsed_seconds"] <= meta["budget_seconds"])
-    result = {"run_id": meta["run_id"], "benchmark_version": VERSION, "graded_at": now(),
+    from pressure import assess_pressure
+    pressure = assess_pressure(run, meta, checks)
+    result = {"run_id": meta["run_id"], "benchmark_version": meta["benchmark_version"], "graded_at": now(),
               "artifact_pass": artifact_pass, "autonomous_success": artifact_pass and measured_completion and no_help and protocol_ok,
               "protocol_evidence_present": protocol_ok,
               "integrity_pass": integrity, "all_stages_frozen": complete_phases,
               "partial_score": round(sum(c["passed"] for c in core) / len(core), 6) if core else 0,
               "checks": checks, "failure_reason": []}
+    result["pressure"] = pressure
+    # Functional success and pressure qualification are separate: efficient solving is not a failure.
+    result["pressure_qualified_success"] = result["autonomous_success"] and pressure["qualified"] is True
     if not no_help:
         result["failure_reason"].append("human interventions unknown or nonzero: no autonomous success claim")
     if not measured_completion:
@@ -306,12 +353,12 @@ def summarize(root):
         if m["run_id"] in seen:
             raise ValueError(f"duplicate run_id (copied result would double count): {m['run_id']}")
         seen.add(m["run_id"])
-        key = tuple(m.get(k) for k in ["benchmark_version", "agent", "model", "variant", "scale", "budget_seconds", "protocol"])
+        key = tuple(m.get(k) for k in ["benchmark_version", "agent", "model", "variant", "scale", "budget_seconds", "protocol", "stages", "history_chars"]) + (json.dumps(m.get("pressure_requirements", {}), sort_keys=True),)
         result = read(path.parent / "results/grade.json") if (path.parent / "results/grade.json").exists() else None
         groups.setdefault(key, []).append((m, result))
     output = []
     for key, rows in groups.items():
-        labels = ["benchmark_version", "agent", "model", "variant", "scale", "budget_seconds", "protocol"]
+        labels = ["benchmark_version", "agent", "model", "variant", "scale", "budget_seconds", "protocol", "stages", "history_chars", "pressure_requirements"]
         item = dict(zip(labels, key))
         n = len(rows)
         wins = sum(bool(r and r["autonomous_success"]) for _, r in rows)
@@ -330,6 +377,7 @@ def summarize(root):
         item.update(planned_runs=n, graded_runs=sum(r is not None for _, r in rows), successes=wins,
                     success_rate=wins / n, macro_task_rate=sum(sum(v) / len(v) for v in tasks.values()) / len(tasks),
                     by_task={k: {"n": len(v), "wins": sum(v), "rate": sum(v) / len(v)} for k, v in sorted(tasks.items())},
+                    pressure_qualified_successes=sum(bool(r and r.get("pressure_qualified_success")) for _, r in rows),
                     descriptive_wilson95=wilson(wins, n),
                     incomplete=sum(m["status"] in {"prepared", "running"} or r is None for m, r in rows),
                     total_elapsed_seconds=sum(elapsed) if len(elapsed) == n else None,
@@ -356,6 +404,8 @@ def main():
     p.add_argument("--seed", type=int, default=17)
     p.add_argument("--scale", choices=SCALES, default="standard")
     p.add_argument("--out", required=True)
+    p.add_argument("--stages", type=int, help="M/W/R tasks only; 2..128")
+    p.add_argument("--history-chars", type=int, help="M tasks only; meaningful inline records per stage, 500..64000")
     p = sub.add_parser("start")
     p.add_argument("--run", required=True)
     for name in ["agent", "model", "variant"]:
@@ -363,6 +413,8 @@ def main():
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--budget-seconds", type=int, required=True)
     p.add_argument("--protocol", choices=["normal", "resume", "compaction"], default="normal")
+    p.add_argument("--min-peak-ratio", type=float, help="measured main-request input / declared window threshold")
+    p.add_argument("--min-compactions", type=int, default=0)
     for command in ["checkpoint", "restart", "finish", "grade"]:
         p = sub.add_parser(command)
         p.add_argument("--run", required=True)
@@ -382,10 +434,10 @@ def main():
             for task, (title, dimension) in CATALOG.items():
                 print(f"{task}  {dimension:14} {title}")
         elif args.cmd == "prepare":
-            out = prepare(args.task, args.seed, args.scale, args.out)
+            out = prepare(args.task, args.seed, args.scale, args.out, args.stages, args.history_chars)
             print(f"Prepared {out}\nCandidate receives ONLY: {out / 'workspace'}")
         elif args.cmd == "start":
-            start(args.run, args.agent, args.model, args.variant, args.repeat, args.budget_seconds, args.protocol)
+            start(args.run, args.agent, args.model, args.variant, args.repeat, args.budget_seconds, args.protocol, args.min_peak_ratio, args.min_compactions)
             print("Started. Wall clock is recorded; the operator must enforce the budget.")
         elif args.cmd == "checkpoint":
             print(checkpoint(args.run))
