@@ -290,6 +290,7 @@ agent_lite/
 ├── agent_core/          # 对话状态、事件循环、工具执行、会话与上下文管理
 ├── ai/                  # 工具 Schema、Provider 契约与 OpenAI 兼容实现
 ├── coding_agent/        # CLI / TUI、任务模式、具体工具与命令后端
+├── agent_eval/          # 离线评测题包：确定性出题、客观评分与上下文压力测量
 ├── docs/
 │   ├── research/        # 上下文管理调研与综合建议
 │   └── context-management-plan.md
@@ -342,6 +343,8 @@ python -m pytest
 | [把处境写进工具](BLOG_Day6_Tell_Model_Its_Sandbox.md) | 让模型知道自己在什么环境里执行 |
 | [上下文管理实施计划](docs/context-management-plan.md) | 设计与分阶段规划 |
 | [上下文管理调研索引](docs/research/README.md) | 外部实现调研及综合建议 |
+| [离线评测题包 agent_eval](agent_eval/README.md) | 30 个可执行任务、评分器、实验方案与报告模板 |
+| [长任务 v2 指南](agent_eval/docs/LONG_TASKS.md) | M / W / R 共 24 道新题与上下文压力设计 |
 
 开发记录与调研文档保留了阶段性方案；当前运行行为以源码和测试为准。提交功能变更时，请同时更新对应测试和本 README 的参数或行为说明。
 
