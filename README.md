@@ -177,7 +177,7 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 
 `render_page(path, wait_ms, actions, screenshot)` 把这条回路交还给 agent：
 
-- **复用你已装的 Edge / Chrome**（`channel: msedge → chrome → bundled`），不下载 Chromium；Node 从 PATH 取，Playwright 模块自动探测（也可用 `AGENT_LITE_PLAYWRIGHT` 指定）。
+- **复用你已装的 Edge / Chrome**（`channel: msedge → chrome → bundled`），不下载 Chromium；Node 从 PATH 取（也可用 `AGENT_LITE_NODE` 指定 node 可执行文件），Playwright 模块自动探测（也可用 `AGENT_LITE_PLAYWRIGHT` 指定）。
 - **文本优先**：捕获 `pageerror`、`console.error`（**WebGL / 着色器编译错误就在这里**）、`console.warning`、被拦请求、页面标题、canvas 尺寸、首屏可见文本。
 - **交互验证**：给出 `actions`（`drag` / `wheel` / `click` / `wait`）后做**像素差分**，把"渲染循环与交互到底活着没有"变成一个明确的「发生了变化 / 没有任何变化」。
 - **页面通过网络访问外部**：在浏览器层拦截，只放行 `127.0.0.1` 与白名单域名，其余 abort 并记入报告与 `.agent-lite/network.log`。
