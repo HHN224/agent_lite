@@ -5,6 +5,7 @@
 用 Python 实现的交互式 Coding Agent，探索工具调用、会话状态与长对话上下文管理。
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue?style=for-the-badge)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](#1-安装)
 [![Stars](https://img.shields.io/github/stars/HHN224/agent_lite?style=for-the-badge)](https://github.com/HHN224/agent_lite/stargazers)
 
 </div>
@@ -54,6 +55,8 @@ python -m pip install -e ".[tui]"
 ```
 
 只需要 CLI 时可安装 `python -m pip install -e .`。未安装 Textual 时，默认界面会回退到 CLI。Docker 并非必装依赖，仅 Docker 后端需要它。
+
+仓库另外保留了 `requirements.txt`（运行时依赖：`openai`、`python-dotenv`）和 `requirements-dev.txt`（在其之上追加 `pytest`），供不便使用 `pip install -e` 的场景直接 `python -m pip install -r requirements-dev.txt`。两者都**不含** TUI 的 `textual`，需要 TUI 时仍用 `.[tui]`；依赖以 `pyproject.toml` 为准，这两份文件是它的等价副本。
 
 ### 2. 配置模型密钥
 
@@ -294,11 +297,13 @@ agent_lite/
 ├── ai/                  # 工具 Schema、Provider 契约与 OpenAI 兼容实现
 ├── coding_agent/        # CLI / TUI、任务模式、具体工具与命令后端
 ├── agent_eval/          # 离线评测题包：确定性出题、客观评分与上下文压力测量
+│   └── docs/            # 题面、实验协议、公开题源与长任务指南
 ├── docs/
 │   ├── research/        # 上下文管理调研与综合建议
 │   └── context-management-plan.md
 ├── tests/               # FauxProvider 驱动的确定性测试与模块测试
 ├── .env.example         # 环境变量示例
+├── .gitignore           # 忽略 .env、sessions/ 与工作目录内的 .agent-lite/
 ├── BLOG_Day1_Agent_Runtime.md
 ├── BLOG_Day2_UTF8_Bash_Bug.md
 ├── BLOG_Day3_Context_Anchor_Delta.md
@@ -334,7 +339,15 @@ python -m pip install -e ".[dev,tui]"
 python -m pytest
 ```
 
-测试覆盖工具执行与校验、沙箱、会话恢复、模型循环、上下文计量与压缩、输出截断、模式、图片内容和插话等；模型循环测试通过 `FauxProvider` 构造确定性事件。TUI 测试直接导入 Textual 界面模块，因此运行完整测试集需要安装 `tui` 可选依赖。
+测试覆盖工具执行与校验（`test_tool_executor` / `test_validation`）、具体工具与受控取件（`test_tools` / `test_fetch`）、沙箱（`test_sandbox`）、会话恢复（`test_session`）、模型循环与思考流（`test_loop` / `test_thinking`）、provider 协议与线上回归（`test_commandcode_provider` / `test_commandcode_live_regressions`）、上下文计量与压缩（`test_context` / `test_compaction`）、输出截断与工具结果裁剪（`test_content` / `test_tool_pruner`）、任务恢复与运行时可靠性（`test_task_recovery` / `test_runtime_reliability`）、页面验证（`test_browser`）、Windows 控制台解析（`test_windows_console`）、模式与插话（`test_modes` / `test_steering`）、TUI（`test_tui` / `test_tui_runtime` / `test_tui_regressions`）等；模型循环测试通过 `FauxProvider` 构造确定性事件。TUI 测试直接导入 Textual 界面模块，因此运行完整测试集需要安装 `tui` 可选依赖。
+
+`tests/live_commandcode_validation.py` 是**需要付费 API 的选入式验证脚本**，默认的 `pytest` 不会收集它（文件名不匹配 `test_*.py`）。它在隔离工作区里跑真实 provider、WSL 工具与 TUI 事件消费，要求 `.env` 里配好 `CMD_API_KEY`，报告与产物都落在被忽略的 `sessions/` 下：
+
+```bash
+python tests/live_commandcode_validation.py --scenario smoke
+```
+
+`--scenario` 可取 `smoke`（默认）/ `steer` / `scene` / `cancel` / `interrupt` / `recovery` / `resume` / `image` / `web`；`resume` 必须同时给 `--resume-dir`。另有 `--history-file`、`--prompt-file` 和 `--timeout`（默认 1800 秒）。该脚本在模块层导入 Textual，因此也需要 `tui` 可选依赖。
 
 | 文档 | 内容 |
 | --- | --- |
@@ -348,6 +361,9 @@ python -m pytest
 | [上下文管理调研索引](docs/research/README.md) | 外部实现调研及综合建议 |
 | [离线评测题包 agent_eval](agent_eval/README.md) | 30 个可执行任务、评分器、实验方案与报告模板 |
 | [长任务 v2 指南](agent_eval/docs/LONG_TASKS.md) | M / W / R 共 24 道新题与上下文压力设计 |
+| [评测题面与出题依据](agent_eval/docs/TASKS.md) | 原六题题面，以及四个未实现的扩展设计 |
+| [评测与对照实验方案](agent_eval/docs/PROTOCOL.md) | 固定模型、预算与种子的对照实验矩阵 |
+| [公开题源与取材方案](agent_eval/docs/SOURCES.md) | Terminal-Bench / SWE-bench 等外部基准的适配判断 |
 
 开发记录与调研文档保留了阶段性方案；当前运行行为以源码和测试为准。提交功能变更时，请同时更新对应测试和本 README 的参数或行为说明。
 
