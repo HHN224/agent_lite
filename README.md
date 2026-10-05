@@ -155,6 +155,23 @@ Windows 输入解析会区分终端能力回复与用户按键，并处理跨批
 | `--compact-max-tokens` | `2000` | 摘要的**目标长度**（提示词里的数字）。真正发给 API 的输出上限会自动放大到 `max(此值×4, 6000)`：这个模型写正文前会先花几千 token 思考，上限给小了正文一个字都写不出来 |
 | `--compact-fallback` | `digest` | 模型摘要连续失败后：`digest` 用机械摘要兜底继续压缩（任务不受影响）；`none` 彻底停手只留原文 |
 
+## 环境变量
+
+除启动参数外，程序读取的环境变量只有下表这几个（已对照源码逐个核对，没有其他隐藏开关）。
+
+| 变量 | 作用 | 说明 |
+| --- | --- | --- |
+| `CMD_API_KEY` | `commandcode`（默认 provider）的密钥 | 缺失时启动即 `sys.exit`，提示在项目根 `.env` 里设置 |
+| `DEEPSEEK_API_KEY` | `--provider deepseek` 时的密钥 | 两个 key 按 provider 二选一，不会互相回退 |
+| `AGENT_SESSION` | 作为 `--session` 的默认值 | 显式传 `--session` 时以命令行参数为准 |
+| `AGENT_LITE_NODE` | 指定 `render_page` 用的 node 可执行文件 | 未设置时取 PATH 里的 `node` |
+| `AGENT_LITE_PLAYWRIGHT` | 指定 `playwright` 模块路径 | 只作为**候选列表第一项**，仍要用 node 实地 `require` 通过才会采用 |
+| `LOCALAPPDATA` | Windows 上 playwright 缓存的探测根之一 | 程序在它和 `~/.cache` 下搜索已有的 `node_modules/playwright` |
+
+`.env` 的加载顺序是：先项目根目录的 `.env`（源码直跑），再当前目录的 `.env`（全局安装后在任意目录启动的兜底）。`python-dotenv` 不覆盖已存在的环境变量，因此 shell 里显式导出的值优先。
+
+**`AGENT_SESSION` 写进 `.env` 不生效**：它在 `parse_args()` 里作为参数默认值读取，而 `.env` 是在参数解析**之后**才加载的——必须作为进程环境变量导出。`AGENT_LITE_NODE` / `AGENT_LITE_PLAYWRIGHT` 相反，它们在 `render_page` 被调用时才读取，那时 `.env` 已经加载，放 `.env` 里可用。
+
 ## 工具与执行边界
 
 | 工具 | 用途 |
